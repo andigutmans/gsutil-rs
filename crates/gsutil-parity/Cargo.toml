@@ -1,0 +1,21 @@
+[package]
+name = "gsutil-parity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gsutil-parity"
+path = "src/bin/gsutil-parity.rs"
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+crc32c.workspace = true
+md-5.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+url.workspace = true

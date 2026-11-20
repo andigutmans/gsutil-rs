@@ -1,0 +1,25 @@
+[package]
+name = "gsutil-gcs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gsutil-core.workspace = true
+gsutil-auth.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+wiremock = "0.6"

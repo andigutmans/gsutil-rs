@@ -1,0 +1,35 @@
+[package]
+name = "gsutil-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "gsutil"
+path = "src/main.rs"
+
+[lib]
+name = "gsutil_cli"
+path = "src/lib.rs"
+
+[dependencies]
+gsutil-core.workspace = true
+gsutil-auth.workspace = true
+gsutil-gcs.workspace = true
+gsutil-admin.workspace = true
+gsutil-transfer.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+futures.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

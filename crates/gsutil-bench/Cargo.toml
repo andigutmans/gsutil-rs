@@ -1,0 +1,19 @@
+[package]
+name = "gsutil-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gsutil-bench"
+path = "src/main.rs"
+
+[dependencies]
+gsutil-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

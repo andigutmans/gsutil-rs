@@ -1,0 +1,25 @@
+[package]
+name = "gsutil-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gsutil-core.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+pkcs8 = { version = "0.10", features = ["pem"] }
+reqwest.workspace = true
+rsa = { version = "0.9", features = ["sha2"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+wiremock = "0.6"

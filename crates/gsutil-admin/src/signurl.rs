@@ -1,0 +1,387 @@
+//! `signurl` command handler supporting V2 and V4 GCS Signed URLs.
+//!
+//! Matches `gslib/commands/signurl.py` and `gslib/utils/signurl_helper.py`.
+
+use std::collections::BTreeMap;
+
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
+use chrono::{DateTime, Duration, Utc};
+use pkcs8::DecodePrivateKey;
+use rsa::pkcs1v15::SigningKey;
+use rsa::signature::{SignatureEncoding, Signer};
+use rsa::RsaPrivateKey;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+
+use gsutil_core::api::SignUrlOptions;
+use gsutil_core::error::{GsutilError, Result};
+
+use crate::{expand_cloud_urls, parse_duration_secs, AdminContext};
+
+const V4_SIGNING_ALGO: &str = "GOOG4-RSA-SHA256";
+const V4_UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
+const DEFAULT_HOST: &str = "storage.googleapis.com";
+const MAX_V4_DURATION_SECS: u64 = 7 * 86_400; // 7 days
+
+#[derive(Deserialize)]
+struct ServiceAccountKeyFile {
+    client_email: String,
+    private_key: String,
+}
+
+impl std::fmt::Debug for ServiceAccountKeyFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceAccountKeyFile")
+            .field("client_email", &self.client_email)
+            .field("private_key", &"<REDACTED>")
+            .finish()
+    }
+}
+
+/// Percent-encode a query parameter value matching Python `urllib.parse.quote_plus`.
+fn quote_plus(s: &str) -> String {
+    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+/// Percent-encode an object path while preserving `/` separators.
+fn encode_gcs_path(path: &str) -> String {
+    path.split('/')
+        .map(|seg| {
+            url::form_urlencoded::byte_serialize(seg.as_bytes())
+                .collect::<String>()
+                .replace('+', "%20")
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Build the V4 string-to-sign and canonical query string (matching `signurl_helper.CreatePayload`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_v4_payload(
+    client_email: &str,
+    method: &str,
+    duration_secs: u64,
+    path: &str,
+    generation: Option<&str>,
+    region: &str,
+    signed_headers: &BTreeMap<String, String>,
+    billing_project: Option<&str>,
+    now: DateTime<Utc>,
+) -> (String, String) {
+    let canonical_day = now.format("%Y%m%d").to_string();
+    let canonical_time = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let canonical_scope = format!("{canonical_day}/{region}/storage/goog4_request");
+
+    let sorted_header_keys: Vec<String> = signed_headers
+        .keys()
+        .map(|k| k.to_ascii_lowercase())
+        .collect();
+    let canonical_signed_headers = sorted_header_keys.join(";");
+
+    let mut query_params: BTreeMap<&str, String> = BTreeMap::new();
+    query_params.insert("x-goog-algorithm", V4_SIGNING_ALGO.to_string());
+    query_params.insert(
+        "x-goog-credential",
+        format!("{client_email}/{canonical_scope}"),
+    );
+    query_params.insert("x-goog-date", canonical_time.clone());
+    query_params.insert("x-goog-expires", duration_secs.to_string());
+    query_params.insert("x-goog-signedheaders", canonical_signed_headers.clone());
+
+    if let Some(proj) = billing_project {
+        query_params.insert("userProject", proj.to_string());
+    }
+    if let Some(gen) = generation {
+        query_params.insert("generation", gen.to_string());
+    }
+
+    let canonical_query_string = query_params
+        .iter()
+        .map(|(k, v)| format!("{k}={}", quote_plus(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+
+    let canonical_headers = signed_headers
+        .iter()
+        .map(|(k, v)| format!("{}:{}", k.to_ascii_lowercase(), v.trim()))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+
+    let canonical_resource = format!("/{path}");
+    let canonical_request = format!(
+        "{method}\n{canonical_resource}\n{canonical_query_string}\n{canonical_headers}\n{canonical_signed_headers}\n{V4_UNSIGNED_PAYLOAD}"
+    );
+
+    let hashed_request = hex::encode(Sha256::digest(canonical_request.as_bytes()));
+    let string_to_sign =
+        format!("{V4_SIGNING_ALGO}\n{canonical_time}\n{canonical_scope}\n{hashed_request}");
+    (string_to_sign, canonical_query_string)
+}
+
+/// Sign a V4 URL locally using an RSA private key.
+#[allow(clippy::too_many_arguments)]
+pub fn sign_url_v4(
+    private_key: &RsaPrivateKey,
+    client_email: &str,
+    method: &str,
+    duration_secs: u64,
+    host: &str,
+    path: &str,
+    generation: Option<&str>,
+    region: &str,
+    signed_headers: &BTreeMap<String, String>,
+    billing_project: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<String> {
+    if duration_secs > MAX_V4_DURATION_SECS {
+        return Err(GsutilError::command(
+            "Max allowed duration for V4 signed URLs is 7 days (604800 seconds).",
+        ));
+    }
+    let encoded_path = encode_gcs_path(path);
+    let (string_to_sign, canonical_query_string) = build_v4_payload(
+        client_email,
+        method,
+        duration_secs,
+        &encoded_path,
+        generation,
+        region,
+        signed_headers,
+        billing_project,
+        now,
+    );
+
+    let signing_key = SigningKey::<Sha256>::new(private_key.clone());
+    let sig = signing_key.sign(string_to_sign.as_bytes());
+    let sig_hex = hex::encode(sig.to_bytes());
+
+    Ok(format!(
+        "https://{host}/{encoded_path}?x-goog-signature={sig_hex}&{canonical_query_string}"
+    ))
+}
+
+/// Sign a V2 URL locally using an RSA private key (RSA-SHA256).
+#[allow(clippy::too_many_arguments)]
+pub fn sign_url_v2(
+    private_key: &RsaPrivateKey,
+    client_email: &str,
+    method: &str,
+    duration_secs: u64,
+    host: &str,
+    path: &str,
+    content_type: Option<&str>,
+    generation: Option<&str>,
+    now: DateTime<Utc>,
+) -> String {
+    let expiration = (now + Duration::seconds(duration_secs as i64)).timestamp();
+    let encoded_path = encode_gcs_path(path);
+    let canonical_resource = match generation {
+        Some(gen) => format!("/{encoded_path}?generation={gen}"),
+        None => format!("/{encoded_path}"),
+    };
+    let ct = content_type.unwrap_or("");
+    let string_to_sign = format!("{method}\n\n{ct}\n{expiration}\n{canonical_resource}");
+
+    let signing_key = SigningKey::<Sha256>::new(private_key.clone());
+    let sig = signing_key.sign(string_to_sign.as_bytes());
+    let sig_b64 = BASE64.encode(sig.to_bytes());
+
+    let mut url = format!(
+        "https://{host}/{encoded_path}?GoogleAccessId={}&Expires={expiration}&Signature={}",
+        quote_plus(client_email),
+        quote_plus(&sig_b64)
+    );
+    if let Some(gen) = generation {
+        url.push_str(&format!("&generation={}", quote_plus(gen)));
+    }
+    url
+}
+
+pub async fn run_signurl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> {
+    let mut method = "GET".to_string();
+    let mut duration_secs: u64 = 3600; // default 1h
+    let mut content_type: Option<String> = None;
+    let mut region = "auto".to_string();
+    let mut billing_project: Option<String> = None;
+    let mut use_iam_sign = false;
+    let mut version: u8 = 4;
+    let mut positional = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-m" => {
+                i += 1;
+                method = args
+                    .get(i)
+                    .ok_or_else(|| GsutilError::command("Option -m requires an HTTP method."))?
+                    .to_ascii_uppercase();
+            }
+            "-d" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| GsutilError::command("Option -d requires a duration."))?;
+                duration_secs = parse_duration_secs(raw)?;
+            }
+            "-c" => {
+                i += 1;
+                content_type = Some(
+                    args.get(i)
+                        .ok_or_else(|| GsutilError::command("Option -c requires a content-type."))?
+                        .clone(),
+                );
+            }
+            "-r" => {
+                i += 1;
+                region = args
+                    .get(i)
+                    .ok_or_else(|| GsutilError::command("Option -r requires a region."))?
+                    .clone();
+            }
+            "-b" => {
+                i += 1;
+                billing_project = Some(
+                    args.get(i)
+                        .ok_or_else(|| {
+                            GsutilError::command("Option -b requires a billing project.")
+                        })?
+                        .clone(),
+                );
+            }
+            "-u" => use_iam_sign = true,
+            "-v" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| GsutilError::command("Option -v requires 2 or 4."))?;
+                version = match v.as_str() {
+                    "2" | "v2" | "V2" => 2,
+                    "4" | "v4" | "V4" => 4,
+                    _ => {
+                        return Err(GsutilError::command(format!(
+                            "Invalid signing version \"{v}\"; expected 2 or 4."
+                        )));
+                    }
+                };
+            }
+            "-p" => {
+                // PKCS12 password flag (accepted for CLI compatibility)
+                i += 1;
+                if i >= args.len() {
+                    return Err(GsutilError::command("Option -p requires a password."));
+                }
+            }
+            other => positional.push(other.to_string()),
+        }
+        i += 1;
+    }
+
+    let (key_file_opt, url_args) = if use_iam_sign {
+        if positional.is_empty() {
+            return Err(GsutilError::command(
+                "signurl -u requires at least one gs:// URL.",
+            ));
+        }
+        (None, positional.as_slice())
+    } else {
+        if positional.len() < 2 {
+            return Err(GsutilError::command(
+                "signurl requires a private key file and at least one gs:// URL.",
+            ));
+        }
+        (Some(positional[0].as_str()), &positional[1..])
+    };
+
+    let loaded_key = if let Some(key_path) = key_file_opt {
+        let raw = std::fs::read_to_string(key_path).map_err(|e| {
+            GsutilError::command(format!(
+                "Could not read private key file \"{key_path}\": {e}"
+            ))
+        })?;
+        let sa_key: ServiceAccountKeyFile = serde_json::from_str(&raw).map_err(|e| {
+            GsutilError::command(format!(
+                "Could not parse service account JSON key \"{key_path}\": {e}"
+            ))
+        })?;
+        let rsa_key = RsaPrivateKey::from_pkcs8_pem(&sa_key.private_key).map_err(|e| {
+            GsutilError::command(format!("Invalid RSA private key in \"{key_path}\": {e}"))
+        })?;
+        Some((sa_key.client_email, rsa_key))
+    } else {
+        None
+    };
+
+    let urls = expand_cloud_urls(ctx, url_args, false, false).await?;
+    let now = Utc::now();
+    let expiration_str = (now + Duration::seconds(duration_secs as i64))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+
+    writeln!(ctx.out, "URL\tHTTP Method\tExpiration\tSigned URL")?;
+
+    for u in urls {
+        let bname = u.bucket_name.as_deref().unwrap_or("");
+        let path = match u.object_name.as_deref() {
+            Some(o) => format!("{bname}/{o}"),
+            None => bname.to_string(),
+        };
+
+        let mut signed_headers = BTreeMap::new();
+        signed_headers.insert("host".to_string(), DEFAULT_HOST.to_string());
+        if let Some(ref ct) = content_type {
+            signed_headers.insert("content-type".to_string(), ct.clone());
+        }
+
+        let signed_url = if let Some((ref client_email, ref rsa_key)) = loaded_key {
+            if version == 2 {
+                sign_url_v2(
+                    rsa_key,
+                    client_email,
+                    &method,
+                    duration_secs,
+                    DEFAULT_HOST,
+                    &path,
+                    content_type.as_deref(),
+                    u.generation.as_deref(),
+                    now,
+                )
+            } else {
+                sign_url_v4(
+                    rsa_key,
+                    client_email,
+                    &method,
+                    duration_secs,
+                    DEFAULT_HOST,
+                    &path,
+                    u.generation.as_deref(),
+                    &region,
+                    &signed_headers,
+                    billing_project.as_deref(),
+                    now,
+                )?
+            }
+        } else {
+            ctx.api
+                .sign_url(&SignUrlOptions {
+                    method: method.clone(),
+                    duration_secs,
+                    path: path.clone(),
+                    generation: u.generation.clone(),
+                    region: Some(region.clone()),
+                    signed_headers,
+                })
+                .await?
+        };
+
+        writeln!(
+            ctx.out,
+            "{}\t{method}\t{expiration_str}\t{signed_url}",
+            u.url_string()
+        )?;
+    }
+
+    Ok(())
+}

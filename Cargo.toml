@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gsutil-core",
+    "crates/gsutil-auth",
+    "crates/gsutil-gcs",
+    "crates/gsutil-transfer",
+    "crates/gsutil-admin",
+    "crates/gsutil-cli",
+    "crates/gsutil-parity",
+    "crates/gsutil-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/GoogleCloudPlatform/gsutil-rs"
+rust-version = "1.87"
+
+[workspace.dependencies]
+gsutil-core = { path = "crates/gsutil-core" }
+gsutil-auth = { path = "crates/gsutil-auth" }
+gsutil-gcs = { path = "crates/gsutil-gcs" }
+gsutil-transfer = { path = "crates/gsutil-transfer" }
+gsutil-admin = { path = "crates/gsutil-admin" }
+gsutil-cli = { path = "crates/gsutil-cli" }
+
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+crc32c = "0.6"
+dirs = "5"
+futures = "0.3"
+hex = "0.4"
+md-5 = "0.10"
+pkcs8 = { version = "0.10", features = ["pem"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip"] }
+rsa = { version = "0.9", features = ["sha2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+url = "2"
