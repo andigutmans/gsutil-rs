@@ -9,7 +9,7 @@ use chrono::DateTime;
 use gsutil_core::api::{Bucket, BucketEncryption, CreateNotificationOptions, HmacKeyMetadata};
 use gsutil_core::error::{GsutilError, Result};
 
-use crate::{expand_bucket_urls, AdminContext};
+use crate::{bucket_display_no_slash, expand_bucket_urls, AdminContext};
 
 // ---------------------------------------------------------------------------
 // kms (encryption | authorize | serviceaccount)
@@ -122,7 +122,7 @@ pub async fn run_kms(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
                             writeln!(
                                 ctx.out,
                                 "Bucket {} has no default encryption key",
-                                b.bucket_url_string()
+                                bucket_display_no_slash(&b)
                             )?;
                         }
                     }

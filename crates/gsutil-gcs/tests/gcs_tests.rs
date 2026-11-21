@@ -455,6 +455,7 @@ async fn test_notifications_and_hmac_keys() {
 
     Mock::given(method("POST"))
         .and(path("/storage/v1/projects/my-proj/hmacKeys"))
+        .and(header("content-length", "0"))
         .and(query_param(
             "serviceAccountEmail",
             "sa@my-proj.iam.gserviceaccount.com",

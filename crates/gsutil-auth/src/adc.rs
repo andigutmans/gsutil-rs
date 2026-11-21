@@ -173,15 +173,25 @@ pub fn is_mtls_enabled(config: &BotoConfig) -> bool {
     if config.has_option("Credentials", "use_client_certificate") {
         return config.get_bool("Credentials", "use_client_certificate", false);
     }
-    if matches!(
-        env::var("CLOUDSDK_CONTEXT_AWARE_USE_CLIENT_CERTIFICATE")
-            .ok()
-            .as_deref()
-            .map(|v| v.to_ascii_lowercase())
-            .as_deref(),
-        Some("true" | "1" | "yes")
-    ) {
-        return true;
+    for var in [
+        "CLOUDSDK_CONTEXT_AWARE_USE_CLIENT_CERTIFICATE",
+        "GOOGLE_API_USE_CLIENT_CERTIFICATE",
+    ] {
+        if let Ok(val) = env::var(var) {
+            match val.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => return true,
+                "false" | "0" | "no" => return false,
+                _ => {}
+            }
+        }
+    }
+    if let Ok(val) = env::var("CLOUDSDK_CONTEXT_AWARE_USE_ECP_HTTP_PROXY") {
+        if matches!(
+            val.trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | "no"
+        ) {
+            return false;
+        }
     }
     certificate_config_path().is_some()
 }

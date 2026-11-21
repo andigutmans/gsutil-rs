@@ -251,8 +251,26 @@ impl XmlApiClient {
         Self::hmac_sha256(&k_service, b"aws4_request")
     }
 
-    /// Sign an HTTP request with AWS Signature Version 4 headers (`Authorization`, `x-amz-date`,
-    /// `x-amz-content-sha256`).
+    /// Derive GCS V4 signing key (`kSigning`) for `GOOG4-HMAC-SHA256`.
+    pub fn derive_goog4_signing_key(
+        secret_access_key: &str,
+        date_stamp: &str,
+        region: &str,
+        service: &str,
+    ) -> [u8; 32] {
+        let k_secret = format!("GOOG4{secret_access_key}");
+        let k_date = Self::hmac_sha256(k_secret.as_bytes(), date_stamp.as_bytes());
+        let k_region = Self::hmac_sha256(&k_date, region.as_bytes());
+        let k_service = Self::hmac_sha256(&k_region, service.as_bytes());
+        Self::hmac_sha256(&k_service, b"goog4_request")
+    }
+
+    /// Sign an HTTP request with V4 HMAC headers:
+    /// - For GCS (`provider == "gs"`): `GOOG4-HMAC-SHA256` with `x-goog-date` and
+    ///   `x-goog-content-sha256` (avoiding mixing `x-amz-*` and `x-goog-*`, which GCS rejects
+    ///   with `400 ExcessHeaderValues`).
+    /// - For S3 (`provider == "s3"`): `AWS4-HMAC-SHA256` with `x-amz-date` and
+    ///   `x-amz-content-sha256`.
     pub fn apply_sigv4_headers(
         &self,
         hmac: &HmacCredentials,
@@ -263,24 +281,30 @@ impl XmlApiClient {
         payload: &[u8],
     ) {
         let now = Utc::now();
-        let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+        let req_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date_stamp = now.format("%Y%m%d").to_string();
         let payload_hash = Self::sha256_hex(payload);
+        let is_gs = self.config.provider == "gs";
 
         if let Ok(v) = HeaderValue::from_str(&self.config.host_header) {
             headers.insert(HOST, v);
         }
-        if let Ok(v) = HeaderValue::from_str(&amz_date) {
-            headers.insert(HeaderName::from_static("x-amz-date"), v);
+        let (date_hdr, sha_hdr, prefix) = if is_gs {
+            ("x-goog-date", "x-goog-content-sha256", "x-goog-")
+        } else {
+            ("x-amz-date", "x-amz-content-sha256", "x-amz-")
+        };
+        if let Ok(v) = HeaderValue::from_str(&req_date) {
+            headers.insert(HeaderName::from_static(date_hdr), v);
         }
         if let Ok(v) = HeaderValue::from_str(&payload_hash) {
-            headers.insert(HeaderName::from_static("x-amz-content-sha256"), v);
+            headers.insert(HeaderName::from_static(sha_hdr), v);
         }
 
         let mut canonical_headers_map: BTreeMap<String, String> = BTreeMap::new();
         for (name, val) in headers.iter() {
             let lower = name.as_str().to_ascii_lowercase();
-            if lower == "host" || lower.starts_with("x-amz-") || lower.starts_with("x-goog-") {
+            if lower == "host" || lower.starts_with(prefix) {
                 if let Ok(s) = val.to_str() {
                     canonical_headers_map.insert(lower, s.trim().to_string());
                 }
@@ -313,24 +337,38 @@ impl XmlApiClient {
             signed_headers,
             payload_hash
         );
-        let credential_scope = format!("{}/{}/s3/aws4_request", date_stamp, self.config.region);
+
+        let (algorithm, credential_scope, signing_key) = if is_gs {
+            let scope = format!("{date_stamp}/auto/storage/goog4_request");
+            let key = Self::derive_goog4_signing_key(
+                &hmac.secret_access_key,
+                &date_stamp,
+                "auto",
+                "storage",
+            );
+            ("GOOG4-HMAC-SHA256", scope, key)
+        } else {
+            let scope = format!("{}/{}/s3/aws4_request", date_stamp, self.config.region);
+            let key = Self::derive_sigv4_signing_key(
+                &hmac.secret_access_key,
+                &date_stamp,
+                &self.config.region,
+                "s3",
+            );
+            ("AWS4-HMAC-SHA256", scope, key)
+        };
+
         let string_to_sign = format!(
-            "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-            amz_date,
+            "{}\n{}\n{}\n{}",
+            algorithm,
+            req_date,
             credential_scope,
             Self::sha256_hex(canonical_request.as_bytes())
         );
-
-        let signing_key = Self::derive_sigv4_signing_key(
-            &hmac.secret_access_key,
-            &date_stamp,
-            &self.config.region,
-            "s3",
-        );
         let signature = hex::encode(Self::hmac_sha256(&signing_key, string_to_sign.as_bytes()));
         let auth_value = format!(
-            "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
-            hmac.access_key_id, credential_scope, signed_headers, signature
+            "{algorithm} Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
+            hmac.access_key_id
         );
         if let Ok(v) = HeaderValue::from_str(&auth_value) {
             headers.insert(HeaderName::from_static("authorization"), v);

@@ -16,6 +16,7 @@ use tempfile::TempDir;
 struct LiveTopology {
     project: String,
     ubla_bucket: String,
+    acl_bucket: Option<String>,
     versioned_bucket: String,
     dual_bucket: String,
     rp_bucket: String,
@@ -23,6 +24,7 @@ struct LiveTopology {
     pubsub_topic: String,
     kms_key: String,
     hmac_sa: String,
+    sa_key_path: Option<String>,
 }
 
 impl LiveTopology {
@@ -46,8 +48,20 @@ impl LiveTopology {
                 })
                 .unwrap_or(default)
         };
+        let acl_bucket = std::env::var("GSUTIL_TEST_ACL_BUCKET")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| {
+                s.trim_start_matches("gs://")
+                    .trim_end_matches('/')
+                    .to_string()
+            });
+        let sa_key_path = std::env::var("GSUTIL_TEST_SA_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
         Self {
             ubla_bucket: ubla,
+            acl_bucket,
             versioned_bucket: env_or(
                 "GSUTIL_TEST_VERSIONED_BUCKET",
                 format!("{project}-ver"),
@@ -63,6 +77,7 @@ impl LiveTopology {
             }),
             hmac_sa: std::env::var("GSUTIL_TEST_HMAC_SA")
                 .unwrap_or_else(|_| format!("gsutil-rs-tester@{project}.iam.gserviceaccount.com")),
+            sa_key_path,
             project,
         }
     }
@@ -931,6 +946,652 @@ pub fn run_live_gcs_suite(
             "live_gcs",
             "notification",
             &del_opts,
+            0,
+            "",
+            &CompareRule::Ignore,
+            "",
+            &CompareRule::Ignore,
+            &ctx,
+        ));
+    }
+
+    // -------------------------------------------------------------------------
+    // 6d. Live Non-UBLA Fine-Grained ACLs (requires GSUTIL_TEST_ACL_BUCKET)
+    // -------------------------------------------------------------------------
+    if let Some(ref acl_bkt) = topo.acl_bucket {
+        let acl_uri = format!("gs://{acl_bkt}");
+        if matches_filter(filter, "live_acl_lifecycle", "live_gcs", "acl") {
+            let get_opts = RunOptions::new(["acl", "get", &acl_uri]);
+            results.push(runner.run_rust_contract(
+                "live_acl_get",
+                "live_gcs",
+                "acl",
+                &get_opts,
+                0,
+                "\"role\"",
+                &CompareRule::ContainsAll(vec!["\"role\"".into()]),
+                "",
+                &CompareRule::Ignore,
+                &ctx,
+            ));
+            let set_opts = RunOptions::new(["acl", "set", "private", &acl_uri]);
+            results.push(runner.run_rust_contract(
+                "live_acl_set_private",
+                "live_gcs",
+                "acl",
+                &set_opts,
+                0,
+                "",
+                &CompareRule::Ignore,
+                "",
+                &CompareRule::Ignore,
+                &ctx,
+            ));
+            let grant_spec = format!("{}:R", topo.hmac_sa);
+            let ch_add = RunOptions::new(["acl", "ch", "-u", &grant_spec, &acl_uri]);
+            results.push(runner.run_rust_contract(
+                "live_acl_ch_grant",
+                "live_gcs",
+                "acl",
+                &ch_add,
+                0,
+                "",
+                &CompareRule::Ignore,
+                "",
+                &CompareRule::Ignore,
+                &ctx,
+            ));
+            let verify_add = RunOptions::new(["acl", "get", &acl_uri]);
+            results.push(runner.run_rust_contract(
+                "live_acl_get_after_grant",
+                "live_gcs",
+                "acl",
+                &verify_add,
+                0,
+                &topo.hmac_sa,
+                &CompareRule::ContainsAll(vec![topo.hmac_sa.clone()]),
+                "",
+                &CompareRule::Ignore,
+                &ctx,
+            ));
+            let ch_del = RunOptions::new(["acl", "ch", "-d", &topo.hmac_sa, &acl_uri]);
+            results.push(runner.run_rust_contract(
+                "live_acl_ch_remove",
+                "live_gcs",
+                "acl",
+                &ch_del,
+                0,
+                "",
+                &CompareRule::Ignore,
+                "",
+                &CompareRule::Ignore,
+                &ctx,
+            ));
+        }
+        if matches_filter(filter, "live_defacl_lifecycle", "live_gcs", "defacl") {
+            let def_get = RunOptions::new(["defacl", "get", &acl_uri]);
+            results.push(runner.run_rust_contract(
+                "live_defacl_get",
+                "live_gcs",
+                "defacl",
+                &def_get,
+                0,
+                "",
+                &CompareRule::Ignore,
+                "",
+                &CompareRule::Ignore,
+                &ctx,
+            ));
+            let def_set = RunOptions::new(["defacl", "set", "private", &acl_uri]);
+            results.push(runner.run_rust_contract(
+                "live_defacl_set_private",
+                "live_gcs",
+                "defacl",
+                &def_set,
+                0,
+                "",
+                &CompareRule::Ignore,
+                "",
+                &CompareRule::Ignore,
+                &ctx,
+            ));
+            let grant_spec = format!("{}:R", topo.hmac_sa);
+            let def_ch_add = RunOptions::new(["defacl", "ch", "-u", &grant_spec, &acl_uri]);
+            results.push(runner.run_rust_contract(
+                "live_defacl_ch_grant",
+                "live_gcs",
+                "defacl",
+                &def_ch_add,
+                0,
+                "",
+                &CompareRule::Ignore,
+                "",
+                &CompareRule::Ignore,
+                &ctx,
+            ));
+            let def_ch_del = RunOptions::new(["defacl", "ch", "-d", &topo.hmac_sa, &acl_uri]);
+            results.push(runner.run_rust_contract(
+                "live_defacl_ch_remove",
+                "live_gcs",
+                "defacl",
+                &def_ch_del,
+                0,
+                "",
+                &CompareRule::Ignore,
+                "",
+                &CompareRule::Ignore,
+                &ctx,
+            ));
+        }
+        if matches_filter(filter, "live_cp_acl_preserve", "live_gcs", "cp") {
+            let acl_obj = format!("gs://{acl_bkt}/{rs_pfx}/acl_obj.txt");
+            let acl_obj2 = format!("gs://{acl_bkt}/{rs_pfx}/acl_obj_copy.txt");
+            let up_a =
+                RunOptions::new(["cp", "-a", "private", f_text1.to_str().unwrap(), &acl_obj]);
+            results.push(runner.run_rust_contract(
+                "live_cp_canned_acl_private",
+                "live_gcs",
+                "cp",
+                &up_a,
+                0,
+                "",
+                &CompareRule::Ignore,
+                "",
+                &CompareRule::Ignore,
+                &ctx,
+            ));
+            let cp_p = RunOptions::new(["cp", "-p", &acl_obj, &acl_obj2]);
+            results.push(runner.run_rust_contract(
+                "live_cp_preserve_acl",
+                "live_gcs",
+                "cp",
+                &cp_p,
+                0,
+                "",
+                &CompareRule::Ignore,
+                "",
+                &CompareRule::Ignore,
+                &ctx,
+            ));
+            let _ = runner.run_rust(&RunOptions::new(["rm", "-f", &acl_obj, &acl_obj2]));
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 6e. Live HMAC CRUD + Real Live GCS XML (-o GSUtil:prefer_api=xml)
+    // -------------------------------------------------------------------------
+    if topo.sa_key_path.is_some()
+        && matches_filter(filter, "live_hmac_xml_lifecycle", "live_gcs", "hmac")
+    {
+        let create_out = runner
+            .run_rust(&RunOptions::new([
+                "hmac",
+                "create",
+                "-p",
+                &topo.project,
+                &topo.hmac_sa,
+            ]))
+            .expect("run rust hmac create");
+        let access_id = create_out
+            .stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("Access ID:"))
+            .map(|s| s.trim().to_string());
+        let secret = create_out
+            .stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("Secret:"))
+            .map(|s| s.trim().to_string());
+        let mut diffs = Vec::new();
+        if create_out.exit_code != 0 || access_id.is_none() || secret.is_none() {
+            diffs.push(format!(
+                "hmac create failed (exit={}): stdout={} stderr={}",
+                create_out.exit_code, create_out.stdout, create_out.stderr
+            ));
+        }
+        results.push(CaseResult {
+            id: "live_hmac_create".into(),
+            category: "live_gcs".into(),
+            command: "hmac".into(),
+            args: vec!["hmac".into(), "create".into()],
+            passed: diffs.is_empty(),
+            skipped: false,
+            skip_reason: None,
+            exit_code_match: create_out.exit_code == 0,
+            ref_output: None,
+            rust_output: Some(create_out),
+            stdout_cmp: None,
+            stderr_cmp: None,
+            side_effect_error: if diffs.is_empty() {
+                None
+            } else {
+                Some(diffs.join("; "))
+            },
+        });
+
+        if let (Some(aid), Some(sec)) = (access_id, secret) {
+            let get_opts = RunOptions::new(["hmac", "get", "-p", &topo.project, &aid]);
+            let expected_hmac_get = format!("{aid} ACTIVE");
+            results.push(runner.run_rust_contract(
+                "live_hmac_get",
+                "live_gcs",
+                "hmac",
+                &get_opts,
+                0,
+                &expected_hmac_get,
+                &CompareRule::ContainsAll(vec![aid.clone(), "ACTIVE".into()]),
+                "",
+                &CompareRule::Ignore,
+                &ctx,
+            ));
+
+            // Real live GCS XML API roundtrip using the newly created HMAC key!
+            let xml_boto = tmp.path().join("hmac_xml.boto");
+            let boto_txt = format!(
+                "[Credentials]\ngs_access_key_id = {aid}\ngs_secret_access_key = {sec}\n\
+                 [GSUtil]\nprefer_api = xml\ndefault_project_id = {}\n",
+                topo.project
+            );
+            std::fs::write(&xml_boto, boto_txt).expect("write xml boto");
+            let xml_obj = format!("{rs_base}/xml_hmac_test.txt");
+
+            let xml_cp = RunOptions::new(["cp", f_text1.to_str().unwrap(), &xml_obj])
+                .with_boto_config(&xml_boto);
+            results.push(runner.run_rust_contract(
+                "live_xml_hmac_cp_upload",
+                "live_gcs",
+                "cp",
+                &xml_cp,
+                0,
+                "",
+                &CompareRule::Ignore,
+                "",
+                &CompareRule::Ignore,
+                &ctx,
+            ));
+            let xml_ls = RunOptions::new(["ls", &xml_obj]).with_boto_config(&xml_boto);
+            results.push(runner.run_rust_contract(
+                "live_xml_hmac_ls",
+                "live_gcs",
+                "ls",
+                &xml_ls,
+                0,
+                "xml_hmac_test.txt",
+                &CompareRule::ContainsAll(vec!["xml_hmac_test.txt".into()]),
+                "",
+                &CompareRule::Ignore,
+                &ctx,
+            ));
+            let xml_cat = RunOptions::new(["cat", &xml_obj]).with_boto_config(&xml_boto);
+            let expected_text1 = String::from_utf8_lossy(p_text1).into_owned();
+            results.push(runner.run_rust_contract(
+                "live_xml_hmac_cat",
+                "live_gcs",
+                "cat",
+                &xml_cat,
+                0,
+                &expected_text1,
+                &CompareRule::Exact,
+                "",
+                &CompareRule::Ignore,
+                &ctx,
+            ));
+            let xml_rm = RunOptions::new(["rm", &xml_obj]).with_boto_config(&xml_boto);
+            results.push(runner.run_rust_contract(
+                "live_xml_hmac_rm",
+                "live_gcs",
+                "rm",
+                &xml_rm,
+                0,
+                "",
+                &CompareRule::Ignore,
+                "",
+                &CompareRule::Ignore,
+                &ctx,
+            ));
+
+            // Always deactivate and delete the HMAC key!
+            let deact = RunOptions::new([
+                "hmac",
+                "update",
+                "-p",
+                &topo.project,
+                "-s",
+                "INACTIVE",
+                &aid,
+            ]);
+            results.push(runner.run_rust_contract(
+                "live_hmac_deactivate",
+                "live_gcs",
+                "hmac",
+                &deact,
+                0,
+                "",
+                &CompareRule::Ignore,
+                "",
+                &CompareRule::Ignore,
+                &ctx,
+            ));
+            let del = RunOptions::new(["hmac", "delete", "-p", &topo.project, &aid]);
+            results.push(runner.run_rust_contract(
+                "live_hmac_delete",
+                "live_gcs",
+                "hmac",
+                &del,
+                0,
+                "",
+                &CompareRule::Ignore,
+                "",
+                &CompareRule::Ignore,
+                &ctx,
+            ));
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 6f. Live `signurl` V4 & V2 with REAL HTTP PUT & GET against storage.googleapis.com
+    // -------------------------------------------------------------------------
+    if let Some(ref sa_key) = topo.sa_key_path {
+        if matches_filter(filter, "live_signurl_http_v4_v2", "live_gcs", "signurl") {
+            let signed_obj = format!("{rs_base}/signed_v4_live.txt");
+            let payload = b"gsutil-rs live signed URL PUT/GET verification 0123456789\n";
+            let payload_file = tmp.path().join("signed_payload.txt");
+            std::fs::write(&payload_file, payload).expect("write signed payload");
+
+            let extract_https_url = |stdout: &str| -> Option<String> {
+                stdout.split_whitespace().find_map(|tok| {
+                    if tok.starts_with("https://storage.googleapis.com/") {
+                        Some(tok.to_string())
+                    } else {
+                        None
+                    }
+                })
+            };
+
+            // V4 PUT + real HTTP PUT
+            let put_sign = runner
+                .run_rust(&RunOptions::new([
+                    "signurl",
+                    "-v",
+                    "4",
+                    "-m",
+                    "PUT",
+                    "-d",
+                    "10m",
+                    "-c",
+                    "text/plain",
+                    sa_key,
+                    &signed_obj,
+                ]))
+                .expect("run signurl v4 put");
+            let mut put_diffs = Vec::new();
+            if put_sign.exit_code != 0 {
+                put_diffs.push(format!(
+                    "signurl v4 PUT exited {}: {}",
+                    put_sign.exit_code, put_sign.stderr
+                ));
+            } else if let Some(url) = extract_https_url(&put_sign.stdout) {
+                let curl = std::process::Command::new("curl")
+                    .args([
+                        "-sS",
+                        "-o",
+                        "/dev/null",
+                        "-w",
+                        "%{http_code}",
+                        "-X",
+                        "PUT",
+                        "-H",
+                        "Content-Type: text/plain",
+                        "--data-binary",
+                        &format!("@{}", payload_file.display()),
+                        &url,
+                    ])
+                    .output()
+                    .expect("curl PUT");
+                let code = String::from_utf8_lossy(&curl.stdout).trim().to_string();
+                if code != "200" {
+                    put_diffs.push(format!(
+                        "V4 signed PUT HTTP status={code} (expected 200), stderr={}",
+                        String::from_utf8_lossy(&curl.stderr)
+                    ));
+                }
+            } else {
+                put_diffs.push(format!(
+                    "no https URL in signurl output: {}",
+                    put_sign.stdout
+                ));
+            }
+            results.push(CaseResult {
+                id: "live_signurl_v4_http_put".into(),
+                category: "live_gcs".into(),
+                command: "signurl".into(),
+                args: vec![
+                    "signurl".into(),
+                    "-v".into(),
+                    "4".into(),
+                    "-m".into(),
+                    "PUT".into(),
+                ],
+                passed: put_diffs.is_empty(),
+                skipped: false,
+                skip_reason: None,
+                exit_code_match: put_sign.exit_code == 0,
+                ref_output: None,
+                rust_output: Some(put_sign),
+                stdout_cmp: None,
+                stderr_cmp: None,
+                side_effect_error: if put_diffs.is_empty() {
+                    None
+                } else {
+                    Some(put_diffs.join("; "))
+                },
+            });
+
+            // V4 GET + V2 GET with real HTTP GET & exact byte verification
+            for (ver, case_id) in [
+                ("4", "live_signurl_v4_http_get"),
+                ("2", "live_signurl_v2_http_get"),
+            ] {
+                let get_sign = runner
+                    .run_rust(&RunOptions::new([
+                        "signurl",
+                        "-v",
+                        ver,
+                        "-m",
+                        "GET",
+                        "-d",
+                        "10m",
+                        sa_key,
+                        &signed_obj,
+                    ]))
+                    .expect("run signurl get");
+                let mut get_diffs = Vec::new();
+                if get_sign.exit_code != 0 {
+                    get_diffs.push(format!(
+                        "signurl v{ver} GET exited {}: {}",
+                        get_sign.exit_code, get_sign.stderr
+                    ));
+                } else if let Some(url) = extract_https_url(&get_sign.stdout) {
+                    let dl_out = tmp.path().join(format!("signed_dl_v{ver}.txt"));
+                    let curl = std::process::Command::new("curl")
+                        .args([
+                            "-sS",
+                            "-o",
+                            dl_out.to_str().unwrap(),
+                            "-w",
+                            "%{http_code}",
+                            &url,
+                        ])
+                        .output()
+                        .expect("curl GET");
+                    let code = String::from_utf8_lossy(&curl.stdout).trim().to_string();
+                    if code != "200" {
+                        get_diffs.push(format!(
+                            "V{ver} signed GET HTTP status={code} (expected 200)"
+                        ));
+                    } else {
+                        let got = std::fs::read(&dl_out).unwrap_or_default();
+                        if got != payload {
+                            get_diffs.push(format!(
+                                "V{ver} signed GET payload mismatch: got {} bytes vs expected {} bytes",
+                                got.len(),
+                                payload.len()
+                            ));
+                        }
+                    }
+                } else {
+                    get_diffs.push(format!(
+                        "no https URL in signurl v{ver} output: {}",
+                        get_sign.stdout
+                    ));
+                }
+                results.push(CaseResult {
+                    id: case_id.into(),
+                    category: "live_gcs".into(),
+                    command: "signurl".into(),
+                    args: vec![
+                        "signurl".into(),
+                        "-v".into(),
+                        ver.into(),
+                        "-m".into(),
+                        "GET".into(),
+                    ],
+                    passed: get_diffs.is_empty(),
+                    skipped: false,
+                    skip_reason: None,
+                    exit_code_match: get_sign.exit_code == 0,
+                    ref_output: None,
+                    rust_output: Some(get_sign),
+                    stdout_cmp: None,
+                    stderr_cmp: None,
+                    side_effect_error: if get_diffs.is_empty() {
+                        None
+                    } else {
+                        Some(get_diffs.join("; "))
+                    },
+                });
+            }
+            let _ = runner.run_rust(&RunOptions::new(["rm", "-f", &signed_obj]));
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 6g. Live `-i` Service Account Impersonation
+    // -------------------------------------------------------------------------
+    if topo.sa_key_path.is_some() && matches_filter(filter, "live_impersonation", "live_gcs", "ls")
+    {
+        let imp_ls = RunOptions::new(["-i", &topo.hmac_sa, "ls", "-b", &ubla_uri]);
+        results.push(runner.run_rust_contract(
+            "live_impersonation_ls_bucket",
+            "live_gcs",
+            "ls",
+            &imp_ls,
+            0,
+            &ubla_uri,
+            &CompareRule::ContainsAll(vec![ubla_uri.clone()]),
+            "",
+            &CompareRule::Ignore,
+            &ctx,
+        ));
+        let imp_obj = format!("{rs_base}/impersonated.txt");
+        let imp_cp = RunOptions::new([
+            "-i",
+            &topo.hmac_sa,
+            "cp",
+            f_text1.to_str().unwrap(),
+            &imp_obj,
+        ]);
+        results.push(runner.run_rust_contract(
+            "live_impersonation_cp_upload",
+            "live_gcs",
+            "cp",
+            &imp_cp,
+            0,
+            "",
+            &CompareRule::Ignore,
+            "",
+            &CompareRule::Ignore,
+            &ctx,
+        ));
+        let imp_cat = RunOptions::new(["-i", &topo.hmac_sa, "cat", &imp_obj]);
+        let expected_text1 = String::from_utf8_lossy(p_text1).into_owned();
+        results.push(runner.run_rust_contract(
+            "live_impersonation_cat",
+            "live_gcs",
+            "cat",
+            &imp_cat,
+            0,
+            &expected_text1,
+            &CompareRule::Exact,
+            "",
+            &CompareRule::Ignore,
+            &ctx,
+        ));
+        let imp_rm = RunOptions::new(["-i", &topo.hmac_sa, "rm", &imp_obj]);
+        results.push(runner.run_rust_contract(
+            "live_impersonation_rm",
+            "live_gcs",
+            "rm",
+            &imp_rm,
+            0,
+            "",
+            &CompareRule::Ignore,
+            "",
+            &CompareRule::Ignore,
+            &ctx,
+        ));
+    }
+
+    // -------------------------------------------------------------------------
+    // 6h. Live `iam` Policy Roundtrip
+    // -------------------------------------------------------------------------
+    if matches_filter(filter, "live_iam_roundtrip", "live_gcs", "iam") {
+        let iam_get = RunOptions::new(["iam", "get", &ubla_uri]);
+        results.push(runner.run_rust_contract(
+            "live_iam_get",
+            "live_gcs",
+            "iam",
+            &iam_get,
+            0,
+            "\"bindings\"",
+            &CompareRule::ContainsAll(vec!["\"bindings\"".into()]),
+            "",
+            &CompareRule::Ignore,
+            &ctx,
+        ));
+        let spec = format!("serviceAccount:{}:objectViewer", topo.hmac_sa);
+        let iam_add = RunOptions::new(["iam", "ch", &spec, &ubla_uri]);
+        results.push(runner.run_rust_contract(
+            "live_iam_ch_grant",
+            "live_gcs",
+            "iam",
+            &iam_add,
+            0,
+            "",
+            &CompareRule::Ignore,
+            "",
+            &CompareRule::Ignore,
+            &ctx,
+        ));
+        let iam_verify = RunOptions::new(["iam", "get", &ubla_uri]);
+        results.push(runner.run_rust_contract(
+            "live_iam_get_after_grant",
+            "live_gcs",
+            "iam",
+            &iam_verify,
+            0,
+            &topo.hmac_sa,
+            &CompareRule::ContainsAll(vec![topo.hmac_sa.clone()]),
+            "",
+            &CompareRule::Ignore,
+            &ctx,
+        ));
+        let iam_del = RunOptions::new(["iam", "ch", "-d", &spec, &ubla_uri]);
+        results.push(runner.run_rust_contract(
+            "live_iam_ch_remove",
+            "live_gcs",
+            "iam",
+            &iam_del,
             0,
             "",
             &CompareRule::Ignore,

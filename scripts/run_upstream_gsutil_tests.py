@@ -200,7 +200,13 @@ def _start_live_backend(project_id):
   ecp_bin = '/usr/bin/ecp_http_proxy'
   ecp_cfg = '/etc/gcloud/certificate_config.json'
   proxy_port = None
-  if os.path.exists(ecp_bin) and os.path.exists(ecp_cfg):
+  ecp_disabled = (
+      os.environ.get('CLOUDSDK_CONTEXT_AWARE_USE_ECP_HTTP_PROXY', '').lower() == 'false'
+      or os.environ.get('CLOUDSDK_CONTEXT_AWARE_USE_CLIENT_CERTIFICATE', '').lower() == 'false'
+  )
+  if ecp_disabled:
+    os.environ.pop('GSUTIL_ECP_PROXY_PORT', None)
+  elif os.path.exists(ecp_bin) and os.path.exists(ecp_cfg):
     proxy_port = _pick_free_port()
     proxy_proc = subprocess.Popen(
         [
@@ -268,11 +274,13 @@ def _start_live_backend(project_id):
 
 
 def _install_live_ecp_transport_patches():
-  """Route Python test harness HTTP clients (httplib2 + boto GSConnection) via local ecp_http_proxy."""
+  """Route Python test harness HTTP clients (httplib2 + boto GSConnection) with gcloud bearer auth.
+
+  When GSUTIL_ECP_PROXY_PORT is set (Context-Aware Access), routes via local ecp_http_proxy mTLS.
+  When unset (personal GCP / direct HTTPS), sends directly over HTTPS with gcloud bearer auth.
+  """
   ecp_port_str = os.environ.get('GSUTIL_ECP_PROXY_PORT', '').strip()
-  if not ecp_port_str:
-    return
-  ecp_port = int(ecp_port_str)
+  ecp_port = int(ecp_port_str) if ecp_port_str else None
   token_file = os.environ.get('GSUTIL_LIVE_TOKEN_FILE', '')
 
   import httplib2
@@ -304,13 +312,6 @@ def _install_live_ecp_transport_patches():
           if k != 'key'
       ]
       new_query = urllib.parse.urlencode(q_pairs)
-      new_uri = urllib.parse.urlunsplit((
-          'http',
-          f'127.0.0.1:{ecp_port}',
-          parsed.path,
-          new_query,
-          parsed.fragment,
-      ))
       new_headers = {}
       if headers:
         for k, v in headers.items():
@@ -321,7 +322,31 @@ def _install_live_ecp_transport_patches():
           new_headers[ks] = vs
       tok = _mint_gcloud_token(token_file)
       new_headers['Authorization'] = f'Bearer {tok}'
-      new_headers['x-goog-ecpproxy-target-host'] = mtls_host
+      if ecp_port is not None:
+        new_uri = urllib.parse.urlunsplit((
+            'http',
+            f'127.0.0.1:{ecp_port}',
+            parsed.path,
+            new_query,
+            parsed.fragment,
+        ))
+        new_headers['x-goog-ecpproxy-target-host'] = mtls_host
+        return orig_httplib2_request(
+            self,
+            new_uri,
+            method=method,
+            body=body,
+            headers=new_headers,
+            redirections=redirections,
+            connection_type=None,
+        )
+      new_uri = urllib.parse.urlunsplit((
+          parsed.scheme or 'https',
+          parsed.netloc,
+          parsed.path,
+          new_query,
+          parsed.fragment,
+      ))
       return orig_httplib2_request(
           self,
           new_uri,
@@ -329,7 +354,7 @@ def _install_live_ecp_transport_patches():
           body=body,
           headers=new_headers,
           redirections=redirections,
-          connection_type=None,
+          connection_type=connection_type,
       )
     return orig_httplib2_request(
         self,
@@ -347,10 +372,11 @@ def _install_live_ecp_transport_patches():
   orig_gs_make_request = boto.gs.connection.GSConnection.make_request
 
   def _ecp_gs_init(self, *args, **kwargs):
-    kwargs['is_secure'] = False
-    kwargs['host'] = '127.0.0.1'
-    kwargs['port'] = ecp_port
-    kwargs['calling_format'] = boto.s3.connection.OrdinaryCallingFormat()
+    if ecp_port is not None:
+      kwargs['is_secure'] = False
+      kwargs['host'] = '127.0.0.1'
+      kwargs['port'] = ecp_port
+      kwargs['calling_format'] = boto.s3.connection.OrdinaryCallingFormat()
     orig_gs_init(self, *args, **kwargs)
 
   def _ecp_gs_make_request(self, method, bucket='', key='', headers=None, *args, **kwargs):
@@ -360,7 +386,8 @@ def _install_live_ecp_transport_patches():
         del new_headers[k]
     tok = _mint_gcloud_token(token_file)
     new_headers['Authorization'] = f'Bearer {tok}'
-    new_headers['x-goog-ecpproxy-target-host'] = 'storage.mtls.googleapis.com'
+    if ecp_port is not None:
+      new_headers['x-goog-ecpproxy-target-host'] = 'storage.mtls.googleapis.com'
     return orig_gs_make_request(
         self, method, bucket=bucket, key=key, headers=new_headers, *args, **kwargs
     )

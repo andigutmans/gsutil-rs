@@ -501,3 +501,65 @@ async fn test_cloud_api_delegator_routing_rules() {
         .to_string()
         .contains("mTLS is not supported for the selected XML API"));
 }
+
+#[tokio::test]
+async fn test_xml_gs_hmac_uses_goog4_without_x_amz_headers() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/gs-xml-bkt"))
+        .respond_with(|req: &wiremock::Request| {
+            for (k, _) in &req.headers {
+                let lower = k.as_str().to_ascii_lowercase();
+                assert!(
+                    !lower.starts_with("x-amz-"),
+                    "GCS XML HMAC request must not mix x-amz-* headers with x-goog-*: found {lower}"
+                );
+            }
+            let auth = req
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            assert!(
+                auth.starts_with("GOOG4-HMAC-SHA256 "),
+                "Expected GOOG4-HMAC-SHA256 auth header, got: {auth}"
+            );
+            assert!(
+                auth.contains("/auto/storage/goog4_request"),
+                "Expected /auto/storage/goog4_request scope, got: {auth}"
+            );
+            assert!(req.headers.get("x-goog-date").is_some());
+            assert!(req.headers.get("x-goog-content-sha256").is_some());
+
+            ResponseTemplate::new(200).set_body_string(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <Name>gs-xml-bkt</Name>
+  <IsTruncated>false</IsTruncated>
+  <Contents>
+    <Key>hello.txt</Key>
+    <Size>5</Size>
+  </Contents>
+</ListBucketResult>"#,
+            )
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let gs_hmac: Arc<dyn gsutil_auth::TokenProvider> = Arc::new(HmacCredentials::new(
+        "GOOG1ETESTKEY00000001",
+        "mock-secret-key-for-gs-xml-test",
+        HmacProvider::Gcs,
+    ));
+    let client = XmlApiClient::with_config(
+        XmlClientConfig::for_mock_server("gs", server.uri()),
+        gs_hmac,
+    );
+    let items = client
+        .list_objects("gs-xml-bkt", &ListObjectsOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 1);
+}

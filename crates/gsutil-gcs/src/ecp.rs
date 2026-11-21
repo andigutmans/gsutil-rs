@@ -13,7 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use gsutil_auth::adc::certificate_config_path;
+use gsutil_auth::adc::{certificate_config_path, is_mtls_enabled};
 use gsutil_core::config::BotoConfig;
 use gsutil_core::error::{GsutilError, Result};
 use gsutil_core::signals::{register_cleanup, CleanupGuard};
@@ -86,10 +86,10 @@ impl EcpProxy {
             return Ok(None);
         }
 
-        // Respect explicit opt-out in .boto.
-        if boto_config.has_option("Credentials", "use_client_certificate")
-            && !boto_config.get_bool("Credentials", "use_client_certificate", true)
-        {
+        // Respect explicit opt-out in .boto or Cloud SDK env vars
+        // (e.g. CLOUDSDK_CONTEXT_AWARE_USE_CLIENT_CERTIFICATE=false,
+        // CLOUDSDK_CONTEXT_AWARE_USE_ECP_HTTP_PROXY=false, GOOGLE_API_USE_CLIENT_CERTIFICATE=false).
+        if !is_mtls_enabled(boto_config) {
             return Ok(None);
         }
 

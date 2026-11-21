@@ -26,7 +26,9 @@ use gsutil_core::api::{
 };
 use gsutil_core::config::{BotoConfig, RESUMABLE_CHUNK_QUANTUM};
 use gsutil_core::error::{GsutilError, Result, ServiceError, ServiceErrorKind};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE, RANGE, USER_AGENT};
+use reqwest::header::{
+    HeaderMap, HeaderName, HeaderValue, CONTENT_LENGTH, CONTENT_TYPE, RANGE, USER_AGENT,
+};
 use reqwest::{Client, Method, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -507,6 +509,8 @@ impl GcsJsonClient {
                             eprintln!("send body: {b}");
                         }
                         req = req.json(b);
+                    } else if matches!(method, Method::POST | Method::PUT | Method::PATCH) {
+                        req = req.header(CONTENT_LENGTH, "0");
                     }
                     let resp = req.send().await.map_err(reqwest_to_service_error)?;
                     let status = resp.status().as_u16();
