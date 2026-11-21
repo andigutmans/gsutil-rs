@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn test_all_40_plus_commands_and_15_old_aliases_registered() {
-        // 40 core commands + update = 41
+        // 40 upstream gsutil commands + update = 41
         assert_eq!(all_commands().len(), 41);
         assert_eq!(OLD_ALIAS_MAP.len(), 15);
         for (old_alias, target) in OLD_ALIAS_MAP {

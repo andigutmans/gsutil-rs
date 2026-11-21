@@ -10,8 +10,8 @@ upstream test assertions, setup, and teardown remain 100% untouched.
 Supports two backends:
   --backend mock : Spawns `gsutil-parity --serve-mock-tls` (2-tier CA self-signed TLS
                    in-memory GCS server) with isolated temp `.boto` and mock ADC.
-  --backend live : Spawns shared `/usr/bin/ecp_http_proxy` for Context-Aware Access mTLS/ECP and runs
-                   against a real GCP project (`your-gcp-project` by default).
+  --backend live : Runs against a real GCP project (`--project` or `GSUTIL_TEST_PROJECT`),
+                   using `/usr/bin/ecp_http_proxy` automatically if present.
 """
 
 import argparse
@@ -34,9 +34,10 @@ import unittest
 import urllib.parse
 import urllib.request
 
-GSUTIL_DIR = '/usr/lib/google-cloud-sdk/platform/gsutil'
-DEFAULT_RUST_BIN = './target/release/gsutil'
-DEFAULT_PARITY_BIN = './target/debug/gsutil-parity'
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+GSUTIL_DIR = os.environ.get('GSUTIL_DIR', '/usr/lib/google-cloud-sdk/platform/gsutil')
+DEFAULT_RUST_BIN = os.path.join(REPO_ROOT, 'target', 'release', 'gsutil')
+DEFAULT_PARITY_BIN = os.path.join(REPO_ROOT, 'target', 'debug', 'gsutil-parity')
 
 DEFAULT_STAGE2_MODULES = [
     'test_gsutil',
@@ -694,9 +695,11 @@ def main():
   if not os.path.exists(args.rust_bin):
     sys.exit(f'Rust binary not found: {args.rust_bin}')
 
-  project_id = args.project or (
-      'mock-project-123' if args.backend == 'mock' else 'your-gcp-project'
+  project_id = args.project or os.environ.get('GSUTIL_TEST_PROJECT') or (
+      'mock-project-123' if args.backend == 'mock' else ''
   )
+  if args.backend == 'live' and not project_id:
+    sys.exit('Live backend requires --project <GCP_PROJECT_ID> or GSUTIL_TEST_PROJECT')
   cmd_timeout = args.timeout or (20 if args.backend == 'mock' else 120)
   test_timeout = args.test_timeout or (25 if args.backend == 'mock' else 150)
   module_timeout = args.module_timeout or (150 if args.backend == 'mock' else 300)

@@ -1,6 +1,7 @@
 //! True differential Live GCS test suite (`--mode live`) comparing
 //! `/usr/bin/gsutil -o GSUtil:use_gcloud_storage=True` against Rust `gsutil`
-//! across all provisioned multi-topology buckets in `your-gcp-project`.
+//! across multi-topology buckets configured via `GSUTIL_TEST_PROJECT` /
+//! `GSUTIL_TEST_BUCKET`.
 //!
 //! Uses isolated per-run prefixes (`py-<run_id>/` vs `rs-<run_id>/`) and
 //! realistic payloads (0-byte, 1 B, 64 KiB random binary, 9 MiB resumable,
@@ -30,8 +31,10 @@ impl LiveTopology {
             .trim_start_matches("gs://")
             .trim_end_matches('/')
             .to_string();
-        let project =
-            std::env::var("GSUTIL_TEST_PROJECT").unwrap_or_else(|_| "your-gcp-project".into());
+        let project = std::env::var("GSUTIL_TEST_PROJECT")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| ubla.strip_suffix("-bucket").unwrap_or(&ubla).to_string());
         let env_or = |var: &str, default: String| {
             std::env::var(var)
                 .ok()
@@ -592,7 +595,7 @@ pub fn run_live_gcs_suite(
     );
 
     // -------------------------------------------------------------------------
-    // 2. Versioned Bucket (`your-gcp-project-ver`): ls -a, du -a, rm -a
+    // 2. Versioned Bucket (`<project>-ver`): ls -a, du -a, rm -a
     // -------------------------------------------------------------------------
     let ver_py = format!("gs://{}/{}", topo.versioned_bucket, py_pfx);
     let ver_rs = format!("gs://{}/{}", topo.versioned_bucket, rs_pfx);
@@ -631,7 +634,7 @@ pub fn run_live_gcs_suite(
     );
 
     // -------------------------------------------------------------------------
-    // 3. Dual-Region Bucket (`your-gcp-project-dual`): rpo get/set
+    // 3. Dual-Region Bucket (`<project>-dual`): rpo get/set
     // -------------------------------------------------------------------------
     let dual_uri = format!("gs://{}", topo.dual_bucket);
     run_diff_live(
@@ -645,7 +648,7 @@ pub fn run_live_gcs_suite(
     );
 
     // -------------------------------------------------------------------------
-    // 4. Requester Pays Bucket (`your-gcp-project-rp`): -u succeeds, no -u fails in Rust
+    // 4. Requester Pays Bucket (`<project>-rp`): -u succeeds, no -u fails in Rust
     // -------------------------------------------------------------------------
     let rp_uri = format!("gs://{}", topo.rp_bucket);
     if matches_filter(filter, "live_rp_ls_without_u_fails", "live_gcs", "ls") {
@@ -688,7 +691,7 @@ pub fn run_live_gcs_suite(
     );
 
     // -------------------------------------------------------------------------
-    // 5. Retention Bucket (`your-gcp-project-ret`): exact native gsutil format
+    // 5. Retention Bucket (`<project>-ret`): exact native gsutil format
     // -------------------------------------------------------------------------
     let ret_uri = format!("gs://{}", topo.ret_bucket);
     if matches_filter(filter, "live_ret_get_initial", "live_gcs", "retention") {
