@@ -276,8 +276,8 @@ def _start_live_backend(project_id):
 def _install_live_ecp_transport_patches():
   """Route Python test harness HTTP clients (httplib2 + boto GSConnection) with gcloud bearer auth.
 
-  When GSUTIL_ECP_PROXY_PORT is set (Context-Aware Access), routes via local ecp_http_proxy mTLS.
-  When unset (personal GCP / direct HTTPS), sends directly over HTTPS with gcloud bearer auth.
+  When GSUTIL_ECP_PROXY_PORT is set, routes via local ecp_http_proxy mTLS.
+  When unset, sends directly over HTTPS with gcloud bearer auth.
   """
   ecp_port_str = os.environ.get('GSUTIL_ECP_PROXY_PORT', '').strip()
   ecp_port = int(ecp_port_str) if ecp_port_str else None

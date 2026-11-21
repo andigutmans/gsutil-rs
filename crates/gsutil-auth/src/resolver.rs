@@ -147,7 +147,7 @@ pub async fn resolve_credentials_with_options(
         }
     }
 
-    // 5. On Context-Aware Access with mTLS/ECP enabled, prefer `gcloud` active user credentials
+    // 5. When Context-Aware Access mTLS/ECP is enabled, prefer `gcloud` active user credentials
     //    because `gcloud` natively negotiates ECP/mTLS certificates and RAPT reauth.
     if base_creds.is_none() && options.allow_gcloud_fallback && is_mtls_enabled(config) {
         let gcloud = GcloudCredentials::with_cache_dir(config.state_dir());
