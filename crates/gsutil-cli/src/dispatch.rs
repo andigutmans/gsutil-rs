@@ -177,7 +177,16 @@ pub async fn run_named_command(
 
     ctx.command_alias_used = cmd_name.clone();
 
-    // Translate OLD_ALIAS_MAP if a deprecated alias was used.
+    // Translate OLD_ALIAS_MAP if a deprecated alias was used and emit the standard warning.
+    if lookup_old_alias(&cmd_name).is_some() {
+        ctx.warn(&format!(
+            "You are using a deprecated alias, \"{cmd_name}\", for the \"{}\" command.\n\
+             This will stop working on 9/9/2014. Please use \"{}\" with the\n\
+             appropriate sub-command in the future. See \"gsutil help {}\" for\n\
+             details.",
+            spec.name, spec.name, spec.name
+        ));
+    }
     let translated_args = translate_deprecated_alias(&cmd_name, &args);
 
     // Parse sub-options using getopt (skip for commands with subcommands+subopts unless they handle it).

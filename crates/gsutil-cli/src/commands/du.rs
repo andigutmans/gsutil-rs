@@ -3,7 +3,7 @@
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 
-use gsutil_core::api::BucketListingRef;
+use gsutil_core::api::{BucketListingRef, CloudApi};
 use gsutil_core::error::{GsutilError, Result};
 use gsutil_core::url::{contains_wildcard, strip_one_slash, StorageUrl};
 use gsutil_core::wildcard::WildcardMatcher;
@@ -12,7 +12,7 @@ use crate::context::CommandContext;
 use crate::dispatch::{CommandSpec, NO_MAX};
 use crate::format::make_human_readable;
 use crate::getopt::OptPair;
-use crate::wildcard_iter::{iter_buckets, iter_objects};
+use crate::wildcard_iter::{iter_all, iter_buckets, iter_objects};
 
 pub const SYNOPSIS: &str = "\n  gsutil du url...\n";
 
@@ -139,67 +139,71 @@ pub async fn run(ctx: &mut CommandContext, sub_opts: &[OptPair], args: &[String]
         for blr in top_refs {
             let target_url = blr.url();
             let target_str = target_url.url_string();
-            let query_pattern = if target_url.is_bucket() || target_str.ends_with('/') {
-                target_url.create_prefix_url(Some("**"))
-            } else {
-                target_str.clone()
-            };
 
-            let mut objs = iter_objects(
-                api.as_ref(),
-                &query_pattern,
-                project_id.as_deref(),
-                all_versions,
-                Some(&["name".to_string(), "size".to_string()]),
-            )
-            .await?;
-
-            // If a non-wildcard object URL (e.g. `gs://bkt/subdir`) matched a prefix rather
-            // than an object, recurse into that prefix (matching `LsHelper(..., should_recurse=True)`).
-            if objs.is_empty()
-                && !target_url.is_bucket()
-                && !target_str.ends_with('/')
-                && !contains_wildcard(&target_str)
-            {
-                let sub_pattern = target_url.create_prefix_url(Some("**"));
-                objs = iter_objects(
+            let (exp_objs, exp_bytes) = if summary_only {
+                let query_pattern = if target_url.is_bucket() || target_str.ends_with('/') {
+                    target_url.create_prefix_url(Some("**"))
+                } else {
+                    target_str.clone()
+                };
+                let mut objs = iter_objects(
                     api.as_ref(),
-                    &sub_pattern,
+                    &query_pattern,
                     project_id.as_deref(),
                     all_versions,
                     Some(&["name".to_string(), "size".to_string()]),
                 )
                 .await?;
-            }
-
-            let mut exp_objs = 0u64;
-            let mut exp_bytes = 0u64;
-
-            for obj_blr in objs {
-                if let BucketListingRef::Object { url, metadata } = obj_blr {
-                    let obj_url_str = url.url_string();
-                    let obj_name = url.object_name().unwrap_or("");
-                    if matchers
-                        .iter()
-                        .any(|m| m.is_match(obj_name) || m.is_match(&obj_url_str))
-                    {
-                        continue;
-                    }
-                    let size = metadata.as_ref().map_or(0, |m| m.size_bytes());
-                    exp_objs += 1;
-                    exp_bytes += size;
-
-                    if !summary_only {
-                        let size_str = if human_readable {
-                            make_human_readable(size)
-                        } else {
-                            size.to_string()
-                        };
-                        let line = format!("{size_str:<11}  {obj_url_str}{line_ending}");
-                        ctx.write_stdout(line.as_bytes())?;
+                if objs.is_empty()
+                    && !target_url.is_bucket()
+                    && !target_str.ends_with('/')
+                    && !contains_wildcard(&target_str)
+                {
+                    let sub_pattern = target_url.create_prefix_url(Some("**"));
+                    objs = iter_objects(
+                        api.as_ref(),
+                        &sub_pattern,
+                        project_id.as_deref(),
+                        all_versions,
+                        Some(&["name".to_string(), "size".to_string()]),
+                    )
+                    .await?;
+                }
+                let mut o_cnt = 0u64;
+                let mut b_cnt = 0u64;
+                for obj_blr in objs {
+                    if let BucketListingRef::Object { url, metadata } = obj_blr {
+                        let obj_url_str = url.url_string();
+                        let obj_name = url.object_name().unwrap_or("");
+                        if matchers
+                            .iter()
+                            .any(|m| m.is_match(obj_name) || m.is_match(&obj_url_str))
+                        {
+                            continue;
+                        }
+                        o_cnt += 1;
+                        b_cnt += metadata.as_ref().map_or(0, |m| m.size_bytes());
                     }
                 }
-            }
+                (o_cnt, b_cnt)
+            } else {
+                let start_pattern = if target_url.is_bucket() || target_str.ends_with('/') {
+                    target_url.create_prefix_url(Some("*"))
+                } else {
+                    target_str.clone()
+                };
+                du_recurse_and_print(
+                    ctx,
+                    api.as_ref(),
+                    start_pattern,
+                    project_id.as_deref(),
+                    all_versions,
+                    human_readable,
+                    line_ending,
+                    &matchers,
+                )
+                .await?
+            };
 
             if target_url.is_object()
                 && exp_objs == 0
@@ -239,4 +243,85 @@ pub async fn run(ctx: &mut CommandContext, sub_opts: &[OptPair], args: &[String]
     }
 
     Ok(0)
+}
+
+type DuFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(u64, u64)>> + 'a>>;
+
+#[allow(clippy::too_many_arguments)]
+fn du_recurse_and_print<'a>(
+    ctx: &'a CommandContext,
+    api: &'a dyn CloudApi,
+    pattern: String,
+    project_id: Option<&'a str>,
+    all_versions: bool,
+    human_readable: bool,
+    line_ending: &'a str,
+    matchers: &'a [WildcardMatcher],
+) -> DuFuture<'a> {
+    Box::pin(async move {
+        let items = iter_all(
+            api,
+            &pattern,
+            project_id,
+            all_versions,
+            Some(&["name".to_string(), "size".to_string()]),
+        )
+        .await?;
+        let mut total_objs = 0u64;
+        let mut total_bytes = 0u64;
+
+        for blr in items {
+            match blr {
+                BucketListingRef::Object { url, metadata } => {
+                    let obj_url_str = url.url_string();
+                    let obj_name = url.object_name().unwrap_or("");
+                    if matchers
+                        .iter()
+                        .any(|m| m.is_match(obj_name) || m.is_match(&obj_url_str))
+                    {
+                        continue;
+                    }
+                    let size = metadata.as_ref().map_or(0, |m| m.size_bytes());
+                    total_objs += 1;
+                    total_bytes += size;
+                    let size_str = if human_readable {
+                        make_human_readable(size)
+                    } else {
+                        size.to_string()
+                    };
+                    let line = format!("{size_str:<11}  {obj_url_str}{line_ending}");
+                    ctx.write_stdout(line.as_bytes())?;
+                }
+                BucketListingRef::Prefix { url, .. } => {
+                    let pref_url_str = url.url_string();
+                    if matchers.iter().any(|m| m.is_match(&pref_url_str)) {
+                        continue;
+                    }
+                    let sub_pat = url.create_prefix_url(Some("*"));
+                    let (no, nb) = du_recurse_and_print(
+                        ctx,
+                        api,
+                        sub_pat,
+                        project_id,
+                        all_versions,
+                        human_readable,
+                        line_ending,
+                        matchers,
+                    )
+                    .await?;
+                    total_objs += no;
+                    total_bytes += nb;
+                    let size_str = if human_readable {
+                        make_human_readable(nb)
+                    } else {
+                        nb.to_string()
+                    };
+                    let line = format!("{size_str:<11}  {pref_url_str}{line_ending}");
+                    ctx.write_stdout(line.as_bytes())?;
+                }
+                BucketListingRef::Bucket { .. } => {}
+            }
+        }
+        Ok((total_objs, total_bytes))
+    })
 }

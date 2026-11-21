@@ -5,6 +5,7 @@ pub mod commands;
 pub mod context;
 pub mod difflib;
 pub mod dispatch;
+pub mod encryption;
 pub mod format;
 pub mod getopt;
 pub mod global_opts;
@@ -12,7 +13,7 @@ pub mod help_topics;
 pub mod wildcard_iter;
 
 use std::io::{self, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use gsutil_core::api::CloudApi;
 use gsutil_core::config::BotoConfig;
@@ -62,6 +63,91 @@ for assistance.
 pub async fn run_from_env() -> i32 {
     let raw_argv: Vec<String> = std::env::args().collect();
     run_cli_with_api(&raw_argv, None).await
+}
+
+/// Captured output from [`run_cli_captured`] for unit & integration tests.
+#[derive(Debug, Clone)]
+pub struct CliOutput {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Run gsutil with an optional `CloudApi` and capture stdout/stderr in memory.
+pub async fn run_cli_captured(raw_argv: &[String], api: Option<Arc<dyn CloudApi>>) -> CliOutput {
+    let stdout_buf = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+    let mut config = BotoConfig::load_default();
+    let cli_args = if raw_argv.len() > 1 {
+        &raw_argv[1..]
+    } else {
+        &[]
+    };
+
+    let (global, remaining) = match parse_global_options(cli_args, &mut config) {
+        Ok(res) => res,
+        Err(e) => {
+            if let Some(msg) = e.cli_message() {
+                let _ = writeln!(stderr_buf.lock().unwrap(), "{msg}");
+            }
+            return CliOutput {
+                exit_code: e.exit_code(),
+                stdout: String::new(),
+                stderr: String::from_utf8_lossy(&stderr_buf.lock().unwrap()).into_owned(),
+            };
+        }
+    };
+
+    let debug_level = global.debug_level;
+    let test_exception_traces = global.test_exception_traces;
+    let show_usage_and_exit = global.show_usage_and_exit;
+
+    let mut ctx =
+        CommandContext::with_capture(config, global, api, stdout_buf.clone(), stderr_buf.clone());
+
+    if show_usage_and_exit {
+        let _ = run_named_command(&mut ctx, "help", &[]).await;
+        return CliOutput {
+            exit_code: 1,
+            stdout: String::from_utf8_lossy(&stdout_buf.lock().unwrap()).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr_buf.lock().unwrap()).into_owned(),
+        };
+    }
+
+    let (command_name, cmd_args): (String, Vec<String>) = if ctx.global.version {
+        let rest = if remaining.len() > 1 {
+            remaining[1..].to_vec()
+        } else {
+            Vec::new()
+        };
+        ("version".to_string(), rest)
+    } else if remaining.is_empty() {
+        ("help".to_string(), Vec::new())
+    } else {
+        (remaining[0].clone(), remaining[1..].to_vec())
+    };
+
+    let exit_code = match run_named_command(&mut ctx, &command_name, &cmd_args).await {
+        Ok(code) => code,
+        Err(e) => {
+            if let Some(msg) = e.cli_message() {
+                if debug_level >= DEBUGLEVEL_DUMP_REQUESTS || test_exception_traces {
+                    ctx.error(&format!("DEBUG: Exception stack trace:\n    {e:?}\n{msg}"));
+                } else {
+                    ctx.error(&msg);
+                }
+            }
+            e.exit_code()
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&stdout_buf.lock().unwrap()).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_buf.lock().unwrap()).into_owned();
+    CliOutput {
+        exit_code,
+        stdout,
+        stderr,
+    }
 }
 
 /// Core CLI entrypoint matching `gslib/__main__.py::main()`.

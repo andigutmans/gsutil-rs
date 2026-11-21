@@ -2,9 +2,9 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use gsutil_core::api::{CloudApi, Preconditions};
+use gsutil_core::api::{CloudApi, KmsApi, Preconditions, PubsubApi};
 use gsutil_core::config::BotoConfig;
 use gsutil_core::error::{GsutilError, Result};
 
@@ -18,8 +18,12 @@ pub struct CommandContext {
     pub config: BotoConfig,
     pub global: GlobalOptions,
     pub api: Option<Arc<dyn CloudApi>>,
+    pub kms_api: Option<Arc<dyn KmsApi>>,
+    pub pubsub_api: Option<Arc<dyn PubsubApi>>,
     pub command_alias_used: String,
     pub is_tty: bool,
+    pub stdout_capture: Option<Arc<Mutex<Vec<u8>>>>,
+    pub stderr_capture: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
 impl CommandContext {
@@ -29,13 +33,38 @@ impl CommandContext {
             config,
             global,
             api,
+            kms_api: None,
+            pubsub_api: None,
             command_alias_used: String::new(),
             is_tty,
+            stdout_capture: None,
+            stderr_capture: None,
         }
     }
 
-    /// Return the configured `CloudApi`, lazily constructing a `GcsJsonClient`
-    /// backed by `gsutil-auth` if none was explicitly injected.
+    /// Create a `CommandContext` with in-memory stdout/stderr capture buffers (for testing).
+    pub fn with_capture(
+        config: BotoConfig,
+        global: GlobalOptions,
+        api: Option<Arc<dyn CloudApi>>,
+        stdout_capture: Arc<Mutex<Vec<u8>>>,
+        stderr_capture: Arc<Mutex<Vec<u8>>>,
+    ) -> Self {
+        Self {
+            config,
+            global,
+            api,
+            kms_api: None,
+            pubsub_api: None,
+            command_alias_used: String::new(),
+            is_tty: false,
+            stdout_capture: Some(stdout_capture),
+            stderr_capture: Some(stderr_capture),
+        }
+    }
+
+    /// Return the configured `CloudApi`, lazily constructing a `CloudApiDelegator`
+    /// (plus `KmsClient` and `PubsubClient`) backed by `gsutil-auth` if none was injected.
     pub async fn api(&mut self) -> Result<Arc<dyn CloudApi>> {
         if let Some(ref existing) = self.api {
             return Ok(existing.clone());
@@ -50,6 +79,7 @@ impl CommandContext {
         client_cfg.custom_headers = self.global.headers.clone();
         client_cfg.trace_token = self.global.trace_token.clone();
         client_cfg.perf_trace_token = self.global.perf_trace_token.clone();
+        client_cfg.debug_level = self.global.debug_level;
         let gs_json: Arc<dyn CloudApi> = Arc::new(gsutil_gcs::GcsJsonClient::with_http_config(
             &self.config,
             client_cfg,
@@ -60,8 +90,11 @@ impl CommandContext {
             &self.config,
             creds.clone(),
         ));
-        let s3_xml: Arc<dyn CloudApi> =
-            Arc::new(gsutil_gcs::XmlApiClient::new("s3", &self.config, creds));
+        let s3_xml: Arc<dyn CloudApi> = Arc::new(gsutil_gcs::XmlApiClient::new(
+            "s3",
+            &self.config,
+            creds.clone(),
+        ));
         let delegator = gsutil_gcs::CloudApiDelegator::from_clients(
             &self.config,
             "gs",
@@ -69,6 +102,16 @@ impl CommandContext {
             gs_xml,
             s3_xml,
         );
+        if self.kms_api.is_none() {
+            if let Ok(kms) = gsutil_gcs::KmsClient::new(&self.config, creds.clone()) {
+                self.kms_api = Some(Arc::new(kms));
+            }
+        }
+        if self.pubsub_api.is_none() {
+            if let Ok(ps) = gsutil_gcs::PubsubClient::new(&self.config, creds) {
+                self.pubsub_api = Some(Arc::new(ps));
+            }
+        }
         let arc: Arc<dyn CloudApi> = Arc::new(delegator);
         self.api = Some(arc.clone());
         Ok(arc)
@@ -86,6 +129,12 @@ impl CommandContext {
 
     /// Write a line to stdout, converting `ErrorKind::BrokenPipe` into `GsutilError::BrokenPipe`.
     pub fn println(&self, s: &str) -> Result<()> {
+        if let Some(ref buf) = self.stdout_capture {
+            if let Ok(mut guard) = buf.lock() {
+                let _ = writeln!(guard, "{s}");
+            }
+            return Ok(());
+        }
         let mut out = io::stdout().lock();
         if let Err(e) = writeln!(out, "{s}") {
             if e.kind() == io::ErrorKind::BrokenPipe {
@@ -98,6 +147,12 @@ impl CommandContext {
 
     /// Write raw bytes to stdout, converting `ErrorKind::BrokenPipe` into `GsutilError::BrokenPipe`.
     pub fn write_stdout(&self, bytes: &[u8]) -> Result<()> {
+        if let Some(ref buf) = self.stdout_capture {
+            if let Ok(mut guard) = buf.lock() {
+                guard.extend_from_slice(bytes);
+            }
+            return Ok(());
+        }
         let mut out = io::stdout().lock();
         if let Err(e) = out.write_all(bytes) {
             if e.kind() == io::ErrorKind::BrokenPipe {
@@ -110,6 +165,9 @@ impl CommandContext {
 
     /// Flush stdout, converting `ErrorKind::BrokenPipe` into `GsutilError::BrokenPipe`.
     pub fn flush_stdout(&self) -> Result<()> {
+        if self.stdout_capture.is_some() {
+            return Ok(());
+        }
         let mut out = io::stdout().lock();
         if let Err(e) = out.flush() {
             if e.kind() == io::ErrorKind::BrokenPipe {
@@ -123,18 +181,28 @@ impl CommandContext {
     /// Log an informational status message to stderr unless `-q` (`--quiet`) is set.
     pub fn info(&self, msg: &str) {
         if !self.global.quiet {
-            let _ = writeln!(io::stderr(), "{msg}");
+            self.write_stderr_line(msg);
         }
     }
 
     /// Log a warning message to stderr.
     pub fn warn(&self, msg: &str) {
-        let _ = writeln!(io::stderr(), "{msg}");
+        self.write_stderr_line(msg);
     }
 
     /// Log an error message to stderr.
     pub fn error(&self, msg: &str) {
-        let _ = writeln!(io::stderr(), "{msg}");
+        self.write_stderr_line(msg);
+    }
+
+    fn write_stderr_line(&self, msg: &str) {
+        if let Some(ref buf) = self.stderr_capture {
+            if let Ok(mut guard) = buf.lock() {
+                let _ = writeln!(guard, "{msg}");
+            }
+        } else {
+            let _ = writeln!(io::stderr(), "{msg}");
+        }
     }
 
     /// Extract preconditions from global `-h` headers (`x-goog-if-generation-match`,

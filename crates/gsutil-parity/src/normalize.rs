@@ -30,7 +30,9 @@ pub struct NormalizeContext {
     pub temp_paths: Vec<String>,
     /// Test bucket names to replace with `<TEST_BUCKET>`.
     pub test_buckets: Vec<String>,
-    /// Strip interactive progress/spinner lines from stderr.
+    /// Arbitrary `(needle, replacement)` pairs (e.g. `py-<id>` -> `<PREFIX>`).
+    pub replacements: Vec<(String, String)>,
+    /// Strip interactive progress/spinner lines and TLS-mock warning banner from stderr.
     pub strip_ui_progress: bool,
 }
 
@@ -42,6 +44,11 @@ impl NormalizeContext {
 
     pub fn with_test_bucket(mut self, bucket: impl Into<String>) -> Self {
         self.test_buckets.push(bucket.into());
+        self
+    }
+
+    pub fn with_replacement(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
+        self.replacements.push((from.into(), to.into()));
         self
     }
 
@@ -76,6 +83,24 @@ fn re_stat_generation() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"(?m)(Generation:\s+)\d+").expect("valid regex"))
 }
 
+fn re_stat_metageneration() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?m)(Metageneration:\s+)\d+").expect("valid regex"))
+}
+
+fn re_stat_etag() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?m)(ETag:\s+)\S+").expect("valid regex"))
+}
+
+fn re_tls_warning() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?s)\*+ WARNING \*+\n.*?https_validate_certificates.*?\*+ WARNING \*+\n?")
+            .expect("valid regex")
+    })
+}
+
 fn re_ui_progress() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -97,6 +122,11 @@ pub fn replace_paths(input: &str, ctx: &NormalizeContext) -> String {
             out = out.replace(b, "<TEST_BUCKET>");
         }
     }
+    for (from, to) in &ctx.replacements {
+        if !from.is_empty() {
+            out = out.replace(from, to);
+        }
+    }
     out
 }
 
@@ -111,7 +141,12 @@ pub fn normalize_output(input: &str, ctx: &NormalizeContext) -> String {
     out = re_stat_generation()
         .replace_all(&out, "${1}<GEN>")
         .into_owned();
+    out = re_stat_metageneration()
+        .replace_all(&out, "${1}<METAGEN>")
+        .into_owned();
+    out = re_stat_etag().replace_all(&out, "${1}<ETAG>").into_owned();
     if ctx.strip_ui_progress {
+        out = re_tls_warning().replace_all(&out, "").into_owned();
         out = re_ui_progress().replace_all(&out, "").into_owned();
         // Collapse blank lines introduced by stripped UI lines.
         let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();

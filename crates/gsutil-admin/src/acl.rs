@@ -227,20 +227,40 @@ pub async fn run_acl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
             let urls = expand_cloud_urls(ctx, &args[1..], false, false).await?;
             for u in urls {
                 let bname = u.bucket_name.as_deref().unwrap_or("");
+                let api = ctx.api.for_provider(u.scheme.as_str())?;
                 if let Some(oname) = u.object_name.as_deref() {
-                    let meta = ctx
-                        .api
+                    let meta = api
                         .get_object_metadata(bname, oname, u.generation.as_deref(), None)
                         .await?;
-                    let acl = meta.acl.unwrap_or_default();
-                    let json = serde_json::to_string_pretty(&acl).map_err(|e| {
+                    let mut acl = meta.acl.unwrap_or_default();
+                    for entry in &mut acl {
+                        entry.kind = None;
+                        entry.id = None;
+                        entry.bucket = None;
+                        entry.object = None;
+                        entry.generation = None;
+                        entry.etag = None;
+                    }
+                    let val = serde_json::to_value(&acl).map_err(|e| {
+                        GsutilError::command(format!("Failed to serialize ACL: {e}"))
+                    })?;
+                    let json = serde_json::to_string_pretty(&val).map_err(|e| {
                         GsutilError::command(format!("Failed to serialize ACL: {e}"))
                     })?;
                     writeln!(ctx.out, "{json}")?;
                 } else {
-                    let meta = ctx.api.get_bucket(bname, None).await?;
-                    let acl = meta.acl.unwrap_or_default();
-                    let json = serde_json::to_string_pretty(&acl).map_err(|e| {
+                    let meta = api.get_bucket(bname, None).await?;
+                    let mut acl = meta.acl.unwrap_or_default();
+                    for entry in &mut acl {
+                        entry.kind = None;
+                        entry.id = None;
+                        entry.bucket = None;
+                        entry.etag = None;
+                    }
+                    let val = serde_json::to_value(&acl).map_err(|e| {
+                        GsutilError::command(format!("Failed to serialize ACL: {e}"))
+                    })?;
+                    let json = serde_json::to_string_pretty(&val).map_err(|e| {
                         GsutilError::command(format!("Failed to serialize ACL: {e}"))
                     })?;
                     writeln!(ctx.out, "{json}")?;
@@ -430,9 +450,24 @@ pub async fn run_defacl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<(
             let buckets = expand_bucket_urls(ctx, &args[1..], "defacl").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                let meta = ctx.api.get_bucket(name, None).await?;
-                let def_acl = meta.default_object_acl.unwrap_or_default();
-                let json = serde_json::to_string_pretty(&def_acl).map_err(|e| {
+                let meta = ctx
+                    .api
+                    .for_provider(b.scheme.as_str())?
+                    .get_bucket(name, None)
+                    .await?;
+                let mut def_acl = meta.default_object_acl.unwrap_or_default();
+                for entry in &mut def_acl {
+                    entry.kind = None;
+                    entry.id = None;
+                    entry.bucket = None;
+                    entry.object = None;
+                    entry.generation = None;
+                    entry.etag = None;
+                }
+                let val = serde_json::to_value(&def_acl).map_err(|e| {
+                    GsutilError::command(format!("Failed to serialize default object ACL: {e}"))
+                })?;
+                let json = serde_json::to_string_pretty(&val).map_err(|e| {
                     GsutilError::command(format!("Failed to serialize default object ACL: {e}"))
                 })?;
                 writeln!(ctx.out, "{json}")?;

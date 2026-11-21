@@ -346,12 +346,9 @@ impl BotoConfig {
             .join(".gsutil")
     }
 
+    /// Default is `0` (disabled), matching Python `gslib/commands/config.py`.
     pub fn parallel_composite_upload_threshold(&self) -> u64 {
-        self.get_size_bytes(
-            "GSUtil",
-            "parallel_composite_upload_threshold",
-            150 * ONE_MIB,
-        )
+        self.get_size_bytes("GSUtil", "parallel_composite_upload_threshold", 0)
     }
 
     pub fn parallel_composite_upload_component_size(&self) -> u64 {

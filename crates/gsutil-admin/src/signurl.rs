@@ -39,19 +39,17 @@ impl std::fmt::Debug for ServiceAccountKeyFile {
     }
 }
 
-/// Percent-encode a query parameter value matching Python `urllib.parse.quote_plus`.
-fn quote_plus(s: &str) -> String {
-    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+/// RFC 3986 percent-encode a query parameter value (`%20` for spaces, matching GCS V4 signing).
+fn quote_rfc3986(s: &str) -> String {
+    url::form_urlencoded::byte_serialize(s.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20")
 }
 
-/// Percent-encode an object path while preserving `/` separators.
+/// Percent-encode an object path while preserving `/` separators (`%20` for spaces).
 fn encode_gcs_path(path: &str) -> String {
     path.split('/')
-        .map(|seg| {
-            url::form_urlencoded::byte_serialize(seg.as_bytes())
-                .collect::<String>()
-                .replace('+', "%20")
-        })
+        .map(quote_rfc3986)
         .collect::<Vec<_>>()
         .join("/")
 }
@@ -98,7 +96,7 @@ pub fn build_v4_payload(
 
     let canonical_query_string = query_params
         .iter()
-        .map(|(k, v)| format!("{k}={}", quote_plus(v)))
+        .map(|(k, v)| format!("{k}={}", quote_rfc3986(v)))
         .collect::<Vec<_>>()
         .join("&");
 
@@ -190,11 +188,11 @@ pub fn sign_url_v2(
 
     let mut url = format!(
         "https://{host}/{encoded_path}?GoogleAccessId={}&Expires={expiration}&Signature={}",
-        quote_plus(client_email),
-        quote_plus(&sig_b64)
+        quote_rfc3986(client_email),
+        quote_rfc3986(&sig_b64)
     );
     if let Some(gen) = generation {
-        url.push_str(&format!("&generation={}", quote_plus(gen)));
+        url.push_str(&format!("&generation={}", quote_rfc3986(gen)));
     }
     url
 }
@@ -207,6 +205,7 @@ pub async fn run_signurl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
     let mut billing_project: Option<String> = None;
     let mut use_iam_sign = false;
     let mut version: u8 = 4;
+    let mut p12_password = "notasecret".to_string();
     let mut positional = Vec::new();
 
     let mut i = 0;
@@ -268,16 +267,23 @@ pub async fn run_signurl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
                 };
             }
             "-p" => {
-                // PKCS12 password flag (accepted for CLI compatibility)
                 i += 1;
-                if i >= args.len() {
-                    return Err(GsutilError::command("Option -p requires a password."));
-                }
+                p12_password = args
+                    .get(i)
+                    .ok_or_else(|| GsutilError::command("Option -p requires a password."))?
+                    .clone();
             }
             other => positional.push(other.to_string()),
         }
         i += 1;
     }
+
+    let is_resumable = method == "RESUMABLE";
+    let http_method = if is_resumable {
+        "POST".to_string()
+    } else {
+        method.clone()
+    };
 
     let (key_file_opt, url_args) = if use_iam_sign {
         if positional.is_empty() {
@@ -296,20 +302,25 @@ pub async fn run_signurl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
     };
 
     let loaded_key = if let Some(key_path) = key_file_opt {
-        let raw = std::fs::read_to_string(key_path).map_err(|e| {
-            GsutilError::command(format!(
-                "Could not read private key file \"{key_path}\": {e}"
-            ))
-        })?;
-        let sa_key: ServiceAccountKeyFile = serde_json::from_str(&raw).map_err(|e| {
-            GsutilError::command(format!(
-                "Could not parse service account JSON key \"{key_path}\": {e}"
-            ))
-        })?;
-        let rsa_key = RsaPrivateKey::from_pkcs8_pem(&sa_key.private_key).map_err(|e| {
-            GsutilError::command(format!("Invalid RSA private key in \"{key_path}\": {e}"))
-        })?;
-        Some((sa_key.client_email, rsa_key))
+        if key_path.to_ascii_lowercase().ends_with(".p12") {
+            let (email, rsa_key) = load_p12_key(key_path, &p12_password)?;
+            Some((email, rsa_key))
+        } else {
+            let raw = std::fs::read_to_string(key_path).map_err(|e| {
+                GsutilError::command(format!(
+                    "Could not read private key file \"{key_path}\": {e}"
+                ))
+            })?;
+            let sa_key: ServiceAccountKeyFile = serde_json::from_str(&raw).map_err(|e| {
+                GsutilError::command(format!(
+                    "Could not parse service account JSON key \"{key_path}\": {e}"
+                ))
+            })?;
+            let rsa_key = RsaPrivateKey::from_pkcs8_pem(&sa_key.private_key).map_err(|e| {
+                GsutilError::command(format!("Invalid RSA private key in \"{key_path}\": {e}"))
+            })?;
+            Some((sa_key.client_email, rsa_key))
+        }
     } else {
         None
     };
@@ -334,13 +345,16 @@ pub async fn run_signurl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
         if let Some(ref ct) = content_type {
             signed_headers.insert("content-type".to_string(), ct.clone());
         }
+        if is_resumable {
+            signed_headers.insert("x-goog-resumable".to_string(), "start".to_string());
+        }
 
         let signed_url = if let Some((ref client_email, ref rsa_key)) = loaded_key {
             if version == 2 {
                 sign_url_v2(
                     rsa_key,
                     client_email,
-                    &method,
+                    &http_method,
                     duration_secs,
                     DEFAULT_HOST,
                     &path,
@@ -352,7 +366,7 @@ pub async fn run_signurl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
                 sign_url_v4(
                     rsa_key,
                     client_email,
-                    &method,
+                    &http_method,
                     duration_secs,
                     DEFAULT_HOST,
                     &path,
@@ -366,7 +380,7 @@ pub async fn run_signurl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
         } else {
             ctx.api
                 .sign_url(&SignUrlOptions {
-                    method: method.clone(),
+                    method: http_method.clone(),
                     duration_secs,
                     path: path.clone(),
                     generation: u.generation.clone(),
@@ -378,10 +392,77 @@ pub async fn run_signurl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
 
         writeln!(
             ctx.out,
-            "{}\t{method}\t{expiration_str}\t{signed_url}",
+            "{}\t{http_method}\t{expiration_str}\t{signed_url}",
             u.url_string()
         )?;
     }
 
     Ok(())
+}
+
+/// Extract an RSA private key and service account email (CN) from a legacy `.p12` PKCS12 bundle.
+fn load_p12_key(key_path: &str, password: &str) -> Result<(String, RsaPrivateKey)> {
+    let pass_arg = format!("pass:{password}");
+    let run_openssl = |extra_args: &[&str]| -> std::io::Result<std::process::Output> {
+        let mut cmd = std::process::Command::new("openssl");
+        cmd.arg("pkcs12")
+            .arg("-in")
+            .arg(key_path)
+            .arg("-nodes")
+            .arg("-passin")
+            .arg(&pass_arg);
+        for a in extra_args {
+            cmd.arg(a);
+        }
+        cmd.output()
+    };
+
+    let output = match run_openssl(&["-legacy"]) {
+        Ok(out) if out.status.success() => out,
+        _ => run_openssl(&[]).map_err(|e| {
+            GsutilError::command(format!(
+                "Could not invoke openssl to read PKCS12 key \"{key_path}\": {e}"
+            ))
+        })?,
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(GsutilError::command(format!(
+            "Could not parse PKCS12 key \"{key_path}\": {}",
+            stderr.trim()
+        )));
+    }
+    let pem_all = String::from_utf8_lossy(&output.stdout);
+    let key_start = pem_all
+        .find("-----BEGIN PRIVATE KEY-----")
+        .or_else(|| pem_all.find("-----BEGIN RSA PRIVATE KEY-----"))
+        .ok_or_else(|| {
+            GsutilError::command(format!(
+                "No private key found inside PKCS12 file \"{key_path}\"."
+            ))
+        })?;
+    let key_pem = &pem_all[key_start..];
+    let rsa_key = RsaPrivateKey::from_pkcs8_pem(key_pem).map_err(|e| {
+        GsutilError::command(format!(
+            "Invalid RSA private key extracted from \"{key_path}\": {e}"
+        ))
+    })?;
+
+    // Extract CN= from subject line if present, otherwise fallback to filename stem.
+    let email = pem_all
+        .lines()
+        .find(|l| l.trim_start().starts_with("subject="))
+        .and_then(|l| {
+            l.split("CN=").nth(1).map(|rest| {
+                rest.split(['/', ','])
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            })
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "service-account@developer.gserviceaccount.com".to_string());
+
+    Ok((email, rsa_key))
 }

@@ -20,6 +20,7 @@ pub async fn iter_buckets(
     let cloud = url
         .as_cloud()
         .ok_or_else(|| GsutilError::command(format!("Expected cloud URL, got {url_str}")))?;
+    let api = api.for_provider(cloud.scheme.as_str())?;
 
     if cloud.is_provider() {
         let buckets = api.list_buckets(project_id, fields).await?;
@@ -97,6 +98,7 @@ pub async fn iter_all(
     let cloud = url
         .as_cloud()
         .ok_or_else(|| GsutilError::command(format!("Expected cloud URL, got {url_str}")))?;
+    let api = api.for_provider(cloud.scheme.as_str())?;
 
     if cloud.is_provider() {
         return iter_buckets(api, url_str, project_id, fields).await;

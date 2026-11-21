@@ -149,16 +149,35 @@ pub async fn run_iam(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
     match args[0].as_str() {
         "get" => {
             let urls = expand_cloud_urls(ctx, &args[1..], false, false).await?;
+            let iam_fields = ["bindings".to_string(), "etag".to_string()];
             for u in urls {
                 let bname = u.bucket_name.as_deref().unwrap_or("");
-                let policy = if let Some(oname) = u.object_name.as_deref() {
-                    ctx.api
-                        .get_object_iam_policy(bname, oname, u.generation.as_deref(), None)
-                        .await?
+                let api = ctx.api.for_provider(u.scheme.as_str())?;
+                let mut policy = if let Some(oname) = u.object_name.as_deref() {
+                    api.get_object_iam_policy(
+                        bname,
+                        oname,
+                        u.generation.as_deref(),
+                        Some(&iam_fields),
+                    )
+                    .await?
                 } else {
-                    ctx.api.get_bucket_iam_policy(bname, None).await?
+                    api.get_bucket_iam_policy(bname, Some(&iam_fields)).await?
                 };
-                let json = serde_json::to_string_pretty(&policy).map_err(|e| {
+                // Match Python gslib/commands/iam.py:541 (fields=['bindings', 'etag'],
+                // omitting empty `bindings`, and sorting JSON keys alphabetically).
+                policy.kind = None;
+                policy.resource_id = None;
+                policy.version = None;
+                let mut val = serde_json::to_value(&policy).map_err(|e| {
+                    GsutilError::command(format!("Failed to serialize IAM policy: {e}"))
+                })?;
+                if policy.bindings.is_empty() {
+                    if let Some(map) = val.as_object_mut() {
+                        map.remove("bindings");
+                    }
+                }
+                let json = serde_json::to_string_pretty(&val).map_err(|e| {
                     GsutilError::command(format!("Failed to serialize IAM policy: {e}"))
                 })?;
                 writeln!(ctx.out, "{json}")?;

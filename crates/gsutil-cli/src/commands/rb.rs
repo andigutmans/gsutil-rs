@@ -81,7 +81,8 @@ pub async fn run(ctx: &mut CommandContext, sub_opts: &[OptPair], args: &[String]
             let url = blr.url();
             let bucket_name = url.bucket_name().unwrap_or("");
             ctx.info(&format!("Removing {url}..."));
-            match api.delete_bucket(bucket_name, None).await {
+            let provider_api = api.for_provider(url.scheme())?;
+            match provider_api.delete_bucket(bucket_name, None).await {
                 Ok(()) => {
                     did_some_work = true;
                 }

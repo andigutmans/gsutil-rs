@@ -2,13 +2,15 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use gsutil_auth::TokenProvider;
-use gsutil_core::api::IamPolicy;
+use gsutil_core::api::{IamBinding, IamPolicy, PubsubApi};
 use gsutil_core::config::BotoConfig;
 use gsutil_core::error::{GsutilError, Result, ServiceError};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::ecp::{EcpProxy, ECP_TARGET_HOST_HEADER};
 use crate::error_translation::{extract_acceptable_scopes, extract_json_error_message};
 use crate::retry::RetryPolicy;
 
@@ -28,6 +30,8 @@ struct SetIamPolicyBody<'a> {
 #[derive(Clone)]
 pub struct PubsubClient {
     base_url: String,
+    ecp_target_host: Option<String>,
+    _ecp_proxy: Option<Arc<EcpProxy>>,
     http: Client,
     credentials: Arc<dyn TokenProvider>,
     retry_policy: RetryPolicy,
@@ -37,10 +41,20 @@ impl PubsubClient {
     pub fn new(config: &BotoConfig, credentials: Arc<dyn TokenProvider>) -> Result<Self> {
         let host = config.get_or("Credentials", "gs_pubsub_host", DEFAULT_PUBSUB_HOST);
         let port = config.get("Credentials", "gs_pubsub_port");
-        let base_url = match port.filter(|p| !p.is_empty()) {
+        let mut base_url = match port.filter(|p| !p.is_empty()) {
             Some(p) => format!("https://{host}:{p}"),
             None => format!("https://{host}"),
         };
+        let mut ecp_target_host = None;
+        let mut ecp_proxy = None;
+        if host == DEFAULT_PUBSUB_HOST && port.is_none() {
+            if let Some(proxy) = EcpProxy::detect_or_spawn(config)? {
+                let (rewritten, target) = proxy.rewrite_google_api_url(&base_url);
+                base_url = rewritten;
+                ecp_target_host = target;
+                ecp_proxy = Some(proxy);
+            }
+        }
         let http = Client::builder()
             .danger_accept_invalid_certs(!config.https_validate_certificates())
             .build()
@@ -49,6 +63,8 @@ impl PubsubClient {
             })?;
         Ok(Self {
             base_url,
+            ecp_target_host,
+            _ecp_proxy: ecp_proxy,
             http,
             credentials,
             retry_policy: RetryPolicy::from_config(config),
@@ -62,6 +78,8 @@ impl PubsubClient {
     ) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            ecp_target_host: None,
+            _ecp_proxy: None,
             http: Client::new(),
             credentials,
             retry_policy,
@@ -72,6 +90,9 @@ impl PubsubClient {
         &self,
         mut req: reqwest::RequestBuilder,
     ) -> Result<reqwest::RequestBuilder> {
+        if let Some(ref target) = self.ecp_target_host {
+            req = req.header(ECP_TARGET_HOST_HEADER, target);
+        }
         if let Some(tok) = self.credentials.token().await? {
             req = req.bearer_auth(&tok.token);
         }
@@ -190,6 +211,47 @@ impl PubsubClient {
                 None,
             ))
         })
+    }
+}
+
+#[async_trait]
+impl PubsubApi for PubsubClient {
+    async fn create_topic(&self, topic_name: &str) -> Result<()> {
+        match PubsubClient::create_topic(self, topic_name).await {
+            Ok(_) => Ok(()),
+            Err(GsutilError::Service(se)) if se.status == Some(409) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn authorize_publisher(
+        &self,
+        topic_name: &str,
+        service_account_email: &str,
+    ) -> Result<()> {
+        const PUBSUB_ROLE: &str = "roles/pubsub.publisher";
+        let member = format!("serviceAccount:{service_account_email}");
+        let mut policy = self.get_topic_iam_policy(topic_name).await?;
+
+        if let Some(binding) = policy
+            .bindings
+            .iter_mut()
+            .find(|b| b.role == PUBSUB_ROLE && b.condition.is_none())
+        {
+            if binding.members.iter().any(|m| m == &member) {
+                return Ok(());
+            }
+            binding.members.push(member);
+        } else {
+            policy.bindings.push(IamBinding {
+                role: PUBSUB_ROLE.to_string(),
+                members: vec![member],
+                condition: None,
+            });
+        }
+
+        self.set_topic_iam_policy(topic_name, &policy).await?;
+        Ok(())
     }
 }
 

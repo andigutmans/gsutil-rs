@@ -10,7 +10,7 @@
 //! - Local -> Local
 //! - On-the-fly CRC32C & MD5 integrity validation (`check_hashes`)
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -27,7 +27,10 @@ use gsutil_core::api::{
 };
 use gsutil_core::config::BotoConfig;
 use gsutil_core::error::{GsutilError, Result, ServiceErrorKind};
-use gsutil_core::hash::{concat_crc32c, crc32c_bytes, crc32c_to_base64, md5_base64, Md5Hasher};
+use gsutil_core::hash::{
+    concat_crc32c, crc32c_bytes, crc32c_from_base64, crc32c_to_base64, hash_reader, md5_base64,
+    Md5Hasher,
+};
 use gsutil_core::url::{contains_wildcard, strip_one_slash, StorageUrl};
 use gsutil_core::wildcard::{build_bucket_filter_strings, WildcardMatcher};
 
@@ -40,9 +43,10 @@ use crate::posix::{
 use crate::rewrite::normalize_storage_class;
 use crate::tracker::{
     delete_download_tracker_files, delete_tracker_file, get_tracker_file_path,
-    read_or_create_download_tracker, write_download_component_tracker,
-    write_parallel_upload_tracker, write_sliced_download_tracker, write_upload_tracker,
-    ParallelUploadComponentEntry, ParallelUploadTrackerData, TrackerFileType,
+    read_or_create_download_tracker, read_parallel_upload_tracker, read_upload_tracker,
+    write_download_component_tracker, write_parallel_upload_tracker, write_sliced_download_tracker,
+    write_upload_tracker, ParallelUploadComponentEntry, ParallelUploadTrackerData,
+    SlicedDownloadTrackerData, TrackerFileType,
 };
 
 /// Temporary file suffix for atomic local downloads (matches `temporary_file_util.py`).
@@ -119,7 +123,12 @@ pub struct CopyConfig {
     pub preserve_posix: bool,
     pub canned_acl: Option<String>,
     pub storage_class: Option<String>,
+    /// `-z <exts>` / `-Z`: gzip-compress and store with `Content-Encoding: gzip`.
     pub gzip_mode: GzipMode,
+    /// `-j <exts>` / `-J`: gzip-compress in transit during upload (stored uncompressed).
+    pub gzip_transport: GzipMode,
+    /// `-e`: exclude symlinks during recursive local copies.
+    pub exclude_symlinks: bool,
     pub daisy_chain: bool,
     pub skip_unsupported: bool,
     pub manifest_path: Option<PathBuf>,
@@ -369,10 +378,13 @@ pub async fn copy_stream_to_cloud<R: Read>(
         preconditions: effective_upload_preconditions(cfg),
         encryption_key: cfg.encryption_key.clone(),
         fields: None,
-        gzip_encoded,
+        // For `-Z`, compressed bytes are stored as-is with `metadata.contentEncoding = "gzip"`,
+        // NOT transport-decompressed by GCS.
+        gzip_encoded: false,
     };
 
-    let uploaded = api
+    let dst_api = api.for_provider(dst_url.scheme())?;
+    let uploaded = dst_api
         .upload_object_resumable(Bytes::from(payload), &meta, &opts)
         .await?;
 
@@ -386,7 +398,7 @@ pub async fn copy_stream_to_cloud<R: Read>(
         uploaded.crc32c.as_deref(),
         uploaded.md5_hash.as_deref(),
     ) {
-        let _ = api
+        let _ = dst_api
             .delete_object(bucket, object_name, uploaded.generation.as_deref(), None)
             .await;
         return Err(err);
@@ -421,11 +433,13 @@ pub async fn copy_cloud_to_stream<W: Write>(
         .object_name()
         .ok_or_else(|| GsutilError::command("Source URL must specify an object."))?;
 
-    let meta = api
+    let src_api = api.for_provider(src_url.scheme())?;
+    let meta = src_api
         .get_object_metadata(bucket, object_name, src_url.generation(), None)
         .await?;
+    let gzip_encoded = is_gzip_encoded(&meta);
 
-    let data = api
+    let data = src_api
         .get_object_media(
             bucket,
             object_name,
@@ -433,7 +447,7 @@ pub async fn copy_cloud_to_stream<W: Write>(
                 generation: src_url.generation().map(ToString::to_string),
                 start_byte: None,
                 end_byte: None,
-                compressed_encoding: false,
+                compressed_encoding: gzip_encoded,
                 strategy: DownloadStrategy::OneShot,
                 decryption_key: cfg.decryption_key.clone(),
             },
@@ -451,7 +465,7 @@ pub async fn copy_cloud_to_stream<W: Write>(
         meta.md5_hash.as_deref(),
     )?;
 
-    let out = if is_gzip_encoded(&meta) {
+    let out = if gzip_encoded {
         gzip_decompress(&data)?
     } else {
         data.to_vec()
@@ -549,7 +563,9 @@ async fn delete_source_after_copy(api: &dyn CloudApi, src_url: &StorageUrl) -> R
     match src_url {
         StorageUrl::Cloud(c) => {
             if let (Some(b), Some(o)) = (c.bucket_name.as_deref(), c.object_name.as_deref()) {
-                api.delete_object(b, o, c.generation.as_deref(), None)
+                let src_api = api.for_provider(c.scheme.as_str())?;
+                src_api
+                    .delete_object(b, o, c.generation.as_deref(), None)
                     .await?;
             }
         }
@@ -589,9 +605,13 @@ async fn copy_local_to_cloud(
         None
     };
 
-    let should_gzip = cfg.gzip_mode.should_compress(&src_path.to_string_lossy());
+    let src_path_str = src_path.to_string_lossy();
+    let should_gzip_storage = cfg.gzip_mode.should_compress(&src_path_str);
+    let should_gzip_transport =
+        !should_gzip_storage && cfg.gzip_transport.should_compress(&src_path_str);
     let pc_threshold = boto.parallel_composite_upload_threshold();
-    let use_parallel_composite = !should_gzip
+    let use_parallel_composite = !should_gzip_storage
+        && !should_gzip_transport
         && dst_url.scheme() == "gs"
         && pc_threshold > 0
         && file_size >= pc_threshold
@@ -613,18 +633,49 @@ async fn copy_local_to_cloud(
         .await;
     }
 
-    let raw = fs::read(src_path)?;
-    let payload = if should_gzip {
-        gzip_compress(&raw)?
+    // Stream-hash / compress according to `-z`/`-Z` (storage gzip) vs `-j`/`-J` (transport gzip):
+    // - `-z`/`-Z`: upload compressed bytes with `meta.content_encoding = Some("gzip")`,
+    //   hashes of compressed bytes, and `UploadOptions.gzip_encoded = false` (store as-is).
+    // - `-j`/`-J`: upload compressed wire bytes with `meta.content_encoding = None`,
+    //   hashes of uncompressed bytes, and `UploadOptions.gzip_encoded = true` (server decompresses).
+    let (payload, local_crc, local_md5) = if should_gzip_storage {
+        let mut f = File::open(src_path)?;
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        std::io::copy(&mut f, &mut enc)?;
+        let compressed = enc.finish()?;
+        let crc = crc32c_bytes(&compressed);
+        let md5 = md5_base64(&compressed);
+        (compressed, crc, md5)
+    } else if should_gzip_transport {
+        let mut f = File::open(src_path)?;
+        let hashes = hash_reader(&mut f, true, true)?;
+        let local_crc = hashes.crc32c.unwrap_or(0);
+        let local_md5 = hashes.md5_base64().unwrap_or_default();
+        f.seek(SeekFrom::Start(0))?;
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        std::io::copy(&mut f, &mut enc)?;
+        let compressed = enc.finish()?;
+        (compressed, local_crc, local_md5)
     } else {
-        raw
+        let mut f = File::open(src_path)?;
+        let hashes = hash_reader(&mut f, true, true)?;
+        let local_crc = hashes.crc32c.unwrap_or(0);
+        let local_md5 = hashes.md5_base64().unwrap_or_default();
+        f.seek(SeekFrom::Start(0))?;
+        let mut buf = Vec::with_capacity(file_size as usize);
+        f.read_to_end(&mut buf)?;
+        (buf, local_crc, local_md5)
     };
-    let local_crc = crc32c_bytes(&payload);
-    let local_md5 = md5_base64(&payload);
+
     let transfer_len = payload.len() as u64;
 
-    let mut meta =
-        build_upload_metadata(bucket, object_name, cfg, should_gzip, posix_attrs.as_ref());
+    let mut meta = build_upload_metadata(
+        bucket,
+        object_name,
+        cfg,
+        should_gzip_storage,
+        posix_attrs.as_ref(),
+    );
     meta.crc32c = Some(crc32c_to_base64(local_crc));
     meta.md5_hash = Some(local_md5.clone());
 
@@ -633,24 +684,38 @@ async fn copy_local_to_cloud(
         preconditions: effective_upload_preconditions(cfg),
         encryption_key: cfg.encryption_key.clone(),
         fields: None,
-        gzip_encoded: should_gzip,
+        // Only set HTTP transport `Content-Encoding: gzip` for `-j`/`-J`, NOT `-z`/`-Z`!
+        gzip_encoded: should_gzip_transport,
     };
 
     let use_resumable = transfer_len >= boto.resumable_threshold();
     let tracker_path = if use_resumable {
         let p = get_tracker_file_path(boto, dst_url, TrackerFileType::Upload, "JSON", None, None)?;
-        let enc_sha = encryption_key_sha256(cfg.encryption_key.as_ref()).map(ToString::to_string);
-        write_upload_tracker(&p, enc_sha, format!("resumable://{bucket}/{object_name}"))?;
+        let enc_sha = encryption_key_sha256(cfg.encryption_key.as_ref());
+        let existing_session = read_upload_tracker(&p, enc_sha);
+        if existing_session.is_none() {
+            let session_marker = format!(
+                "resumable://{}/{}/{}",
+                dst_url.scheme(),
+                bucket,
+                object_name
+            );
+            write_upload_tracker(&p, enc_sha.map(ToString::to_string), session_marker)?;
+        }
         Some(p)
     } else {
         None
     };
 
+    let dst_api = api.for_provider(dst_url.scheme())?;
     let upload_res = if use_resumable {
-        api.upload_object_resumable(Bytes::from(payload), &meta, &opts)
+        dst_api
+            .upload_object_resumable(Bytes::from(payload), &meta, &opts)
             .await
     } else {
-        api.upload_object(Bytes::from(payload), &meta, &opts).await
+        dst_api
+            .upload_object(Bytes::from(payload), &meta, &opts)
+            .await
     };
 
     let uploaded = match upload_res {
@@ -687,7 +752,7 @@ async fn copy_local_to_cloud(
         uploaded.crc32c.as_deref(),
         uploaded.md5_hash.as_deref(),
     ) {
-        let _ = api
+        let _ = dst_api
             .delete_object(bucket, object_name, uploaded.generation.as_deref(), None)
             .await;
         return Err(err);
@@ -724,15 +789,6 @@ async fn upload_parallel_composite(
     let num_components = (file_size.div_ceil(comp_size_cfg) as usize).clamp(2, MAX_COMPOSE_ARITY);
     let chunk_size = file_size.div_ceil(num_components as u64);
 
-    // Build deterministic unique temp prefix under PARALLEL_UPLOAD_TEMP_NAMESPACE.
-    let mut salt_hash = Md5Hasher::new();
-    salt_hash.update(bucket.as_bytes());
-    salt_hash.update(b"/");
-    salt_hash.update(object_name.as_bytes());
-    salt_hash.update(b"/");
-    salt_hash.update(src_path.to_string_lossy().as_bytes());
-    let random_prefix = salt_hash.finalize_hex();
-
     let tracker_path = get_tracker_file_path(
         boto,
         dst_url,
@@ -742,13 +798,66 @@ async fn upload_parallel_composite(
         None,
     )?;
 
-    let mut ranges: Vec<(usize, u64, u64, String)> = Vec::new();
+    let desired_enc_sha = encryption_key_sha256(cfg.encryption_key.as_ref());
+    let existing_tracker = read_parallel_upload_tracker(&tracker_path)
+        .filter(|t| t.encryption_key_sha256.as_deref() == desired_enc_sha);
+
+    // Reuse random_prefix from matching tracker if resuming an interrupted composite upload.
+    let random_prefix = if let Some(ref prev) = existing_tracker {
+        prev.random_prefix.clone()
+    } else {
+        let mut salt_hash = Md5Hasher::new();
+        salt_hash.update(bucket.as_bytes());
+        salt_hash.update(b"/");
+        salt_hash.update(object_name.as_bytes());
+        salt_hash.update(b"/");
+        salt_hash.update(src_path.to_string_lossy().as_bytes());
+        salt_hash.finalize_hex()
+    };
+
+    let prev_components: BTreeMap<usize, ParallelUploadComponentEntry> = existing_tracker
+        .map(|t| {
+            t.components
+                .into_iter()
+                .map(|c| (c.component_num, c))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut ranges_to_upload: Vec<(usize, u64, u64, String)> = Vec::new();
+    let mut reused_parts: Vec<(usize, String, Object, u32, u64)> = Vec::new();
+    let dst_api = api.for_provider(dst_url.scheme())?;
+
     let mut offset = 0u64;
     let mut idx = 0usize;
     while offset < file_size {
         let len = (file_size - offset).min(chunk_size);
         let temp_name = format!("{PARALLEL_UPLOAD_TEMP_NAMESPACE}{random_prefix}_{idx}");
-        ranges.push((idx, offset, len, temp_name));
+
+        // Check if this component was already uploaded in an earlier interrupted run.
+        let mut reused = false;
+        if let Some(prev) = prev_components.get(&idx) {
+            if prev.object_name == temp_name && prev.size == len {
+                if let Ok(existing_obj) = dst_api
+                    .get_object_metadata(bucket, &temp_name, prev.generation.as_deref(), None)
+                    .await
+                {
+                    if existing_obj.size_bytes() == len {
+                        if let Some(crc) = existing_obj
+                            .crc32c
+                            .as_deref()
+                            .and_then(|c| crc32c_from_base64(c).ok())
+                        {
+                            reused_parts.push((idx, temp_name.clone(), existing_obj, crc, len));
+                            reused = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !reused {
+            ranges_to_upload.push((idx, offset, len, temp_name));
+        }
         offset += len;
         idx += 1;
     }
@@ -762,16 +871,18 @@ async fn upload_parallel_composite(
 
     let src_path_buf = src_path.to_path_buf();
     let bucket_str = bucket.to_string();
+    let dst_scheme = dst_url.scheme().to_string();
     let cfg_cloned = cfg.clone();
     let api_for_parts = Arc::clone(&api);
 
     let (mut uploaded_parts, batch) = run_parallel_with_results(
-        ranges.clone(),
+        ranges_to_upload,
         &par_cfg,
         move |(part_idx, start, len, temp_name)| {
             let api = Arc::clone(&api_for_parts);
             let path = src_path_buf.clone();
             let bkt = bucket_str.clone();
+            let scheme = dst_scheme.clone();
             let cfg = cfg_cloned.clone();
             async move {
                 let mut f = File::open(&path)?;
@@ -794,27 +905,22 @@ async fn upload_parallel_composite(
                     fields: None,
                     gzip_encoded: false,
                 };
-                let obj = api.upload_object(Bytes::from(buf), &meta, &opts).await?;
+                let part_api = api.for_provider(&scheme)?;
+                let obj = part_api
+                    .upload_object(Bytes::from(buf), &meta, &opts)
+                    .await?;
                 Ok((part_idx, temp_name, obj, part_crc, len))
             }
         },
     )
     .await;
 
-    if batch.failed > 0 {
-        // Best-effort cleanup of any uploaded temp components.
-        for (_, temp_name, _, _, _) in &uploaded_parts {
-            let _ = api.delete_object(bucket, temp_name, None, None).await;
-        }
-        return Err(batch.into_result().unwrap_err());
-    }
-
+    uploaded_parts.extend(reused_parts);
     uploaded_parts.sort_by_key(|(i, _, _, _, _)| *i);
 
-    // Record component tracker file.
+    // Always persist uploaded components to tracker so an interrupted upload can resume.
     let tracker_data = ParallelUploadTrackerData {
-        encryption_key_sha256: encryption_key_sha256(cfg.encryption_key.as_ref())
-            .map(ToString::to_string),
+        encryption_key_sha256: desired_enc_sha.map(ToString::to_string),
         random_prefix,
         components: uploaded_parts
             .iter()
@@ -829,6 +935,10 @@ async fn upload_parallel_composite(
     };
     let _ = write_parallel_upload_tracker(&tracker_path, &tracker_data);
 
+    if batch.failed > 0 {
+        return Err(batch.into_result().unwrap_err());
+    }
+
     // Compute expected composite CRC32C via concat_crc32c.
     let mut expected_crc = 0u32;
     let mut compose_sources = Vec::with_capacity(uploaded_parts.len());
@@ -842,7 +952,7 @@ async fn upload_parallel_composite(
     }
 
     let dst_meta = build_upload_metadata(bucket, object_name, cfg, false, posix_attrs);
-    let compose_res = api
+    let compose_res = dst_api
         .compose_object(
             &compose_sources,
             &dst_meta,
@@ -852,9 +962,9 @@ async fn upload_parallel_composite(
         )
         .await;
 
-    // Always clean up temporary component objects.
+    // Always clean up temporary component objects after compose attempt.
     for (_, temp_name, obj, _, _) in &uploaded_parts {
-        let _ = api
+        let _ = dst_api
             .delete_object(bucket, temp_name, obj.generation.as_deref(), None)
             .await;
     }
@@ -889,7 +999,7 @@ async fn upload_parallel_composite(
         composed.crc32c.as_deref(),
         None,
     ) {
-        let _ = api
+        let _ = dst_api
             .delete_object(bucket, object_name, composed.generation.as_deref(), None)
             .await;
         return Err(err);
@@ -945,7 +1055,8 @@ async fn copy_cloud_to_local(
         }
     }
 
-    let src_meta = api
+    let src_api = api.for_provider(src_url.scheme())?;
+    let src_meta = src_api
         .get_object_metadata(bucket, object_name, src_url.generation(), None)
         .await?;
     let obj_size = src_meta.size_bytes();
@@ -1026,8 +1137,9 @@ async fn download_single(
     obj_size: u64,
     gzip_encoded: bool,
 ) -> Result<u64> {
+    let src_api = api.for_provider(src_url.scheme())?;
     let existing_size = fs::metadata(temp_path).map(|m| m.len()).unwrap_or(0);
-    let (_tracker, _start_byte) =
+    let (_tracker, start_byte) =
         read_or_create_download_tracker(boto, src_meta, dst_url, "JSON", 0, existing_size, None)?;
 
     let strategy = if obj_size >= boto.resumable_threshold() {
@@ -1036,7 +1148,50 @@ async fn download_single(
         DownloadStrategy::OneShot
     };
 
-    let data = api
+    // Real resumable download: when a matching tracker file exists and partial bytes
+    // are already present in `_.gstmp` (non-gzip), request only `[start_byte..]` and
+    // validate hashes over the full assembled file on disk.
+    if !gzip_encoded && start_byte > 0 && start_byte <= obj_size && temp_path.exists() {
+        if start_byte < obj_size {
+            let remaining = src_api
+                .get_object_media(
+                    bucket,
+                    object_name,
+                    &DownloadOptions {
+                        generation: src_url.generation().map(ToString::to_string),
+                        start_byte: Some(start_byte as i64),
+                        end_byte: None,
+                        compressed_encoding: false,
+                        strategy,
+                        decryption_key: cfg.decryption_key.clone(),
+                    },
+                )
+                .await?;
+            let mut f = OpenOptions::new().write(true).open(temp_path)?;
+            f.seek(SeekFrom::Start(start_byte))?;
+            f.write_all(&remaining)?;
+        }
+
+        let mut f = File::open(temp_path)?;
+        let hashes = hash_reader(&mut f, true, true)?;
+        let check_mode = CheckHashesMode::from_config(boto);
+        if let Err(err) = validate_hashes(
+            check_mode,
+            &dst_url.url_string(),
+            &src_url.url_string(),
+            hashes.crc32c,
+            hashes.md5_base64().as_deref(),
+            src_meta.crc32c.as_deref(),
+            src_meta.md5_hash.as_deref(),
+        ) {
+            let _ = fs::remove_file(temp_path);
+            return Err(err);
+        }
+        let final_len = fs::metadata(temp_path)?.len();
+        return Ok(final_len);
+    }
+
+    let data = src_api
         .get_object_media(
             bucket,
             object_name,
@@ -1044,7 +1199,7 @@ async fn download_single(
                 generation: src_url.generation().map(ToString::to_string),
                 start_byte: None,
                 end_byte: None,
-                compressed_encoding: false,
+                compressed_encoding: gzip_encoded,
                 strategy,
                 decryption_key: cfg.decryption_key.clone(),
             },
@@ -1093,26 +1248,38 @@ async fn download_sliced(
     let num_components = (obj_size.div_ceil(comp_size_cfg) as usize).clamp(2, max_components);
     let slice_size = obj_size.div_ceil(num_components as u64);
 
-    // Pre-allocate temp file.
-    {
-        let f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(temp_path)?;
-        f.set_len(obj_size)?;
-    }
-
-    // Write parent sliced download tracker.
-    if let Ok(parent_tracker) = get_tracker_file_path(
+    // Check if an existing matching sliced-download tracker + temp file can be resumed.
+    let parent_tracker = get_tracker_file_path(
         boto,
         dst_url,
         TrackerFileType::SlicedDownload,
         "JSON",
         None,
         None,
-    ) {
-        let _ = write_sliced_download_tracker(&parent_tracker, src_meta, num_components);
+    )
+    .ok();
+    let can_resume_sliced = parent_tracker
+        .as_ref()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<SlicedDownloadTrackerData>(&s).ok())
+        .is_some_and(|t| {
+            t.etag == src_meta.etag.as_deref().unwrap_or("")
+                && t.generation == src_meta.generation
+                && t.num_components == num_components
+                && temp_path.exists()
+                && fs::metadata(temp_path).map(|m| m.len()).unwrap_or(0) == obj_size
+        });
+
+    if !can_resume_sliced {
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(temp_path)?;
+        f.set_len(obj_size)?;
+        if let Some(ref pt) = parent_tracker {
+            let _ = write_sliced_download_tracker(pt, src_meta, num_components);
+        }
     }
 
     let mut slices: Vec<(usize, u64, u64)> = Vec::new();
@@ -1135,6 +1302,7 @@ async fn download_sliced(
     let temp_path_buf = temp_path.to_path_buf();
     let bucket_str = bucket.to_string();
     let obj_str = object_name.to_string();
+    let src_scheme = src_url.scheme().to_string();
     let gen = src_url.generation().map(ToString::to_string);
     let dec_key = cfg.decryption_key.clone();
     let boto_cloned = boto.clone();
@@ -1147,58 +1315,85 @@ async fn download_sliced(
             let temp_path = temp_path_buf.clone();
             let bkt = bucket_str.clone();
             let obj = obj_str.clone();
+            let scheme = src_scheme.clone();
             let gen = gen.clone();
             let dec_key = dec_key.clone();
             let boto = boto_cloned.clone();
             let dst_url = dst_url_cloned.clone();
             let src_meta = src_meta_cloned.clone();
             async move {
-                let comp_tracker = get_tracker_file_path(
-                    &boto,
-                    &dst_url,
-                    TrackerFileType::DownloadComponent,
-                    "JSON",
-                    None,
-                    Some(comp_idx),
-                )
-                .ok();
-                if let Some(ref ct) = comp_tracker {
-                    let _ = write_download_component_tracker(ct, &src_meta, start_byte);
-                }
-
-                let bytes = api
-                    .get_object_media(
-                        &bkt,
-                        &obj,
-                        &DownloadOptions {
-                            generation: gen,
-                            start_byte: Some(start_byte as i64),
-                            end_byte: Some(end_byte),
-                            compressed_encoding: false,
-                            strategy: DownloadStrategy::Resumable,
-                            decryption_key: dec_key,
-                        },
+                let expected_len = end_byte - start_byte + 1;
+                let (comp_tracker, saved_pos) = if can_resume_sliced {
+                    read_or_create_download_tracker(
+                        &boto,
+                        &src_meta,
+                        &dst_url,
+                        "JSON",
+                        start_byte,
+                        0,
+                        Some(comp_idx),
+                    )?
+                } else {
+                    let ct = get_tracker_file_path(
+                        &boto,
+                        &dst_url,
+                        TrackerFileType::DownloadComponent,
+                        "JSON",
+                        None,
+                        Some(comp_idx),
                     )
-                    .await?;
+                    .ok();
+                    if let Some(ref p) = ct {
+                        let _ = write_download_component_tracker(p, &src_meta, start_byte);
+                    }
+                    (ct, start_byte)
+                };
 
-                let slice_crc = crc32c_bytes(&bytes);
-                let len = bytes.len() as u64;
+                // If this slice was already completely downloaded in an earlier run, skip GET!
+                let resume_from = saved_pos.clamp(start_byte, end_byte + 1);
+                if resume_from <= end_byte {
+                    let src_api = api.for_provider(&scheme)?;
+                    let bytes = src_api
+                        .get_object_media(
+                            &bkt,
+                            &obj,
+                            &DownloadOptions {
+                                generation: gen,
+                                start_byte: Some(resume_from as i64),
+                                end_byte: Some(end_byte),
+                                compressed_encoding: false,
+                                strategy: DownloadStrategy::Resumable,
+                                decryption_key: dec_key,
+                            },
+                        )
+                        .await?;
 
-                let mut f = OpenOptions::new().write(true).open(&temp_path)?;
-                f.seek(SeekFrom::Start(start_byte))?;
-                f.write_all(&bytes)?;
+                    let mut f = OpenOptions::new().write(true).open(&temp_path)?;
+                    f.seek(SeekFrom::Start(resume_from))?;
+                    f.write_all(&bytes)?;
 
-                if let Some(ref ct) = comp_tracker {
-                    let _ = write_download_component_tracker(ct, &src_meta, start_byte + len);
+                    if let Some(ref ct) = comp_tracker {
+                        let _ = write_download_component_tracker(
+                            ct,
+                            &src_meta,
+                            resume_from + bytes.len() as u64,
+                        );
+                    }
                 }
 
-                Ok((comp_idx, slice_crc, len))
+                // Compute CRC32C of this slice from disk (handles both fresh and resumed slices).
+                let mut rf = File::open(&temp_path)?;
+                rf.seek(SeekFrom::Start(start_byte))?;
+                let mut limited = rf.take(expected_len);
+                let hashes = hash_reader(&mut limited, true, false)?;
+                let slice_crc = hashes.crc32c.unwrap_or(0);
+
+                Ok((comp_idx, slice_crc, expected_len))
             }
         })
         .await;
 
     if batch.failed > 0 {
-        let _ = fs::remove_file(temp_path);
         return Err(batch.into_result().unwrap_err());
     }
 
@@ -1251,7 +1446,8 @@ async fn copy_cloud_to_cloud(
         .object_name()
         .ok_or_else(|| GsutilError::command("Destination cloud URL missing object name."))?;
 
-    let src_meta = api
+    let src_api = api.for_provider(src_url.scheme())?;
+    let src_meta = src_api
         .get_object_metadata(src_bucket, src_obj, src_url.generation(), None)
         .await?;
 
@@ -1284,7 +1480,8 @@ async fn copy_cloud_to_cloud(
         fields: None,
     };
 
-    let copied = match api.copy_object(&src_meta, &dst_meta, &copy_opts).await {
+    let dst_api = api.for_provider(dst_url.scheme())?;
+    let copied = match dst_api.copy_object(&src_meta, &dst_meta, &copy_opts).await {
         Ok(obj) => obj,
         Err(GsutilError::Service(se))
             if cfg.no_clobber && se.kind == ServiceErrorKind::Precondition =>
@@ -1327,8 +1524,11 @@ async fn copy_cloud_daisy_chain(
 ) -> Result<CopyItemResult> {
     let src_bucket = src_url.bucket_name().unwrap_or("");
     let src_obj = src_url.object_name().unwrap_or("");
+    let src_api = api.for_provider(src_url.scheme())?;
+    let dst_api = api.for_provider(dst_url.scheme())?;
+    let gzip_encoded = is_gzip_encoded(src_meta);
 
-    let data = api
+    let data = src_api
         .get_object_media(
             src_bucket,
             src_obj,
@@ -1336,7 +1536,7 @@ async fn copy_cloud_daisy_chain(
                 generation: src_url.generation().map(ToString::to_string),
                 start_byte: None,
                 end_byte: None,
-                compressed_encoding: false,
+                compressed_encoding: gzip_encoded,
                 strategy: DownloadStrategy::OneShot,
                 decryption_key: cfg.decryption_key.clone(),
             },
@@ -1374,14 +1574,18 @@ async fn copy_cloud_daisy_chain(
         preconditions: effective_upload_preconditions(cfg),
         encryption_key: cfg.encryption_key.clone(),
         fields: None,
-        gzip_encoded: is_gzip_encoded(src_meta),
+        // For `-Z`, compressed bytes are stored as-is with `metadata.contentEncoding = "gzip"`,
+        // NOT transport-decompressed by GCS.
+        gzip_encoded: false,
     };
 
     let len = data.len() as u64;
     let uploaded = match if len >= boto.resumable_threshold() {
-        api.upload_object_resumable(data, &dst_meta, &opts).await
+        dst_api
+            .upload_object_resumable(data, &dst_meta, &opts)
+            .await
     } else {
-        api.upload_object(data, &dst_meta, &opts).await
+        dst_api.upload_object(data, &dst_meta, &opts).await
     } {
         Ok(obj) => obj,
         Err(GsutilError::Service(se))
@@ -1407,7 +1611,7 @@ async fn copy_cloud_daisy_chain(
         uploaded.crc32c.as_deref(),
         uploaded.md5_hash.as_deref(),
     ) {
-        let _ = api
+        let _ = dst_api
             .delete_object(dst_bucket, dst_obj, uploaded.generation.as_deref(), None)
             .await;
         return Err(err);
@@ -1502,8 +1706,12 @@ async fn expand_copy_pairs(
             }
             StorageUrl::File(f) => {
                 let src_is_dir = Path::new(&f.object_name).is_dir();
-                let expanded =
-                    expand_local_source(&f.object_name, cfg.recursive, cfg.skip_unsupported)?;
+                let expanded = expand_local_source(
+                    &f.object_name,
+                    cfg.recursive,
+                    cfg.skip_unsupported,
+                    cfg.exclude_symlinks,
+                )?;
                 let treat_dst_as_container =
                     dst_is_container || multi_src_arg || src_is_dir || expanded.len() > 1;
                 for (local_path, rel_path) in expanded {
@@ -1536,6 +1744,7 @@ fn expand_local_source(
     raw_path: &str,
     recursive: bool,
     skip_unsupported: bool,
+    exclude_symlinks: bool,
 ) -> Result<Vec<(PathBuf, String)>> {
     if contains_wildcard(raw_path) {
         // Split into static base dir + wildcard pattern.
@@ -1548,16 +1757,24 @@ fn expand_local_source(
         };
         let matcher = WildcardMatcher::compile(raw_path)?;
         let mut results = Vec::new();
-        walk_local_dir(base_dir, true, skip_unsupported, &mut |p| {
-            let p_str = p.to_string_lossy();
-            if matcher.is_match(&p_str) {
-                let fname = p
-                    .file_name()
-                    .map(|f| f.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                results.push((p.to_path_buf(), fname));
-            }
-        })?;
+        let mut visited = HashSet::new();
+        walk_local_dir(
+            base_dir,
+            true,
+            skip_unsupported,
+            exclude_symlinks,
+            &mut visited,
+            &mut |p| {
+                let p_str = p.to_string_lossy();
+                if matcher.is_match(&p_str) {
+                    let fname = p
+                        .file_name()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    results.push((p.to_path_buf(), fname));
+                }
+            },
+        )?;
         return Ok(results);
     }
 
@@ -1579,17 +1796,28 @@ fn expand_local_source(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         let mut results = Vec::new();
-        walk_local_dir(path, true, skip_unsupported, &mut |file_path| {
-            if let Ok(rel) = file_path.strip_prefix(path) {
-                let rel_unix = rel.to_string_lossy().replace('\\', "/");
-                let rel_with_root = if dir_name.is_empty() {
-                    rel_unix
-                } else {
-                    format!("{dir_name}/{rel_unix}")
-                };
-                results.push((file_path.to_path_buf(), rel_with_root));
-            }
-        })?;
+        let mut visited = HashSet::new();
+        if let Ok(canon) = fs::canonicalize(path) {
+            visited.insert(canon);
+        }
+        walk_local_dir(
+            path,
+            true,
+            skip_unsupported,
+            exclude_symlinks,
+            &mut visited,
+            &mut |file_path| {
+                if let Ok(rel) = file_path.strip_prefix(path) {
+                    let rel_unix = rel.to_string_lossy().replace('\\', "/");
+                    let rel_with_root = if dir_name.is_empty() {
+                        rel_unix
+                    } else {
+                        format!("{dir_name}/{rel_unix}")
+                    };
+                    results.push((file_path.to_path_buf(), rel_with_root));
+                }
+            },
+        )?;
         return Ok(results);
     }
 
@@ -1600,7 +1828,14 @@ fn expand_local_source(
     Ok(vec![(path.to_path_buf(), fname)])
 }
 
-fn walk_local_dir<F>(dir: &Path, recursive: bool, skip_unsupported: bool, cb: &mut F) -> Result<()>
+fn walk_local_dir<F>(
+    dir: &Path,
+    recursive: bool,
+    skip_unsupported: bool,
+    exclude_symlinks: bool,
+    visited_dirs: &mut HashSet<PathBuf>,
+    cb: &mut F,
+) -> Result<()>
 where
     F: FnMut(&Path),
 {
@@ -1608,17 +1843,35 @@ where
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
         let path = entry.path();
-        let meta = match fs::symlink_metadata(&path) {
+        let sym_meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(_) if skip_unsupported => continue,
             Err(e) => return Err(e.into()),
         };
-        if meta.file_type().is_symlink() && skip_unsupported {
+        if sym_meta.file_type().is_symlink() && (exclude_symlinks || skip_unsupported) {
             continue;
         }
+        // Follow symlinks by default (matching Python gsutil cp -r).
+        let meta = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) if skip_unsupported || exclude_symlinks => continue,
+            Err(e) => return Err(e.into()),
+        };
         if meta.is_dir() {
             if recursive {
-                walk_local_dir(&path, recursive, skip_unsupported, cb)?;
+                if let Ok(canon) = fs::canonicalize(&path) {
+                    if !visited_dirs.insert(canon) {
+                        continue;
+                    }
+                }
+                walk_local_dir(
+                    &path,
+                    recursive,
+                    skip_unsupported,
+                    exclude_symlinks,
+                    visited_dirs,
+                    cb,
+                )?;
             }
         } else if meta.is_file() {
             cb(&path);
@@ -1642,6 +1895,7 @@ async fn expand_cloud_source(
         .bucket_name()
         .ok_or_else(|| GsutilError::command("Cloud source URL must specify a bucket."))?;
     let scheme = src_url.scheme();
+    let src_api = api.for_provider(scheme)?;
 
     if src_url.is_bucket() {
         if !recursive {
@@ -1649,7 +1903,7 @@ async fn expand_cloud_source(
                 "Omitting bucket \"{src_url}\". (Did you mean to do cp -r?)"
             )));
         }
-        let listed = api
+        let listed = src_api
             .list_objects(
                 bucket,
                 &ListObjectsOptions {
@@ -1680,7 +1934,7 @@ async fn expand_cloud_source(
     if contains_wildcard(obj_name) {
         let filter = build_bucket_filter_strings(obj_name);
         let matcher = WildcardMatcher::compile(obj_name)?;
-        let listed = api
+        let listed = src_api
             .list_objects(
                 bucket,
                 &ListObjectsOptions {
@@ -1717,7 +1971,7 @@ async fn expand_cloud_source(
         } else {
             format!("{obj_name}/")
         };
-        let listed = api
+        let listed = src_api
             .list_objects(
                 bucket,
                 &ListObjectsOptions {
@@ -2180,5 +2434,299 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(fs::read(&f2).unwrap(), b"local copy");
+    }
+
+    #[tokio::test]
+    async fn test_resumable_download_resumes_from_partial_gstmp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut boto = test_boto(tmp.path());
+        boto.set("GSUtil", "resumable_threshold", "100");
+        boto.set("GSUtil", "sliced_object_download_threshold", "0");
+
+        let api = Arc::new(MockCloudApi::new());
+        api.create_bucket_sync("bkt");
+        let payload: Vec<u8> = (0..500).map(|i| (i % 251) as u8).collect();
+        let obj = api.put_object("bkt", "resume.bin", &payload);
+
+        let dst_path = tmp.path().join("resume_out.bin");
+        let temp_path = PathBuf::from(format!("{}{TEMP_FILE_SUFFIX}", dst_path.display()));
+        // Simulate an interrupted download: first 200 bytes already on disk + matching tracker.
+        fs::write(&temp_path, &payload[..200]).unwrap();
+        let dst_url = StorageUrl::parse(&dst_path.to_string_lossy()).unwrap();
+        let tracker = get_tracker_file_path(
+            &boto,
+            &dst_url,
+            TrackerFileType::Download,
+            "JSON",
+            None,
+            None,
+        )
+        .unwrap();
+        crate::tracker::write_tracker_file(&tracker, &format!("{}\n", obj.etag.unwrap())).unwrap();
+
+        run_copy(
+            api.clone(),
+            &boto,
+            &CopyConfig {
+                src_urls: vec!["gs://bkt/resume.bin".into()],
+                dst_url: dst_path.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Must have used a ranged download starting at byte 200 rather than full re-download.
+        assert_eq!(api.range_download_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fs::read(&dst_path).unwrap(), payload);
+        assert!(!tracker.exists());
+    }
+
+    #[tokio::test]
+    async fn test_sliced_download_resumes_completed_components() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut boto = test_boto(tmp.path());
+        boto.set("GSUtil", "resumable_threshold", "100");
+        boto.set("GSUtil", "sliced_object_download_threshold", "500");
+        boto.set("GSUtil", "sliced_object_download_component_size", "250");
+        boto.set("GSUtil", "sliced_object_download_max_components", "4");
+
+        let api = Arc::new(MockCloudApi::new());
+        api.create_bucket_sync("bkt");
+        let payload: Vec<u8> = (0..1000).map(|i| (i % 199) as u8).collect();
+        let obj = api.put_object("bkt", "sliced_resume.bin", &payload);
+
+        let dst_path = tmp.path().join("sliced_resume_out.bin");
+        let temp_path = PathBuf::from(format!("{}{TEMP_FILE_SUFFIX}", dst_path.display()));
+        // Pre-populate full-size temp file where components 0 and 1 (bytes 0..500) are complete.
+        let mut partial = vec![0u8; 1000];
+        partial[..500].copy_from_slice(&payload[..500]);
+        fs::write(&temp_path, &partial).unwrap();
+
+        let dst_url = StorageUrl::parse(&dst_path.to_string_lossy()).unwrap();
+        let parent_tracker = get_tracker_file_path(
+            &boto,
+            &dst_url,
+            TrackerFileType::SlicedDownload,
+            "JSON",
+            None,
+            None,
+        )
+        .unwrap();
+        write_sliced_download_tracker(&parent_tracker, &obj, 4).unwrap();
+        for (idx, pos) in [(0usize, 250u64), (1, 500), (2, 500), (3, 750)] {
+            let ct = get_tracker_file_path(
+                &boto,
+                &dst_url,
+                TrackerFileType::DownloadComponent,
+                "JSON",
+                None,
+                Some(idx),
+            )
+            .unwrap();
+            write_download_component_tracker(&ct, &obj, pos).unwrap();
+        }
+
+        run_copy(
+            api.clone(),
+            &boto,
+            &CopyConfig {
+                src_urls: vec!["gs://bkt/sliced_resume.bin".into()],
+                dst_url: dst_path.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Only components 2 and 3 should have been downloaded!
+        assert_eq!(api.range_download_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fs::read(&dst_path).unwrap(), payload);
+    }
+
+    #[tokio::test]
+    async fn test_parallel_composite_upload_resumes_existing_components() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut boto = test_boto(tmp.path());
+        boto.set("GSUtil", "parallel_composite_upload_threshold", "500");
+        boto.set("GSUtil", "parallel_composite_upload_component_size", "250");
+
+        let api = Arc::new(MockCloudApi::new());
+        api.create_bucket_sync("bkt");
+
+        let src_path = tmp.path().join("comp_resume.bin");
+        let payload: Vec<u8> = (0..1000).map(|i| (i % 233) as u8).collect();
+        fs::write(&src_path, &payload).unwrap();
+
+        let src_url = StorageUrl::parse(&src_path.to_string_lossy()).unwrap();
+        let dst_url = StorageUrl::parse("gs://bkt/comp_resume.bin").unwrap();
+        let tracker_path = get_tracker_file_path(
+            &boto,
+            &dst_url,
+            TrackerFileType::ParallelUpload,
+            "JSON",
+            Some(&src_url),
+            None,
+        )
+        .unwrap();
+
+        // Pre-upload component 0 and record it in the parallel upload tracker.
+        let prefix = "resumedprefix";
+        let comp0_name = format!("{PARALLEL_UPLOAD_TEMP_NAMESPACE}{prefix}_0");
+        let comp0_meta = api.put_object("bkt", &comp0_name, &payload[..250]);
+        write_parallel_upload_tracker(
+            &tracker_path,
+            &ParallelUploadTrackerData {
+                encryption_key_sha256: None,
+                random_prefix: prefix.to_string(),
+                components: vec![ParallelUploadComponentEntry {
+                    component_num: 0,
+                    object_name: comp0_name,
+                    generation: comp0_meta.generation,
+                    crc32c: comp0_meta.crc32c,
+                    size: 250,
+                }],
+            },
+        )
+        .unwrap();
+
+        run_copy(
+            api.clone(),
+            &boto,
+            &CopyConfig {
+                src_urls: vec![src_path.to_string_lossy().into_owned()],
+                dst_url: "gs://bkt/comp_resume.bin".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Only 3 of 4 components should have been uploaded (component 0 was reused!).
+        assert_eq!(api.upload_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(api.compose_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            api.get_stored("bkt", "comp_resume.bin")
+                .unwrap()
+                .data
+                .as_ref(),
+            payload.as_slice()
+        );
+        assert_eq!(
+            api.list_all_object_names("bkt"),
+            vec!["comp_resume.bin".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_default_parallel_composite_threshold_is_disabled() {
+        let boto = BotoConfig::new();
+        assert_eq!(boto.parallel_composite_upload_threshold(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_cp_recursive_follows_and_excludes_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let boto = test_boto(tmp.path());
+        let src_dir = tmp.path().join("src_tree");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("real.txt"), b"real").unwrap();
+        let target_file = tmp.path().join("outside.txt");
+        fs::write(&target_file, b"linked-content").unwrap();
+        symlink(&target_file, src_dir.join("link.txt")).unwrap();
+
+        // Default: follow symlinks
+        let api1 = Arc::new(MockCloudApi::new());
+        api1.create_bucket_sync("b1");
+        let res1 = run_copy(
+            api1.clone(),
+            &boto,
+            &CopyConfig {
+                src_urls: vec![src_dir.to_string_lossy().into_owned()],
+                dst_url: "gs://b1/".into(),
+                recursive: true,
+                exclude_symlinks: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(res1.succeeded, 2);
+        assert_eq!(
+            api1.get_stored("b1", "src_tree/link.txt")
+                .unwrap()
+                .data
+                .as_ref(),
+            b"linked-content"
+        );
+
+        // With `-e` (`exclude_symlinks: true`): skip symlink cleanly
+        let api2 = Arc::new(MockCloudApi::new());
+        api2.create_bucket_sync("b2");
+        let res2 = run_copy(
+            api2.clone(),
+            &boto,
+            &CopyConfig {
+                src_urls: vec![src_dir.to_string_lossy().into_owned()],
+                dst_url: "gs://b2/".into(),
+                recursive: true,
+                exclude_symlinks: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(res2.succeeded, 1);
+        assert!(api2.get_stored("b2", "src_tree/link.txt").is_none());
+        assert!(api2.get_stored("b2", "src_tree/real.txt").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_gzip_transport_vs_storage_encoding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let boto = test_boto(tmp.path());
+        let api = Arc::new(MockCloudApi::new());
+        api.create_bucket_sync("bkt");
+
+        let src_path = tmp.path().join("doc.txt");
+        let payload = b"repeated text for gzip compression test repeated text repeated text";
+        fs::write(&src_path, payload).unwrap();
+
+        // `-J` gzip transport: stored UNCOMPRESSED with `content_encoding == None`
+        run_copy(
+            api.clone(),
+            &boto,
+            &CopyConfig {
+                src_urls: vec![src_path.to_string_lossy().into_owned()],
+                dst_url: "gs://bkt/transport.txt".into(),
+                gzip_transport: GzipMode::All,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let stored_t = api.get_stored("bkt", "transport.txt").unwrap();
+        assert_eq!(stored_t.metadata.content_encoding, None);
+        assert_eq!(stored_t.data.as_ref(), payload.as_slice());
+
+        // `-Z` gzip storage: stored COMPRESSED with `content_encoding == Some("gzip")`
+        run_copy(
+            api.clone(),
+            &boto,
+            &CopyConfig {
+                src_urls: vec![src_path.to_string_lossy().into_owned()],
+                dst_url: "gs://bkt/stored.txt".into(),
+                gzip_mode: GzipMode::All,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let stored_z = api.get_stored("bkt", "stored.txt").unwrap();
+        assert_eq!(stored_z.metadata.content_encoding.as_deref(), Some("gzip"));
+        assert_ne!(stored_z.data.as_ref(), payload.as_slice());
     }
 }

@@ -288,6 +288,8 @@ fn build_copy_config(
         parallel_operations: ctx.global.parallel_operations,
         headers: ctx.global.headers.clone(),
         preconditions: Some(ctx.preconditions_from_headers()?),
+        encryption_key: crate::encryption::configured_encryption_key(&ctx.config)?,
+        decryption_key: crate::encryption::primary_decryption_key(&ctx.config)?,
         recursive: is_mv,
         delete_source_after_copy: is_mv,
         ..Default::default()
@@ -298,6 +300,7 @@ fn build_copy_config(
             "-a" => cfg.canned_acl = Some(a.clone()),
             "-c" => cfg.continue_on_error = true,
             "-D" => cfg.daisy_chain = true,
+            "-e" => cfg.exclude_symlinks = true,
             "-I" => cfg.read_stdin_urls = true,
             "-L" => cfg.manifest_path = Some(PathBuf::from(a)),
             "-n" => cfg.no_clobber = true,
@@ -305,6 +308,10 @@ fn build_copy_config(
             "-P" => cfg.preserve_posix = true,
             "-r" | "-R" => cfg.recursive = true,
             "-s" => cfg.storage_class = Some(a.clone()),
+            "-t" if !a.is_empty() => {
+                // Content-type header override if supplied via -t.
+                cfg.headers.insert("content-type".to_string(), a.clone());
+            }
             "-U" => cfg.skip_unsupported = true,
             "-v" => cfg.print_created_version = true,
             "-Z" => cfg.gzip_mode = GzipMode::All,
@@ -315,6 +322,15 @@ fn build_copy_config(
                     .filter(|s| !s.is_empty())
                     .collect();
                 cfg.gzip_mode = GzipMode::Extensions(exts);
+            }
+            "-J" => cfg.gzip_transport = GzipMode::All,
+            "-j" => {
+                let exts: Vec<String> = a
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                cfg.gzip_transport = GzipMode::Extensions(exts);
             }
             _ => {}
         }
@@ -456,7 +472,7 @@ pub async fn run_compose_cmd(
         src_urls: args[..args.len() - 1].to_vec(),
         dst_url: args[args.len() - 1].clone(),
         preconditions: Some(ctx.preconditions_from_headers()?),
-        encryption_key: None,
+        encryption_key: crate::encryption::configured_encryption_key(&ctx.config)?,
     };
     let api = ctx.api().await?;
     ctx.info(&format!("Composing {}...", cfg.dst_url));
@@ -472,6 +488,8 @@ pub async fn run_rewrite_cmd(
     let mut cfg = RewriteConfig {
         parallel_operations: ctx.global.parallel_operations,
         preconditions: Some(ctx.preconditions_from_headers()?),
+        encryption_key: crate::encryption::configured_encryption_key(&ctx.config)?,
+        decryption_key: crate::encryption::primary_decryption_key(&ctx.config)?,
         ..Default::default()
     };
     let mut read_stdin = false;

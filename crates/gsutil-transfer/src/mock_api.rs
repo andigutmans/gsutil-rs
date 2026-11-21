@@ -1,11 +1,13 @@
 //! In-memory mock `CloudApi` implementation for `gsutil-transfer` unit tests.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use flate2::read::GzDecoder;
 use gsutil_core::api::*;
 use gsutil_core::error::{GsutilError, Result, ServiceError};
 use gsutil_core::hash::{crc32c_base64, md5_base64};
@@ -171,11 +173,28 @@ impl MockCloudApi {
             }
         }
 
+        // Emulate real GCS HTTP transport gzip decompression when `options.gzip_encoded == true`
+        // (i.e. `Content-Encoding: gzip` on the HTTP upload part, used by `-j`/`-J`).
+        let stored_data = if options.gzip_encoded {
+            let mut dec = GzDecoder::new(data.as_ref());
+            let mut out = Vec::new();
+            dec.read_to_end(&mut out).map_err(|e| {
+                ServiceError::bad_request(
+                    format!("Invalid gzip transport stream: {e}"),
+                    Some(400),
+                    None,
+                )
+            })?;
+            Bytes::from(out)
+        } else {
+            data
+        };
+
         let gen = self.next_gen.fetch_add(1, Ordering::SeqCst).to_string();
         let mut meta = object_metadata.clone();
         meta.generation = Some(gen.clone());
         meta.metageneration = Some("1".to_string());
-        meta.size = Some(data.len().to_string());
+        meta.size = Some(stored_data.len().to_string());
         meta.etag = Some(format!("etag-{gen}"));
         if meta.storage_class.is_none() {
             meta.storage_class = Some("STANDARD".to_string());
@@ -185,13 +204,28 @@ impl MockCloudApi {
         }
         meta.updated = Some("2026-01-01T00:00:00Z".to_string());
 
-        let real_crc = crc32c_base64(&data);
+        let real_crc = crc32c_base64(&stored_data);
+        // Emulate GCS 400 BadRequest when caller-supplied CRC32C mismatches stored bytes!
+        if !s.corrupt_upload_crc {
+            if let Some(ref provided) = object_metadata.crc32c {
+                if provided != &real_crc {
+                    return Err(ServiceError::bad_request(
+                        format!(
+                            "Provided CRC32C \"{provided}\" doesn't match calculated CRC32C \"{real_crc}\"."
+                        ),
+                        Some(400),
+                        None,
+                    )
+                    .into());
+                }
+            }
+        }
         meta.crc32c = Some(if s.corrupt_upload_crc {
             "AAAAAA==".to_string()
         } else {
             real_crc
         });
-        meta.md5_hash = Some(md5_base64(&data));
+        meta.md5_hash = Some(md5_base64(&stored_data));
 
         if let Some(enc) = &options.encryption_key {
             match enc {
@@ -210,7 +244,7 @@ impl MockCloudApi {
         s.objects.insert(
             key,
             StoredObject {
-                data,
+                data: stored_data,
                 metadata: meta.clone(),
             },
         );
@@ -386,6 +420,24 @@ impl CloudApi for MockCloudApi {
                 map.insert(k.clone(), v.clone());
             }
         }
+        if !metadata.metadata_removals.is_empty() {
+            if let Some(ref mut map) = entry.metadata.metadata {
+                for k in &metadata.metadata_removals {
+                    map.remove(k);
+                }
+            }
+        }
+        for field in &metadata.clear_fields {
+            match field.as_str() {
+                "cacheControl" => entry.metadata.cache_control = None,
+                "contentDisposition" => entry.metadata.content_disposition = None,
+                "contentEncoding" => entry.metadata.content_encoding = None,
+                "contentLanguage" => entry.metadata.content_language = None,
+                "contentType" => entry.metadata.content_type = None,
+                "customTime" => entry.metadata.custom_time = None,
+                _ => {}
+            }
+        }
         if let Some(ref ct) = metadata.content_type {
             entry.metadata.content_type = Some(ct.clone());
         }
@@ -431,17 +483,37 @@ impl CloudApi for MockCloudApi {
             .get(&(bucket_name.to_string(), object_name.to_string()))
             .ok_or_else(|| ServiceError::not_found("Not found", Some(404), None))?;
 
+        let is_gzip = stored
+            .metadata
+            .content_encoding
+            .as_deref()
+            .is_some_and(|e| e.eq_ignore_ascii_case("gzip"));
+
+        // Emulate real GCS transparent gzip decompression when client omits
+        // `Accept-Encoding: gzip` (`compressed_encoding == false`).
+        let effective_data: Vec<u8> = if is_gzip && !options.compressed_encoding {
+            let mut dec = GzDecoder::new(stored.data.as_ref());
+            let mut out = Vec::new();
+            dec.read_to_end(&mut out).unwrap_or_else(|_| {
+                out = stored.data.to_vec();
+                out.len()
+            });
+            out
+        } else {
+            stored.data.to_vec()
+        };
+
         let start = options.start_byte.unwrap_or(0).max(0) as usize;
         let end_inclusive = options
             .end_byte
             .map(|e| e as usize)
-            .unwrap_or_else(|| stored.data.len().saturating_sub(1));
+            .unwrap_or_else(|| effective_data.len().saturating_sub(1));
 
-        let mut slice = if stored.data.is_empty() || start >= stored.data.len() {
+        let mut slice = if effective_data.is_empty() || start >= effective_data.len() {
             Vec::new()
         } else {
-            let end = (end_inclusive + 1).min(stored.data.len());
-            stored.data[start..end].to_vec()
+            let end = (end_inclusive + 1).min(effective_data.len());
+            effective_data[start..end].to_vec()
         };
 
         if s.corrupt_download_bytes && !slice.is_empty() {

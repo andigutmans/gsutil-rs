@@ -193,7 +193,8 @@ pub async fn run(ctx: &mut CommandContext, sub_opts: &[OptPair], args: &[String]
             ctx.info(&format!("Removing {obj_url}..."));
             let bucket = obj_url.bucket_name().unwrap_or("");
             let name = obj_url.object_name().unwrap_or("");
-            match api
+            let provider_api = api.for_provider(obj_url.scheme())?;
+            match provider_api
                 .delete_object(bucket, name, obj_url.generation(), Some(&preconditions))
                 .await
             {
@@ -223,10 +224,15 @@ pub async fn run(ctx: &mut CommandContext, sub_opts: &[OptPair], args: &[String]
                     }
                     let bucket = obj_url.bucket_name().unwrap_or("");
                     let name = obj_url.object_name().unwrap_or("");
-                    match api
-                        .delete_object(bucket, name, obj_url.generation(), Some(&precond))
-                        .await
-                    {
+                    let res = match api.for_provider(obj_url.scheme()) {
+                        Ok(provider_api) => {
+                            provider_api
+                                .delete_object(bucket, name, obj_url.generation(), Some(&precond))
+                                .await
+                        }
+                        Err(e) => Err(e),
+                    };
+                    match res {
                         Ok(()) => {}
                         Err(e) if e.is_not_found() => {
                             if !quiet {
@@ -246,10 +252,11 @@ pub async fn run(ctx: &mut CommandContext, sub_opts: &[OptPair], args: &[String]
     for b_url in &bucket_urls_to_delete {
         ctx.info(&format!("Removing {b_url}..."));
         let bucket = b_url.bucket_name().unwrap_or("");
+        let provider_api = api.for_provider(b_url.scheme())?;
         let mut attempts = 0;
         loop {
             attempts += 1;
-            match api.delete_bucket(bucket, None).await {
+            match provider_api.delete_bucket(bucket, None).await {
                 Ok(()) => break,
                 Err(GsutilError::Service(se))
                     if se.kind == ServiceErrorKind::NotEmpty && attempts < 3 =>

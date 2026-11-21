@@ -15,13 +15,18 @@ pub mod signurl;
 #[cfg(test)]
 mod tests;
 
+use std::collections::BTreeMap;
 use std::io::Write;
 
-use gsutil_core::api::{CloudApi, CsObjectOrPrefix, ListObjectsOptions};
+use gsutil_core::api::{CloudApi, CsObjectOrPrefix, KmsApi, ListObjectsOptions, PubsubApi};
 use gsutil_core::config::BotoConfig;
 use gsutil_core::error::{no_urls_matched_target, GsutilError, Result};
 use gsutil_core::url::{contains_wildcard, CloudUrl, StorageUrl};
 use gsutil_core::wildcard::{build_bucket_filter_strings, WildcardMatcher};
+
+pub const SECONDS_IN_DAY: u64 = 24 * 60 * 60;
+pub const SECONDS_IN_MONTH: u64 = 31 * SECONDS_IN_DAY; // 2,678,400s (retention_util.py)
+pub const SECONDS_IN_YEAR: u64 = 31_557_600; // int(365.25 * 86400)
 
 /// Shared execution context passed to admin command handlers.
 pub struct AdminContext<'a> {
@@ -29,6 +34,14 @@ pub struct AdminContext<'a> {
     pub config: &'a BotoConfig,
     pub project_id: Option<String>,
     pub parallel_operations: bool,
+    pub quiet: bool,
+    pub debug_level: u8,
+    pub headers: BTreeMap<String, String>,
+    pub kms_api: Option<&'a dyn KmsApi>,
+    pub pubsub_api: Option<&'a dyn PubsubApi>,
+    /// Optional interactive confirmation override for tests (returns `true` to proceed).
+    /// When `None`, prompts on stdin/stderr matching Python `retention_util._ConfirmWithUserPrompt`.
+    pub confirm_fn: Option<&'a dyn Fn(&str) -> bool>,
     pub out: &'a mut dyn Write,
     pub err: &'a mut dyn Write,
 }
@@ -38,6 +51,38 @@ impl<'a> AdminContext<'a> {
         self.project_id
             .as_deref()
             .or_else(|| self.config.default_project_id())
+    }
+
+    /// Write an informational status line to `stderr` unless `-q` (`quiet`) is set.
+    pub fn info(&mut self, msg: &str) -> Result<()> {
+        if !self.quiet {
+            writeln!(self.err, "{msg}")?;
+        }
+        Ok(())
+    }
+
+    /// Prompt the user for `[y|N]` confirmation (default `false`).
+    pub fn confirm(&mut self, question: &str) -> Result<bool> {
+        if let Some(cb) = self.confirm_fn {
+            return Ok(cb(question));
+        }
+        let prompt = format!("{question} [y|N]: ");
+        loop {
+            write!(self.err, "{prompt}")?;
+            self.err.flush()?;
+            let mut line = String::new();
+            let n = std::io::stdin().read_line(&mut line)?;
+            if n == 0 {
+                return Ok(false);
+            }
+            match line.trim().to_ascii_lowercase().as_str() {
+                "" | "n" | "no" => return Ok(false),
+                "y" | "yes" => return Ok(true),
+                _ => {
+                    writeln!(self.err, "\tPlease respond with 'yes'/'y' or 'no'/'n'.")?;
+                }
+            }
+        }
     }
 }
 
@@ -136,10 +181,8 @@ pub(crate) async fn expand_bucket_urls(
         let bname = cloud.bucket_name.as_deref().unwrap_or("");
         if contains_wildcard(bname) {
             let matcher = WildcardMatcher::compile(bname)?;
-            let buckets = ctx
-                .api
-                .list_buckets(ctx.effective_project_id(), None)
-                .await?;
+            let api = ctx.api.for_provider(cloud.scheme.as_str())?;
+            let buckets = api.list_buckets(ctx.effective_project_id(), None).await?;
             for b in buckets {
                 let name = b.name.or(b.id).unwrap_or_default();
                 if matcher.is_match(&name) {
@@ -184,13 +227,13 @@ pub(crate) async fn expand_cloud_urls(
                 )));
             }
         };
+        let api = ctx.api.for_provider(cloud.scheme.as_str())?;
 
         if cloud.is_bucket() {
             let bname = cloud.bucket_name.as_deref().unwrap_or("");
             let matched_buckets = if contains_wildcard(bname) {
                 let matcher = WildcardMatcher::compile(bname)?;
-                ctx.api
-                    .list_buckets(ctx.effective_project_id(), None)
+                api.list_buckets(ctx.effective_project_id(), None)
                     .await?
                     .into_iter()
                     .filter_map(|b| {
@@ -204,8 +247,7 @@ pub(crate) async fn expand_cloud_urls(
 
             for b in matched_buckets {
                 if recursive {
-                    let listed = ctx
-                        .api
+                    let listed = api
                         .list_objects(
                             &b,
                             &ListObjectsOptions {
@@ -249,8 +291,7 @@ pub(crate) async fn expand_cloud_urls(
                 };
                 let filter = build_bucket_filter_strings(&pattern);
                 let matcher = WildcardMatcher::compile(&filter.prefix_wildcard)?;
-                let listed = ctx
-                    .api
+                let listed = api
                     .list_objects(
                         bname,
                         &ListObjectsOptions {
@@ -310,7 +351,7 @@ pub(crate) fn read_json_arg(path: &str) -> Result<String> {
     }
 }
 
-/// Parse a gsutil duration string like `"10s"`, `"5m"`, `"2h"`, `"30d"`, `"1y"` into seconds.
+/// Parse a `signurl -d` duration string like `"10s"`, `"5m"`, `"2h"`, `"7d"` into seconds.
 pub fn parse_duration_secs(s: &str) -> Result<u64> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -321,8 +362,8 @@ pub fn parse_duration_secs(s: &str) -> Result<u64> {
         's' | 'S' => (&trimmed[..trimmed.len() - 1], 1u64),
         'm' | 'M' => (&trimmed[..trimmed.len() - 1], 60u64),
         'h' | 'H' => (&trimmed[..trimmed.len() - 1], 3600u64),
-        'd' | 'D' => (&trimmed[..trimmed.len() - 1], 86_400u64),
-        'y' | 'Y' => (&trimmed[..trimmed.len() - 1], 31_557_600u64),
+        'd' | 'D' => (&trimmed[..trimmed.len() - 1], SECONDS_IN_DAY),
+        'y' | 'Y' => (&trimmed[..trimmed.len() - 1], SECONDS_IN_YEAR),
         c if c.is_ascii_digit() => (trimmed, 1u64),
         _ => {
             return Err(GsutilError::command(format!(
@@ -337,4 +378,62 @@ pub fn parse_duration_secs(s: &str) -> Result<u64> {
     })?;
     n.checked_mul(mult)
         .ok_or_else(|| GsutilError::command(format!("Duration overflow: \"{s}\"")))
+}
+
+/// Parse a GCS Retention Policy duration matching `gslib/utils/retention_util.py`:
+/// - `<N>s`: seconds (`N * 1`)
+/// - `<N>d`: days (`N * 86,400`)
+/// - `<N>m`: months (`N * 31 * 86,400 = 2,678,400`)
+/// - `<N>y`: years (`N * 31,557,600`)
+///
+/// Hours (`h`) and bare numbers are explicitly rejected!
+pub fn parse_retention_duration_secs(s: &str) -> Result<u64> {
+    let trimmed = s.trim();
+    if trimmed.len() < 2 {
+        return Err(GsutilError::command(format!(
+            "Incorrect retention period specified: {s}"
+        )));
+    }
+    let last = trimmed.chars().last().unwrap();
+    let num_str = &trimmed[..trimmed.len() - 1];
+    let mult = match last {
+        's' | 'S' => 1u64,
+        'd' | 'D' => SECONDS_IN_DAY,
+        'm' | 'M' => SECONDS_IN_MONTH,
+        'y' | 'Y' => SECONDS_IN_YEAR,
+        _ => {
+            return Err(GsutilError::command(format!(
+                "Incorrect retention period specified: {s}"
+            )));
+        }
+    };
+    if num_str.is_empty() || !num_str.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(GsutilError::command(format!(
+            "Incorrect retention period specified: {s}"
+        )));
+    }
+    let n: u64 = num_str
+        .parse()
+        .map_err(|_| GsutilError::command(format!("Incorrect retention period specified: {s}")))?;
+    if n == 0 {
+        return Err(GsutilError::command(format!(
+            "Incorrect retention period specified: {s}"
+        )));
+    }
+    n.checked_mul(mult)
+        .ok_or_else(|| GsutilError::command(format!("Retention period overflow: {s}")))
+}
+
+/// Normalize GCS storage class shorthand aliases matching `gslib/utils/text_util.py`.
+pub fn normalize_storage_class(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "std" | "standard" => "STANDARD".to_string(),
+        "nl" | "nearline" => "NEARLINE".to_string(),
+        "cl" | "coldline" => "COLDLINE".to_string(),
+        "ar" | "archive" => "ARCHIVE".to_string(),
+        "dra" | "durable_reduced_availability" => "DURABLE_REDUCED_AVAILABILITY".to_string(),
+        "mr" | "multi_regional" => "MULTI_REGIONAL".to_string(),
+        "r" | "regional" => "REGIONAL".to_string(),
+        _ => raw.trim().to_ascii_uppercase(),
+    }
 }

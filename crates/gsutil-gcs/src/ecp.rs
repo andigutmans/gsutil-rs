@@ -179,17 +179,53 @@ impl EcpProxy {
         format!("http://127.0.0.1:{}", self.port)
     }
 
-    /// Rewrite a `https://storage*.googleapis.com/...` URL to route through this local ECP proxy.
-    pub fn rewrite_gcs_url(&self, url: &str) -> String {
-        for prefix in [
-            "https://storage.mtls.googleapis.com",
-            "https://storage.googleapis.com",
+    /// Rewrite a `https://<service>.googleapis.com/...` URL to route through this local ECP proxy,
+    /// returning `(rewritten_url, Some("<service>.mtls.googleapis.com"))` when rewritten.
+    pub fn rewrite_google_api_url(&self, url: &str) -> (String, Option<String>) {
+        for (plain, mtls) in [
+            (
+                "https://storage.mtls.googleapis.com",
+                "storage.mtls.googleapis.com",
+            ),
+            (
+                "https://storage.googleapis.com",
+                "storage.mtls.googleapis.com",
+            ),
+            (
+                "https://cloudkms.mtls.googleapis.com",
+                "cloudkms.mtls.googleapis.com",
+            ),
+            (
+                "https://cloudkms.googleapis.com",
+                "cloudkms.mtls.googleapis.com",
+            ),
+            (
+                "https://pubsub.mtls.googleapis.com",
+                "pubsub.mtls.googleapis.com",
+            ),
+            (
+                "https://pubsub.googleapis.com",
+                "pubsub.mtls.googleapis.com",
+            ),
+            (
+                "https://iamcredentials.mtls.googleapis.com",
+                "iamcredentials.mtls.googleapis.com",
+            ),
+            (
+                "https://iamcredentials.googleapis.com",
+                "iamcredentials.mtls.googleapis.com",
+            ),
         ] {
-            if let Some(rest) = url.strip_prefix(prefix) {
-                return format!("{}{}", self.origin(), rest);
+            if let Some(rest) = url.strip_prefix(plain) {
+                return (format!("{}{}", self.origin(), rest), Some(mtls.to_string()));
             }
         }
-        url.to_string()
+        (url.to_string(), None)
+    }
+
+    /// Rewrite a `https://storage*.googleapis.com/...` URL to route through this local ECP proxy.
+    pub fn rewrite_gcs_url(&self, url: &str) -> String {
+        self.rewrite_google_api_url(url).0
     }
 
     pub fn target_host(&self) -> &'static str {

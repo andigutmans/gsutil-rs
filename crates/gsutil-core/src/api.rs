@@ -123,6 +123,37 @@ pub struct Bucket {
     pub hierarchical_namespace: Option<BucketHierarchicalNamespace>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub satisfies_pzs: Option<bool>,
+    /// Label keys to explicitly delete (`{"key": null}`) in JSON `PATCH` requests.
+    #[serde(skip)]
+    pub label_removals: Vec<String>,
+    /// Top-level bucket JSON fields to explicitly set to `null` in JSON `PATCH` requests
+    /// (e.g., `"logging"`, `"encryption"`, `"website"`, `"retentionPolicy"`).
+    #[serde(skip)]
+    pub clear_fields: Vec<String>,
+}
+
+impl Bucket {
+    /// Serialize this `Bucket` as a GCS JSON `PATCH` payload, injecting explicit `null`
+    /// tombstones for `label_removals` and `clear_fields`.
+    pub fn to_patch_value(&self) -> serde_json::Value {
+        let mut val = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(map) = val.as_object_mut() {
+            for field in &self.clear_fields {
+                map.insert(field.clone(), serde_json::Value::Null);
+            }
+            if !self.label_removals.is_empty() {
+                let labels_entry = map
+                    .entry("labels".to_string())
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(labels_map) = labels_entry.as_object_mut() {
+                    for k in &self.label_removals {
+                        labels_map.insert(k.clone(), serde_json::Value::Null);
+                    }
+                }
+            }
+        }
+        val
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -374,6 +405,14 @@ pub struct Object {
     pub owner: Option<ResourceOwner>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retention: Option<ObjectRetention>,
+    /// Custom metadata keys to explicitly delete (`{"key": null}`) in JSON `PATCH` requests.
+    #[serde(skip)]
+    pub metadata_removals: Vec<String>,
+    /// Top-level object JSON fields to explicitly set to `null` in JSON `PATCH` requests
+    /// (e.g., `"cacheControl"`, `"contentDisposition"`, `"contentEncoding"`,
+    /// `"contentLanguage"`, `"contentType"`, `"customTime"`).
+    #[serde(skip)]
+    pub clear_fields: Vec<String>,
 }
 
 impl Object {
@@ -383,6 +422,28 @@ impl Object {
             .as_deref()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0)
+    }
+
+    /// Serialize this `Object` as a GCS JSON `PATCH` payload, injecting explicit `null`
+    /// tombstones for `metadata_removals` and `clear_fields`.
+    pub fn to_patch_value(&self) -> serde_json::Value {
+        let mut val = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(map) = val.as_object_mut() {
+            for field in &self.clear_fields {
+                map.insert(field.clone(), serde_json::Value::Null);
+            }
+            if !self.metadata_removals.is_empty() {
+                let meta_entry = map
+                    .entry("metadata".to_string())
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(meta_map) = meta_entry.as_object_mut() {
+                    for k in &self.metadata_removals {
+                        meta_map.insert(k.clone(), serde_json::Value::Null);
+                    }
+                }
+            }
+        }
+        val
     }
 }
 
@@ -548,11 +609,15 @@ pub struct Channel {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct ServiceAccount {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// GCS JSON API v1 returns `email_address` (snake_case), not camelCase.
+    #[serde(
+        rename = "email_address",
+        alias = "emailAddress",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub email_address: Option<String>,
 }
 
@@ -719,6 +784,13 @@ pub struct SignUrlOptions {
 /// Async Cloud Storage API trait covering all methods in `gslib/cloud_api.py`.
 #[async_trait]
 pub trait CloudApi: Send + Sync {
+    /// Resolve a provider-specific `CloudApi` delegate (`"gs"` or `"s3"`).
+    /// Returns `Ok(None)` by default (meaning `self` handles the request).
+    /// `CloudApiDelegator` overrides this to route `s3://` to `XmlApiClient("s3")`.
+    fn resolve_provider(&self, _provider: &str) -> Result<Option<&dyn CloudApi>> {
+        Ok(None)
+    }
+
     async fn get_service_account_id(&self) -> Result<String>;
 
     // ---- Buckets ----
@@ -919,6 +991,43 @@ pub trait CloudApi: Send + Sync {
     async fn sign_url(&self, options: &SignUrlOptions) -> Result<String>;
 }
 
+impl dyn CloudApi + '_ {
+    /// Return the `CloudApi` instance for `provider` (`"gs"` or `"s3"`),
+    /// delegating through `resolve_provider` when implemented (e.g. `CloudApiDelegator`).
+    pub fn for_provider(&self, provider: &str) -> Result<&dyn CloudApi> {
+        match self.resolve_provider(provider)? {
+            Some(api) => Ok(api),
+            None => Ok(self),
+        }
+    }
+}
+
+/// Async Cloud KMS API trait for `gsutil kms authorize`.
+#[async_trait]
+pub trait KmsApi: Send + Sync {
+    /// Grant `roles/cloudkms.cryptoKeyEncrypterDecrypter` to `service_account_email`
+    /// on `kms_key_name`. Returns `true` if the policy was updated, `false` if already authorized.
+    async fn authorize_service_account(
+        &self,
+        kms_key_name: &str,
+        service_account_email: &str,
+    ) -> Result<bool>;
+}
+
+/// Async Cloud Pub/Sub API trait for `gsutil notification create`.
+#[async_trait]
+pub trait PubsubApi: Send + Sync {
+    /// Create `topic_name` if it does not already exist (idempotent).
+    async fn create_topic(&self, topic_name: &str) -> Result<()>;
+
+    /// Grant `roles/pubsub.publisher` to `service_account_email` on `topic_name`.
+    async fn authorize_publisher(
+        &self,
+        topic_name: &str,
+        service_account_email: &str,
+    ) -> Result<()>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,5 +1097,44 @@ mod tests {
         assert_eq!(policy.version, Some(3));
         assert_eq!(policy.bindings.len(), 1);
         assert!(policy.bindings[0].condition.is_some());
+    }
+
+    #[test]
+    fn test_bucket_and_object_patch_null_tombstones() {
+        let mut b = Bucket {
+            labels: Some(BTreeMap::from([("env".to_string(), "prod".to_string())])),
+            label_removals: vec!["old_label".to_string()],
+            clear_fields: vec!["logging".to_string(), "encryption".to_string()],
+            ..Default::default()
+        };
+        let b_val = b.to_patch_value();
+        assert_eq!(b_val["labels"]["env"], "prod");
+        assert!(b_val["labels"]["old_label"].is_null());
+        assert!(b_val["logging"].is_null());
+        assert!(b_val["encryption"].is_null());
+        b.labels = None;
+        let b_val2 = b.to_patch_value();
+        assert!(b_val2["labels"]["old_label"].is_null());
+
+        let o = Object {
+            metadata: Some(BTreeMap::from([("k1".to_string(), "v1".to_string())])),
+            metadata_removals: vec!["k2".to_string()],
+            clear_fields: vec!["cacheControl".to_string()],
+            ..Default::default()
+        };
+        let o_val = o.to_patch_value();
+        assert_eq!(o_val["metadata"]["k1"], "v1");
+        assert!(o_val["metadata"]["k2"].is_null());
+        assert!(o_val["cacheControl"].is_null());
+
+        // GCS JSON v1 returns snake_case `email_address` for projects.serviceAccount.get
+        let sa: ServiceAccount = serde_json::from_str(
+            r#"{"kind": "storage#serviceAccount", "email_address": "service-123@gs-project-accounts.iam.gserviceaccount.com"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            sa.email_address.as_deref(),
+            Some("service-123@gs-project-accounts.iam.gserviceaccount.com")
+        );
     }
 }

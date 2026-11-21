@@ -427,6 +427,16 @@ async fn test_cloud_api_delegator_routing_rules() {
         .unwrap();
     assert_eq!(b_s3.name.as_deref(), Some("s3-bkt"));
 
+    // Verify dynamic dispatch through `Arc<dyn CloudApi>` routes s3:// via `for_provider("s3")`.
+    let dyn_api: Arc<dyn CloudApi> = Arc::new(delegator.clone());
+    let b_s3_dyn = dyn_api
+        .for_provider("s3")
+        .unwrap()
+        .get_bucket("s3-bkt", None)
+        .await
+        .unwrap();
+    assert_eq!(b_s3_dyn.name.as_deref(), Some("s3-bkt"));
+
     // prefer_api = xml -> gs routes to XML
     let mut cfg_xml = BotoConfig::new();
     cfg_xml.set("GSUtil", "prefer_api", "xml");

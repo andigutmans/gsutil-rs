@@ -60,7 +60,9 @@ pub async fn run(ctx: &mut CommandContext, _sub_opts: &[OptPair], args: &[String
         } else {
             let bucket = url.bucket_name().unwrap_or("");
             let obj_name = url.object_name().unwrap_or("");
-            api.get_object_metadata(bucket, obj_name, url.generation(), None)
+            let provider_api = api.for_provider(url.scheme())?;
+            provider_api
+                .get_object_metadata(bucket, obj_name, url.generation(), None)
                 .await
                 .map(|meta| {
                     vec![BucketListingRef::Object {

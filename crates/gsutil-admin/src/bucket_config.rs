@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use chrono::DateTime;
 use gsutil_core::api::{
     Bucket, BucketAutoclass, BucketBilling, BucketCors, BucketIamConfiguration, BucketLifecycle,
     BucketLogging, BucketRetentionPolicy, BucketVersioning, BucketWebsite, Object, Preconditions,
@@ -14,7 +15,8 @@ use gsutil_core::error::{GsutilError, Result};
 
 use crate::{
     bucket_display_no_slash, expand_bucket_urls, expand_cloud_urls, insist_on_or_off,
-    parse_duration_secs, read_json_arg, AdminContext,
+    normalize_storage_class, parse_retention_duration_secs, read_json_arg, AdminContext,
+    SECONDS_IN_DAY, SECONDS_IN_MONTH, SECONDS_IN_YEAR,
 };
 
 // ---------------------------------------------------------------------------
@@ -296,26 +298,29 @@ pub async fn run_logging(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
             let buckets = expand_bucket_urls(ctx, &url_args, "logging").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                let logging = if enabled {
-                    writeln!(ctx.err, "Enabling logging on {}...", b.bucket_url_string())?;
-                    Some(BucketLogging {
-                        log_bucket: log_bucket.clone(),
-                        log_object_prefix: Some(
-                            log_prefix.clone().unwrap_or_else(|| name.to_string()),
-                        ),
-                    })
+                let patch = if enabled {
+                    ctx.info(&format!("Enabling logging on {}...", b.bucket_url_string()))?;
+                    Bucket {
+                        logging: Some(BucketLogging {
+                            log_bucket: log_bucket.clone(),
+                            log_object_prefix: Some(
+                                log_prefix.clone().unwrap_or_else(|| name.to_string()),
+                            ),
+                        }),
+                        ..Default::default()
+                    }
                 } else {
-                    writeln!(ctx.err, "Disabling logging on {}...", b.bucket_url_string())?;
-                    Some(BucketLogging {
-                        log_bucket: None,
-                        log_object_prefix: None,
-                    })
-                };
-                let patch = Bucket {
-                    logging,
-                    ..Default::default()
+                    ctx.info(&format!(
+                        "Disabling logging on {}...",
+                        b.bucket_url_string()
+                    ))?;
+                    Bucket {
+                        clear_fields: vec!["logging".to_string()],
+                        ..Default::default()
+                    }
                 };
                 ctx.api
+                    .for_provider(b.scheme.as_str())?
                     .patch_bucket(name, &patch, None, None, None, None)
                     .await?;
             }
@@ -391,19 +396,26 @@ pub async fn run_web(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
             let buckets = expand_bucket_urls(ctx, &url_args, "web").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                writeln!(
-                    ctx.err,
+                ctx.info(&format!(
                     "Setting website configuration on {}...",
                     b.bucket_url_string()
-                )?;
-                let patch = Bucket {
-                    website: Some(BucketWebsite {
-                        main_page_suffix: main_page.clone(),
-                        not_found_page: error_page.clone(),
-                    }),
-                    ..Default::default()
+                ))?;
+                let patch = if main_page.is_none() && error_page.is_none() {
+                    Bucket {
+                        clear_fields: vec!["website".to_string()],
+                        ..Default::default()
+                    }
+                } else {
+                    Bucket {
+                        website: Some(BucketWebsite {
+                            main_page_suffix: main_page.clone(),
+                            not_found_page: error_page.clone(),
+                        }),
+                        ..Default::default()
+                    }
                 };
                 ctx.api
+                    .for_provider(b.scheme.as_str())?
                     .patch_bucket(name, &patch, None, None, None, None)
                     .await?;
             }
@@ -515,28 +527,37 @@ pub async fn run_label(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()
             let buckets = expand_bucket_urls(ctx, &url_args, "label").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                let existing = ctx.api.get_bucket(name, None).await?;
-                let mut labels = existing.labels.unwrap_or_default();
+                let mut set_labels: BTreeMap<String, String> = BTreeMap::new();
+                let mut removals: Vec<String> = Vec::new();
                 for (k, v_opt) in &updates {
                     match v_opt {
                         Some(v) => {
-                            labels.insert(k.clone(), v.clone());
+                            removals.retain(|rk| rk != k);
+                            set_labels.insert(k.clone(), v.clone());
                         }
                         None => {
-                            labels.remove(k);
+                            set_labels.remove(k);
+                            if !removals.iter().any(|rk| rk == k) {
+                                removals.push(k.clone());
+                            }
                         }
                     }
                 }
-                writeln!(
-                    ctx.err,
+                ctx.info(&format!(
                     "Setting label configuration on {}...",
                     b.bucket_url_string()
-                )?;
+                ))?;
                 let patch = Bucket {
-                    labels: Some(labels),
+                    labels: if set_labels.is_empty() {
+                        None
+                    } else {
+                        Some(set_labels)
+                    },
+                    label_removals: removals,
                     ..Default::default()
                 };
                 ctx.api
+                    .for_provider(b.scheme.as_str())?
                     .patch_bucket(name, &patch, None, None, None, None)
                     .await?;
             }
@@ -622,9 +643,13 @@ pub async fn run_defstorageclass(ctx: &mut AdminContext<'_>, args: &[String]) ->
             let buckets = expand_bucket_urls(ctx, &args[1..], "defstorageclass").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                let meta = ctx.api.get_bucket(name, None).await?;
+                let meta = ctx
+                    .api
+                    .for_provider(b.scheme.as_str())?
+                    .get_bucket(name, None)
+                    .await?;
                 let sc = meta.storage_class.as_deref().unwrap_or("STANDARD");
-                writeln!(ctx.out, "{}: {sc}", b.bucket_url_string())?;
+                writeln!(ctx.out, "{}: {sc}", bucket_display_no_slash(&b))?;
             }
             Ok(())
         }
@@ -634,20 +659,20 @@ pub async fn run_defstorageclass(ctx: &mut AdminContext<'_>, args: &[String]) ->
                     "defstorageclass set requires a storage class and bucket URL(s).",
                 ));
             }
-            let sc = args[1].to_ascii_uppercase();
+            let sc = normalize_storage_class(&args[1]);
             let buckets = expand_bucket_urls(ctx, &args[2..], "defstorageclass").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                writeln!(
-                    ctx.err,
+                ctx.info(&format!(
                     "Setting default storage class to \"{sc}\" for bucket {}",
-                    b.bucket_url_string()
-                )?;
+                    bucket_display_no_slash(&b)
+                ))?;
                 let patch = Bucket {
                     storage_class: Some(sc.clone()),
                     ..Default::default()
                 };
                 ctx.api
+                    .for_provider(b.scheme.as_str())?
                     .patch_bucket(name, &patch, None, None, None, None)
                     .await?;
             }
@@ -690,14 +715,15 @@ pub async fn run_ubla(ctx: &mut AdminContext<'_>, args: &[String], legacy_bpo: b
                     .and_then(|c| c.uniform_bucket_level_access.or(c.bucket_policy_only));
                 let enabled = ubla.as_ref().and_then(|u| u.enabled).unwrap_or(false);
                 let enabled_str = if enabled { "True" } else { "False" };
+                let locked_line = ubla
+                    .and_then(|u| u.locked_time)
+                    .map(|lt| format!("  LockedTime: {}\n", format_ubla_locked_time(&lt)))
+                    .unwrap_or_default();
                 writeln!(
                     ctx.out,
-                    "{label} setting for {}:\n  Enabled: {enabled_str}",
+                    "{label} setting for {}:\n  Enabled: {enabled_str}\n{locked_line}",
                     bucket_display_no_slash(&b)
                 )?;
-                if let Some(lt) = ubla.and_then(|u| u.locked_time) {
-                    writeln!(ctx.out, "  LockedTime: {lt}")?;
-                }
             }
             Ok(())
         }
@@ -931,6 +957,65 @@ pub async fn run_autoclass(ctx: &mut AdminContext<'_>, args: &[String]) -> Resul
     }
 }
 
+/// Format UBLA/BPO `lockedTime` RFC3339 string as Python's `YYYY-MM-DD HH:MM:SS.ffffff+00:00`.
+fn format_ubla_locked_time(raw: &str) -> String {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        let utc = dt.with_timezone(&chrono::Utc);
+        let micros = utc.timestamp_subsec_micros();
+        return format!("{}.{:06}+00:00", utc.format("%Y-%m-%d %H:%M:%S"), micros);
+    }
+    raw.to_string()
+}
+
+/// Format retention period in seconds matching `retention_util._RetentionPeriodToString`.
+fn format_retention_duration(period: u64) -> String {
+    if period.is_multiple_of(SECONDS_IN_YEAR) {
+        format!("    Duration: {} Year(s)", period / SECONDS_IN_YEAR)
+    } else if period.is_multiple_of(SECONDS_IN_MONTH) {
+        format!("    Duration: {} Month(s)", period / SECONDS_IN_MONTH)
+    } else if period.is_multiple_of(SECONDS_IN_DAY) {
+        format!("    Duration: {} Day(s)", period / SECONDS_IN_DAY)
+    } else if period > SECONDS_IN_DAY {
+        format!(
+            "    Duration: {} Seconds (~{} Day(s))",
+            period,
+            period / SECONDS_IN_DAY
+        )
+    } else {
+        format!("    Duration: {} Second(s)", period)
+    }
+}
+
+/// Format a bucket's retention policy matching `retention_util.RetentionPolicyToString`.
+fn format_retention_policy(rp: Option<&BucketRetentionPolicy>, bucket_url: &str) -> String {
+    if let Some(rp) = rp {
+        if let Some(period) = rp
+            .retention_period
+            .as_deref()
+            .and_then(|p| p.parse::<u64>().ok())
+            .filter(|&p| p > 0)
+        {
+            let locked = if rp.is_locked.unwrap_or(false) {
+                "(LOCKED)"
+            } else {
+                "(UNLOCKED)"
+            };
+            let dur = format_retention_duration(period);
+            let eff = rp
+                .effective_time
+                .as_deref()
+                .map(|raw| {
+                    DateTime::parse_from_rfc3339(raw)
+                        .map(|dt| dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+                        .unwrap_or_else(|_| raw.to_string())
+                })
+                .unwrap_or_else(|| "None".to_string());
+            return format!("  Retention Policy {locked}:\n{dur}\n    Effective Time: {eff}");
+        }
+    }
+    format!("{bucket_url} has no Retention Policy.")
+}
+
 // ---------------------------------------------------------------------------
 // 14. retention (set|clear|get|lock|event-default|event|temp)
 // ---------------------------------------------------------------------------
@@ -948,15 +1033,14 @@ pub async fn run_retention(ctx: &mut AdminContext<'_>, args: &[String]) -> Resul
                     "retention set requires <duration> and bucket URL(s).",
                 ));
             }
-            let secs = parse_duration_secs(&args[1])?;
+            let secs = parse_retention_duration_secs(&args[1])?;
             let buckets = expand_bucket_urls(ctx, &args[2..], "retention").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                writeln!(
-                    ctx.err,
+                ctx.info(&format!(
                     "Setting Retention Policy on {}...",
                     b.bucket_url_string()
-                )?;
+                ))?;
                 let patch = Bucket {
                     retention_policy: Some(BucketRetentionPolicy {
                         retention_period: Some(secs.to_string()),
@@ -965,6 +1049,7 @@ pub async fn run_retention(ctx: &mut AdminContext<'_>, args: &[String]) -> Resul
                     ..Default::default()
                 };
                 ctx.api
+                    .for_provider(b.scheme.as_str())?
                     .patch_bucket(name, &patch, None, None, None, None)
                     .await?;
             }
@@ -974,19 +1059,16 @@ pub async fn run_retention(ctx: &mut AdminContext<'_>, args: &[String]) -> Resul
             let buckets = expand_bucket_urls(ctx, &args[1..], "retention").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                writeln!(
-                    ctx.err,
+                ctx.info(&format!(
                     "Clearing Retention Policy on {}...",
                     b.bucket_url_string()
-                )?;
+                ))?;
                 let patch = Bucket {
-                    retention_policy: Some(BucketRetentionPolicy {
-                        retention_period: Some("0".to_string()),
-                        ..Default::default()
-                    }),
+                    clear_fields: vec!["retentionPolicy".to_string()],
                     ..Default::default()
                 };
                 ctx.api
+                    .for_provider(b.scheme.as_str())?
                     .patch_bucket(name, &patch, None, None, None, None)
                     .await?;
             }
@@ -996,31 +1078,16 @@ pub async fn run_retention(ctx: &mut AdminContext<'_>, args: &[String]) -> Resul
             let buckets = expand_bucket_urls(ctx, &args[1..], "retention").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                let meta = ctx.api.get_bucket(name, None).await?;
-                match meta.retention_policy {
-                    Some(rp) if rp.retention_period.as_deref().is_some_and(|p| p != "0") => {
-                        let status = if rp.is_locked.unwrap_or(false) {
-                            "LOCKED"
-                        } else {
-                            "UNLOCKED"
-                        };
-                        writeln!(
-                            ctx.out,
-                            "Retention Policy (Current Configuration):\n  Duration: {} Second(s)\n  Mode: {status}",
-                            rp.retention_period.as_deref().unwrap_or("0")
-                        )?;
-                        if let Some(eff) = rp.effective_time {
-                            writeln!(ctx.out, "  Effective Time: {eff}")?;
-                        }
-                    }
-                    _ => {
-                        writeln!(
-                            ctx.out,
-                            "{} has no Retention Policy.",
-                            b.bucket_url_string()
-                        )?;
-                    }
-                }
+                let meta = ctx
+                    .api
+                    .for_provider(b.scheme.as_str())?
+                    .get_bucket(name, None)
+                    .await?;
+                writeln!(
+                    ctx.out,
+                    "{}",
+                    format_retention_policy(meta.retention_policy.as_ref(), &b.bucket_url_string())
+                )?;
             }
             Ok(())
         }
@@ -1028,18 +1095,62 @@ pub async fn run_retention(ctx: &mut AdminContext<'_>, args: &[String]) -> Resul
             let buckets = expand_bucket_urls(ctx, &args[1..], "retention").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                let meta = ctx.api.get_bucket(name, None).await?;
+                let meta = ctx
+                    .api
+                    .for_provider(b.scheme.as_str())?
+                    .get_bucket(name, None)
+                    .await?;
+                if meta
+                    .retention_policy
+                    .as_ref()
+                    .and_then(|rp| rp.retention_period.as_deref())
+                    .and_then(|p| p.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    == 0
+                {
+                    return Err(GsutilError::command(format!(
+                        "Bucket \"{}\" does not have an Unlocked Retention Policy.",
+                        b.bucket_url_string()
+                    )));
+                }
+                if meta
+                    .retention_policy
+                    .as_ref()
+                    .and_then(|rp| rp.is_locked)
+                    .unwrap_or(false)
+                {
+                    ctx.info(&format!(
+                        "Retention Policy on {} is already locked.",
+                        b.bucket_url_string()
+                    ))?;
+                    continue;
+                }
+                let policy_str =
+                    format_retention_policy(meta.retention_policy.as_ref(), &b.bucket_url_string());
+                let question = format!(
+                    "This will PERMANENTLY set the Retention Policy on gs://{name} to:\n\n\
+                     {policy_str}\n\nThis setting cannot be reverted!  Continue?"
+                );
+                if !ctx.confirm(&question)? {
+                    ctx.info(&format!(
+                        "  Abort Locking Retention Policy on {}",
+                        b.bucket_url_string()
+                    ))?;
+                    continue;
+                }
                 let metagen: i64 = meta
                     .metageneration
                     .as_deref()
                     .and_then(|m| m.parse().ok())
                     .unwrap_or(1);
-                writeln!(
-                    ctx.err,
+                ctx.info(&format!(
                     "Locking Retention Policy on {}...",
                     b.bucket_url_string()
-                )?;
-                ctx.api.lock_retention_policy(name, metagen).await?;
+                ))?;
+                ctx.api
+                    .for_provider(b.scheme.as_str())?
+                    .lock_retention_policy(name, metagen)
+                    .await?;
             }
             Ok(())
         }

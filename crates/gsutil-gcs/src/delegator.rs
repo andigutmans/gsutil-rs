@@ -164,6 +164,18 @@ impl CloudApiDelegator {
 
 #[async_trait]
 impl CloudApi for CloudApiDelegator {
+    fn resolve_provider(&self, provider: &str) -> Result<Option<&dyn CloudApi>> {
+        let selector = self.get_api_selector(Some(provider))?;
+        match (provider, selector) {
+            ("gs", ApiSelector::Json) => Ok(Some(self.gs_json.as_ref())),
+            ("gs", ApiSelector::Xml) => Ok(Some(self.gs_xml.as_ref())),
+            ("s3", ApiSelector::Xml) => Ok(Some(self.s3_xml.as_ref())),
+            (p, s) => Err(GsutilError::argument(format!(
+                "gsutil Cloud API map does not support API {s:?} for provider {p}."
+            ))),
+        }
+    }
+
     async fn get_service_account_id(&self) -> Result<String> {
         self.default_api()?.get_service_account_id().await
     }

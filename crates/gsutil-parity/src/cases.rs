@@ -1,13 +1,20 @@
 //! Differential test case definitions for offline, mock-GCS, and live-GCS modes.
 
-use crate::mock_gcs::MockGcsServer;
 use crate::normalize::{CompareRule, NormalizeContext};
 use crate::runner::{CaseResult, GsutilRunner, RunOptions};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tempfile::TempDir;
 
-fn matches_filter(filter: Option<&str>, id: &str, category: &str, command: &str) -> bool {
+pub use crate::live_cases::run_live_gcs_suite;
+pub use crate::mock_cases::run_mock_gcs_suite;
+
+pub(crate) fn matches_filter(
+    filter: Option<&str>,
+    id: &str,
+    category: &str,
+    command: &str,
+) -> bool {
     let Some(f) = filter else {
         return true;
     };
@@ -17,14 +24,26 @@ fn matches_filter(filter: Option<&str>, id: &str, category: &str, command: &str)
         || command.to_ascii_lowercase().contains(&f)
 }
 
-/// Snapshot all files under `root` as relative-path -> bytes for side-effect comparison.
-fn snapshot_dir(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
+/// Snapshot entry capturing regular files (bytes + mode), directories, and symlinks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DirEntrySnapshot {
+    Dir,
+    File { bytes: Vec<u8>, mode: u32 },
+    Symlink { target: String },
+}
+
+/// Snapshot all files, directories, symlinks, and POSIX modes under `root`.
+fn snapshot_dir(root: &Path) -> Result<BTreeMap<String, DirEntrySnapshot>, String> {
     let mut map = BTreeMap::new();
     collect_dir(root, root, &mut map)?;
     Ok(map)
 }
 
-fn collect_dir(base: &Path, cur: &Path, out: &mut BTreeMap<String, Vec<u8>>) -> Result<(), String> {
+fn collect_dir(
+    base: &Path,
+    cur: &Path,
+    out: &mut BTreeMap<String, DirEntrySnapshot>,
+) -> Result<(), String> {
     let entries = std::fs::read_dir(cur)
         .map_err(|e| format!("failed to read dir {}: {}", cur.display(), e))?;
     for entry in entries {
@@ -35,15 +54,53 @@ fn collect_dir(base: &Path, cur: &Path, out: &mut BTreeMap<String, Vec<u8>>) -> 
             .unwrap_or(&path)
             .to_string_lossy()
             .into_owned();
-        if path.is_dir() {
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("failed to stat {}: {}", path.display(), e))?;
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            let target = std::fs::read_link(&path)
+                .map_err(|e| format!("failed to readlink {}: {}", path.display(), e))?
+                .to_string_lossy()
+                .into_owned();
+            out.insert(rel, DirEntrySnapshot::Symlink { target });
+        } else if ft.is_dir() {
+            out.insert(rel, DirEntrySnapshot::Dir);
             collect_dir(base, &path, out)?;
-        } else if path.is_file() {
+        } else if ft.is_file() {
             let bytes = std::fs::read(&path)
                 .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
-            out.insert(rel, bytes);
+            #[cfg(unix)]
+            let mode = {
+                use std::os::unix::fs::PermissionsExt;
+                meta.permissions().mode() & 0o777
+            };
+            #[cfg(not(unix))]
+            let mode = 0o644;
+            out.insert(rel, DirEntrySnapshot::File { bytes, mode });
         }
     }
     Ok(())
+}
+
+/// Deterministic seeded PRNG (xorshift64) for non-UTF-8 realistic binary test payloads.
+pub(crate) fn seeded_random_bytes(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = if seed == 0 {
+        0x9E37_79B9_7F4A_7C15
+    } else {
+        seed
+    };
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        for b in state.to_le_bytes() {
+            if out.len() < len {
+                out.push(b);
+            }
+        }
+    }
+    out
 }
 
 /// Run all offline / hermetic differential tests (no network required).
@@ -100,32 +157,32 @@ pub fn run_offline_suite(runner: &GsutilRunner, filter: Option<&str>) -> Vec<Cas
         "cli_dispatch",
         "dispatch",
         &["-o", "bad", "version"],
-        CompareRule::Ignore,
-        CompareRule::Ignore,
+        CompareRule::ContainsAll(vec!["Usage:".into()]),
+        CompareRule::Exact,
     );
     run_simple(
         "invalid_o_empty_section",
         "cli_dispatch",
         "dispatch",
         &["-o", ":k=v", "version"],
-        CompareRule::Ignore,
-        CompareRule::Ignore,
+        CompareRule::ContainsAll(vec!["Usage:".into()]),
+        CompareRule::Exact,
     );
     run_simple(
         "invalid_o_empty_key",
         "cli_dispatch",
         "dispatch",
         &["-o", "s:=v", "version"],
-        CompareRule::Ignore,
-        CompareRule::Ignore,
+        CompareRule::ContainsAll(vec!["Usage:".into()]),
+        CompareRule::Exact,
     );
     run_simple(
         "invalid_h_empty_header_name",
         "cli_dispatch",
         "dispatch",
         &["-h", ":v", "version"],
-        CompareRule::Ignore,
-        CompareRule::Ignore,
+        CompareRule::ContainsAll(vec!["Usage:".into()]),
+        CompareRule::Exact,
     );
     run_simple(
         "fuzzy_deprecated_alias_typo",
@@ -933,881 +990,4 @@ fn verify_dir_parity(res: &mut CaseResult, ref_root: &Path, rust_root: &Path) {
             res.side_effect_error = Some(e);
         }
     }
-}
-
-/// Run deterministic differential tests against the in-process Mock GCS JSON server.
-pub async fn run_mock_gcs_suite(runner: &GsutilRunner, filter: Option<&str>) -> Vec<CaseResult> {
-    let mut results = Vec::new();
-    let server = match MockGcsServer::start().await {
-        Ok(s) => s,
-        Err(e) => {
-            results.push(CaseResult {
-                id: "mock_gcs_startup".into(),
-                category: "mock_gcs".into(),
-                command: "setup".into(),
-                args: vec![],
-                passed: false,
-                skipped: false,
-                skip_reason: None,
-                exit_code_match: false,
-                ref_output: None,
-                rust_output: None,
-                stdout_cmp: None,
-                stderr_cmp: None,
-                side_effect_error: Some(format!("failed to start MockGcsServer: {}", e)),
-            });
-            return results;
-        }
-    };
-
-    server.seed_bucket("mock-bkt");
-    server.seed_object("mock-bkt", "hello.txt", b"0123456789");
-    server.seed_object("mock-bkt", "dir/nested.txt", b"nested-payload");
-
-    let tmp = TempDir::new().expect("temp dir");
-    let boto = tmp.path().join("mock.boto");
-    server.write_boto_config(&boto).expect("write mock boto");
-    let fake_home = tmp.path().join("home");
-    std::fs::create_dir_all(&fake_home).expect("mkdir fake home");
-    let fake_home_s = fake_home.to_string_lossy().into_owned();
-    let adc_path = tmp.path().join("adc.json");
-    std::fs::write(
-        &adc_path,
-        serde_json::json!({
-            "type": "authorized_user",
-            "client_id": "mock-client-id",
-            "client_secret": "mock-client-secret",
-            "refresh_token": "mock-refresh-token",
-            "token_uri": format!("{}/oauth2/token", server.base_url()),
-        })
-        .to_string(),
-    )
-    .expect("write mock adc.json");
-    let adc_path_s = adc_path.to_string_lossy().into_owned();
-
-    let mut run_mock = |id: &str,
-                        cmd: &str,
-                        args: &[&str],
-                        expected_exit: i32,
-                        expected_stdout: &str,
-                        stdout_rule: CompareRule,
-                        expected_stderr: &str,
-                        stderr_rule: CompareRule| {
-        if !matches_filter(filter, id, "mock_gcs", cmd) {
-            return;
-        }
-        let opts = RunOptions::new(args.iter().copied())
-            .with_boto_config(&boto)
-            .with_env("GOOGLE_APPLICATION_CREDENTIALS", &adc_path_s)
-            .with_env("STORAGE_EMULATOR_HOST", server.base_url())
-            .with_env("GCE_METADATA_HOST", server.addr.to_string())
-            .with_env("GCE_METADATA_ROOT", server.addr.to_string())
-            .with_env("CLOUDSDK_CORE_PASS_CREDENTIALS_TO_GSUTIL", "False")
-            .with_env("CLOUDSDK_CONTEXT_AWARE_USE_CLIENT_CERTIFICATE", "false")
-            .with_env("CLOUDSDK_CONFIG", &fake_home_s)
-            .with_env("HOME", &fake_home_s);
-        let ctx = NormalizeContext::default().strip_ui();
-        results.push(runner.run_rust_contract(
-            id,
-            "mock_gcs",
-            cmd,
-            &opts,
-            expected_exit,
-            expected_stdout,
-            &stdout_rule,
-            expected_stderr,
-            &stderr_rule,
-            &ctx,
-        ));
-    };
-
-    run_mock(
-        "mock_ls_bucket",
-        "ls",
-        &["ls", "gs://mock-bkt"],
-        0,
-        "gs://mock-bkt/hello.txt\ngs://mock-bkt/dir/\n",
-        CompareRule::Exact,
-        "",
-        CompareRule::Exact,
-    );
-    run_mock(
-        "mock_ls_long",
-        "ls",
-        &["ls", "-l", "gs://mock-bkt/hello.txt"],
-        0,
-        "gs://mock-bkt/hello.txt TOTAL: 1 objects",
-        CompareRule::ContainsAll(vec![
-            "gs://mock-bkt/hello.txt".into(),
-            "TOTAL: 1 objects".into(),
-        ]),
-        "",
-        CompareRule::Exact,
-    );
-    run_mock(
-        "mock_stat_object",
-        "stat",
-        &["stat", "gs://mock-bkt/hello.txt"],
-        0,
-        "gs://mock-bkt/hello.txt: Content-Length: Hash (crc32c): Hash (md5):",
-        CompareRule::ContainsAll(vec![
-            "gs://mock-bkt/hello.txt:".into(),
-            "Content-Length:".into(),
-            "Hash (crc32c):".into(),
-            "Hash (md5):".into(),
-        ]),
-        "",
-        CompareRule::Exact,
-    );
-    run_mock(
-        "mock_cat_full",
-        "cat",
-        &["cat", "gs://mock-bkt/hello.txt"],
-        0,
-        "0123456789",
-        CompareRule::Exact,
-        "",
-        CompareRule::Exact,
-    );
-    run_mock(
-        "mock_cat_range_1_3",
-        "cat",
-        &["cat", "-r", "1-3", "gs://mock-bkt/hello.txt"],
-        0,
-        "123",
-        CompareRule::Exact,
-        "",
-        CompareRule::Exact,
-    );
-    run_mock(
-        "mock_cat_range_suffix",
-        "cat",
-        &["cat", "-r", "-3", "gs://mock-bkt/hello.txt"],
-        0,
-        "789",
-        CompareRule::Exact,
-        "",
-        CompareRule::Exact,
-    );
-    run_mock(
-        "mock_cat_header",
-        "cat",
-        &["cat", "-h", "gs://mock-bkt/hello.txt"],
-        0,
-        "0123456789",
-        CompareRule::Exact,
-        "==> gs://mock-bkt/hello.txt <==",
-        CompareRule::ContainsAll(vec!["==> gs://mock-bkt/hello.txt <==".into()]),
-    );
-    run_mock(
-        "mock_hash_cloud_object",
-        "hash",
-        &["hash", "gs://mock-bkt/hello.txt"],
-        0,
-        "Hashes [base64] Hash (crc32c): Hash (md5):",
-        CompareRule::ContainsAll(vec![
-            "Hashes [base64]".into(),
-            "Hash (crc32c):".into(),
-            "Hash (md5):".into(),
-        ]),
-        "",
-        CompareRule::Ignore,
-    );
-    run_mock(
-        "mock_hash_cloud_object_hex",
-        "hash",
-        &["hash", "-h", "gs://mock-bkt/hello.txt"],
-        0,
-        "Hashes [hex] Hash (crc32c): Hash (md5):",
-        CompareRule::ContainsAll(vec![
-            "Hashes [hex]".into(),
-            "Hash (crc32c):".into(),
-            "Hash (md5):".into(),
-        ]),
-        "",
-        CompareRule::Ignore,
-    );
-    run_mock(
-        "mock_du_bucket",
-        "du",
-        &["du", "gs://mock-bkt"],
-        0,
-        "10 gs://mock-bkt/hello.txt",
-        CompareRule::ContainsAll(vec!["gs://mock-bkt/hello.txt".into()]),
-        "",
-        CompareRule::Exact,
-    );
-    // Transfer commands against Mock GCS: cp upload/download/cloud-to-cloud, compose, rewrite, mv, rm, mb, rb
-    let local_up = tmp.path().join("upload.txt");
-    let local_dl = tmp.path().join("download.txt");
-    std::fs::write(&local_up, b"uploaded-via-mock-gcs").unwrap();
-    let local_up_s = local_up.to_string_lossy().into_owned();
-    let local_dl_s = local_dl.to_string_lossy().into_owned();
-
-    run_mock(
-        "mock_cp_upload",
-        "cp",
-        &["cp", &local_up_s, "gs://mock-bkt/uploaded.txt"],
-        0,
-        "",
-        CompareRule::Ignore,
-        "",
-        CompareRule::Ignore,
-    );
-    run_mock(
-        "mock_cp_download",
-        "cp",
-        &["cp", "gs://mock-bkt/uploaded.txt", &local_dl_s],
-        0,
-        "",
-        CompareRule::Ignore,
-        "",
-        CompareRule::Ignore,
-    );
-    run_mock(
-        "mock_cp_cloud_to_cloud",
-        "cp",
-        &[
-            "cp",
-            "gs://mock-bkt/hello.txt",
-            "gs://mock-bkt/hello_copy.txt",
-        ],
-        0,
-        "",
-        CompareRule::Ignore,
-        "",
-        CompareRule::Ignore,
-    );
-    run_mock(
-        "mock_compose",
-        "compose",
-        &[
-            "compose",
-            "gs://mock-bkt/hello.txt",
-            "gs://mock-bkt/dir/nested.txt",
-            "gs://mock-bkt/composed.txt",
-        ],
-        0,
-        "",
-        CompareRule::Ignore,
-        "",
-        CompareRule::Ignore,
-    );
-    run_mock(
-        "mock_rewrite",
-        "rewrite",
-        &["rewrite", "-s", "NEARLINE", "gs://mock-bkt/hello_copy.txt"],
-        0,
-        "",
-        CompareRule::Ignore,
-        "",
-        CompareRule::Ignore,
-    );
-    run_mock(
-        "mock_mv_cloud",
-        "mv",
-        &[
-            "mv",
-            "gs://mock-bkt/hello_copy.txt",
-            "gs://mock-bkt/hello_moved.txt",
-        ],
-        0,
-        "",
-        CompareRule::Ignore,
-        "",
-        CompareRule::Ignore,
-    );
-    run_mock(
-        "mock_setmeta",
-        "setmeta",
-        &[
-            "setmeta",
-            "-h",
-            "Content-Type:text/plain",
-            "gs://mock-bkt/hello.txt",
-        ],
-        0,
-        "",
-        CompareRule::Ignore,
-        "",
-        CompareRule::Ignore,
-    );
-    run_mock(
-        "mock_rm_object",
-        "rm",
-        &["rm", "gs://mock-bkt/hello_moved.txt"],
-        0,
-        "",
-        CompareRule::Ignore,
-        "",
-        CompareRule::Ignore,
-    );
-    run_mock(
-        "mock_mb_new_bucket",
-        "mb",
-        &["mb", "gs://mock-new-bkt"],
-        0,
-        "",
-        CompareRule::Ignore,
-        "",
-        CompareRule::Ignore,
-    );
-    run_mock(
-        "mock_rb_empty_bucket",
-        "rb",
-        &["rb", "gs://mock-new-bkt"],
-        0,
-        "",
-        CompareRule::Ignore,
-        "",
-        CompareRule::Ignore,
-    );
-    // Admin / bucket config commands against Mock GCS
-    for (id, cmd, args) in [
-        (
-            "mock_versioning_get",
-            "versioning",
-            &["versioning", "get", "gs://mock-bkt"][..],
-        ),
-        (
-            "mock_versioning_set_on",
-            "versioning",
-            &["versioning", "set", "on", "gs://mock-bkt"][..],
-        ),
-        (
-            "mock_cors_get",
-            "cors",
-            &["cors", "get", "gs://mock-bkt"][..],
-        ),
-        (
-            "mock_lifecycle_get",
-            "lifecycle",
-            &["lifecycle", "get", "gs://mock-bkt"][..],
-        ),
-        (
-            "mock_logging_get",
-            "logging",
-            &["logging", "get", "gs://mock-bkt"][..],
-        ),
-        ("mock_web_get", "web", &["web", "get", "gs://mock-bkt"][..]),
-        (
-            "mock_label_get",
-            "label",
-            &["label", "get", "gs://mock-bkt"][..],
-        ),
-        (
-            "mock_requesterpays_get",
-            "requesterpays",
-            &["requesterpays", "get", "gs://mock-bkt"][..],
-        ),
-        (
-            "mock_defstorageclass_get",
-            "defstorageclass",
-            &["defstorageclass", "get", "gs://mock-bkt"][..],
-        ),
-        (
-            "mock_ubla_get",
-            "ubla",
-            &["ubla", "get", "gs://mock-bkt"][..],
-        ),
-        ("mock_pap_get", "pap", &["pap", "get", "gs://mock-bkt"][..]),
-        ("mock_rpo_get", "rpo", &["rpo", "get", "gs://mock-bkt"][..]),
-        (
-            "mock_autoclass_get",
-            "autoclass",
-            &["autoclass", "get", "gs://mock-bkt"][..],
-        ),
-        ("mock_iam_get", "iam", &["iam", "get", "gs://mock-bkt"][..]),
-        (
-            "mock_notification_list",
-            "notification",
-            &["notification", "list", "gs://mock-bkt"][..],
-        ),
-    ] {
-        run_mock(
-            id,
-            cmd,
-            args,
-            0,
-            "",
-            CompareRule::Ignore,
-            "",
-            CompareRule::Ignore,
-        );
-    }
-    // Deterministic HTTP error codes (403, 404, 409, 412, 500)
-    run_mock(
-        "mock_error_403_forbidden",
-        "ls",
-        &["ls", "gs://fault-403"],
-        1,
-        "",
-        CompareRule::Exact,
-        "AccessDeniedException: 403",
-        CompareRule::ErrorClass {
-            required_substrings: vec!["403".into()],
-        },
-    );
-    run_mock(
-        "mock_error_404_not_found",
-        "ls",
-        &["ls", "gs://fault-404"],
-        1,
-        "",
-        CompareRule::Exact,
-        "BucketNotFoundException: 404",
-        CompareRule::ErrorClass {
-            required_substrings: vec!["404".into()],
-        },
-    );
-    run_mock(
-        "mock_error_409_conflict",
-        "mb",
-        &["mb", "gs://fault-409"],
-        1,
-        "",
-        CompareRule::Exact,
-        "ServiceException: 409",
-        CompareRule::ErrorClass {
-            required_substrings: vec!["409".into()],
-        },
-    );
-    run_mock(
-        "mock_error_412_precondition",
-        "ls",
-        &["ls", "gs://fault-412"],
-        1,
-        "",
-        CompareRule::Exact,
-        "PreconditionException: 412",
-        CompareRule::ErrorClass {
-            required_substrings: vec!["412".into()],
-        },
-    );
-    run_mock(
-        "mock_error_500_backend",
-        "ls",
-        &["ls", "gs://fault-500"],
-        1,
-        "",
-        CompareRule::Exact,
-        "RetryableServiceException: 500",
-        CompareRule::ErrorClass {
-            required_substrings: vec!["500".into()],
-        },
-    );
-
-    results
-}
-
-/// Run live GCS end-to-end parity tests against `GSUTIL_TEST_BUCKET`.
-///
-/// Exercises `cp` (upload, download with byte-for-byte check, cloud-to-cloud),
-/// `ls`, `ls -l`, `ls -L -b`, `stat`, `stat -q`, `cat` (full, `-r`, `-h`),
-/// `hash` (base64 & hex), `du`, `compose`, `setmeta`, `mv`, `rm -r`, bucket
-/// config getters (`versioning`, `cors`, `lifecycle`, `label`, `ubla`, `pap`,
-/// `iam`), and `No URLs matched` error handling against real GCS.
-pub fn run_live_gcs_suite(
-    runner: &GsutilRunner,
-    bucket: &str,
-    filter: Option<&str>,
-) -> Vec<CaseResult> {
-    let mut results = Vec::new();
-    let bucket_clean = bucket.trim_start_matches("gs://").trim_end_matches('/');
-    let bucket_uri = format!("gs://{}", bucket_clean);
-    let run_id = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
-    let prefix_uri = format!("{}/gsutil-parity-{}", bucket_uri, run_id);
-
-    let tmp = TempDir::new().expect("temp dir");
-    let payload1 = b"gsutil-rs live parity test payload 0123456789\n";
-    let payload2 = b"second-part-for-compose\n";
-    let local_src1 = tmp.path().join("payload1.txt");
-    let local_src2 = tmp.path().join("payload2.txt");
-    std::fs::write(&local_src1, payload1).unwrap();
-    std::fs::write(&local_src2, payload2).unwrap();
-
-    let ctx = NormalizeContext::default()
-        .with_temp_path(tmp.path().to_string_lossy())
-        .strip_ui();
-
-    let mut run_live = |id: &str,
-                        cmd: &str,
-                        args: Vec<String>,
-                        expected_exit: i32,
-                        expected_stdout: &str,
-                        stdout_rule: CompareRule,
-                        expected_stderr: &str,
-                        stderr_rule: CompareRule| {
-        if !matches_filter(filter, id, "live_gcs", cmd) {
-            return;
-        }
-        let opts = RunOptions::new(args);
-        results.push(runner.run_rust_contract(
-            id,
-            "live_gcs",
-            cmd,
-            &opts,
-            expected_exit,
-            expected_stdout,
-            &stdout_rule,
-            expected_stderr,
-            &stderr_rule,
-            &ctx,
-        ));
-    };
-
-    let obj1 = format!("{}/obj1.txt", prefix_uri);
-    let obj2 = format!("{}/obj2.txt", prefix_uri);
-    let obj_copy = format!("{}/obj1_copy.txt", prefix_uri);
-    let obj_moved = format!("{}/obj1_moved.txt", prefix_uri);
-    let obj_composed = format!("{}/composed.txt", prefix_uri);
-
-    // 1. Upload two objects via Rust gsutil cp
-    run_live(
-        "live_cp_upload_1",
-        "cp",
-        vec![
-            "cp".into(),
-            local_src1.to_string_lossy().into_owned(),
-            obj1.clone(),
-        ],
-        0,
-        "",
-        CompareRule::Ignore,
-        "",
-        CompareRule::Ignore,
-    );
-    run_live(
-        "live_cp_upload_2",
-        "cp",
-        vec![
-            "cp".into(),
-            local_src2.to_string_lossy().into_owned(),
-            obj2.clone(),
-        ],
-        0,
-        "",
-        CompareRule::Ignore,
-        "",
-        CompareRule::Ignore,
-    );
-
-    // 2. Listing, stat, du, cat, hash
-    run_live(
-        "live_ls_bucket_meta",
-        "ls",
-        vec!["ls".into(), "-L".into(), "-b".into(), bucket_uri.clone()],
-        0,
-        &format!("{}/ : Storage class: Location constraint:", bucket_uri),
-        CompareRule::ContainsAll(vec![
-            format!("{}/ :", bucket_uri),
-            "Storage class:".into(),
-            "Location constraint:".into(),
-        ]),
-        "",
-        CompareRule::Ignore,
-    );
-    run_live(
-        "live_ls_prefix",
-        "ls",
-        vec!["ls".into(), format!("{}/", prefix_uri)],
-        0,
-        &format!("{}\n{}\n", obj1, obj2),
-        CompareRule::ContainsAll(vec![obj1.clone(), obj2.clone()]),
-        "",
-        CompareRule::Exact,
-    );
-    run_live(
-        "live_ls_long",
-        "ls",
-        vec!["ls".into(), "-l".into(), obj1.clone()],
-        0,
-        &format!("{} TOTAL: 1 objects", obj1),
-        CompareRule::ContainsAll(vec![obj1.clone(), "TOTAL: 1 objects".into()]),
-        "",
-        CompareRule::Exact,
-    );
-    run_live(
-        "live_stat_object",
-        "stat",
-        vec!["stat".into(), obj1.clone()],
-        0,
-        &format!("{}: Content-Length: Hash (crc32c): Hash (md5):", obj1),
-        CompareRule::ContainsAll(vec![
-            format!("{}:", obj1),
-            "Content-Length:".into(),
-            "Hash (crc32c):".into(),
-            "Hash (md5):".into(),
-        ]),
-        "",
-        CompareRule::Exact,
-    );
-    run_live(
-        "live_stat_quiet_exists",
-        "stat",
-        vec!["-q".into(), "stat".into(), obj1.clone()],
-        0,
-        "",
-        CompareRule::Exact,
-        "",
-        CompareRule::Exact,
-    );
-    run_live(
-        "live_stat_quiet_missing",
-        "stat",
-        vec![
-            "-q".into(),
-            "stat".into(),
-            format!("{}/does-not-exist", prefix_uri),
-        ],
-        1,
-        "",
-        CompareRule::Exact,
-        "",
-        CompareRule::Exact,
-    );
-    run_live(
-        "live_cat_full",
-        "cat",
-        vec!["cat".into(), obj1.clone()],
-        0,
-        std::str::from_utf8(payload1).unwrap(),
-        CompareRule::Exact,
-        "",
-        CompareRule::Exact,
-    );
-    run_live(
-        "live_cat_range",
-        "cat",
-        vec!["cat".into(), "-r".into(), "0-8".into(), obj1.clone()],
-        0,
-        "gsutil-rs",
-        CompareRule::Exact,
-        "",
-        CompareRule::Exact,
-    );
-    run_live(
-        "live_cat_header",
-        "cat",
-        vec!["cat".into(), "-h".into(), obj1.clone()],
-        0,
-        std::str::from_utf8(payload1).unwrap(),
-        CompareRule::Exact,
-        &format!("==> {} <==", obj1),
-        CompareRule::ContainsAll(vec![format!("==> {} <==", obj1)]),
-    );
-    run_live(
-        "live_hash_base64",
-        "hash",
-        vec!["hash".into(), obj1.clone()],
-        0,
-        "Hashes [base64] Hash (crc32c): Hash (md5):",
-        CompareRule::ContainsAll(vec![
-            "Hashes [base64]".into(),
-            "Hash (crc32c):".into(),
-            "Hash (md5):".into(),
-        ]),
-        "",
-        CompareRule::Ignore,
-    );
-    run_live(
-        "live_hash_hex",
-        "hash",
-        vec!["hash".into(), "-h".into(), obj1.clone()],
-        0,
-        "Hashes [hex] Hash (crc32c): Hash (md5):",
-        CompareRule::ContainsAll(vec![
-            "Hashes [hex]".into(),
-            "Hash (crc32c):".into(),
-            "Hash (md5):".into(),
-        ]),
-        "",
-        CompareRule::Ignore,
-    );
-    run_live(
-        "live_du_prefix",
-        "du",
-        vec!["du".into(), format!("{}/", prefix_uri)],
-        0,
-        &format!("{} {}", obj1, obj2),
-        CompareRule::ContainsAll(vec![obj1.clone(), obj2.clone()]),
-        "",
-        CompareRule::Exact,
-    );
-
-    // 3. Download & verify byte-for-byte equality
-    let mut download_result = None;
-    if matches_filter(filter, "live_cp_download", "live_gcs", "cp") {
-        let rust_dl: PathBuf = tmp.path().join("dl_rust.txt");
-        let opts = RunOptions::new(["cp", &obj1, &rust_dl.to_string_lossy()]);
-        let mut res = runner.run_rust_contract(
-            "live_cp_download",
-            "live_gcs",
-            "cp",
-            &opts,
-            0,
-            "",
-            &CompareRule::Ignore,
-            "",
-            &CompareRule::Ignore,
-            &ctx,
-        );
-        if !res.skipped && res.passed {
-            let got = std::fs::read(&rust_dl).ok();
-            if got.as_deref() != Some(payload1.as_slice()) {
-                res.passed = false;
-                res.side_effect_error =
-                    Some("downloaded file bytes do not match uploaded payload".into());
-            }
-        }
-        download_result = Some(res);
-    }
-
-    // 4. Cloud-to-cloud cp, compose, setmeta, mv
-    run_live(
-        "live_cp_cloud_to_cloud",
-        "cp",
-        vec!["cp".into(), obj1.clone(), obj_copy.clone()],
-        0,
-        "",
-        CompareRule::Ignore,
-        "",
-        CompareRule::Ignore,
-    );
-    run_live(
-        "live_compose",
-        "compose",
-        vec![
-            "compose".into(),
-            obj1.clone(),
-            obj2.clone(),
-            obj_composed.clone(),
-        ],
-        0,
-        "",
-        CompareRule::Ignore,
-        "",
-        CompareRule::Ignore,
-    );
-    run_live(
-        "live_cat_composed",
-        "cat",
-        vec!["cat".into(), obj_composed.clone()],
-        0,
-        &format!(
-            "{}{}",
-            std::str::from_utf8(payload1).unwrap(),
-            std::str::from_utf8(payload2).unwrap()
-        ),
-        CompareRule::Exact,
-        "",
-        CompareRule::Exact,
-    );
-    run_live(
-        "live_setmeta",
-        "setmeta",
-        vec![
-            "setmeta".into(),
-            "-h".into(),
-            "x-goog-meta-parity:verified".into(),
-            obj_copy.clone(),
-        ],
-        0,
-        "",
-        CompareRule::Ignore,
-        "",
-        CompareRule::Ignore,
-    );
-    run_live(
-        "live_mv_cloud",
-        "mv",
-        vec!["mv".into(), obj_copy.clone(), obj_moved.clone()],
-        0,
-        "",
-        CompareRule::Ignore,
-        "",
-        CompareRule::Ignore,
-    );
-
-    // 5. Admin / bucket config getters against live bucket
-    for (id, cmd, args) in [
-        (
-            "live_versioning_get",
-            "versioning",
-            vec!["versioning".into(), "get".into(), bucket_uri.clone()],
-        ),
-        (
-            "live_cors_get",
-            "cors",
-            vec!["cors".into(), "get".into(), bucket_uri.clone()],
-        ),
-        (
-            "live_lifecycle_get",
-            "lifecycle",
-            vec!["lifecycle".into(), "get".into(), bucket_uri.clone()],
-        ),
-        (
-            "live_label_get",
-            "label",
-            vec!["label".into(), "get".into(), bucket_uri.clone()],
-        ),
-        (
-            "live_ubla_get",
-            "ubla",
-            vec!["ubla".into(), "get".into(), bucket_uri.clone()],
-        ),
-        (
-            "live_pap_get",
-            "pap",
-            vec!["pap".into(), "get".into(), bucket_uri.clone()],
-        ),
-        (
-            "live_iam_get",
-            "iam",
-            vec!["iam".into(), "get".into(), bucket_uri.clone()],
-        ),
-    ] {
-        run_live(
-            id,
-            cmd,
-            args,
-            0,
-            "",
-            CompareRule::Ignore,
-            "",
-            CompareRule::Ignore,
-        );
-    }
-
-    // 6. Error parity: No URLs matched
-    run_live(
-        "live_ls_no_match",
-        "ls",
-        vec!["ls".into(), format!("{}/nonexistent-*", prefix_uri)],
-        1,
-        "",
-        CompareRule::Exact,
-        "No URLs matched",
-        CompareRule::ErrorClass {
-            required_substrings: vec!["matched no objects".into()],
-        },
-    );
-
-    // 7. Cleanup all objects under our test prefix via Rust gsutil -m rm -r
-    run_live(
-        "live_rm_cleanup",
-        "rm",
-        vec!["-m".into(), "rm".into(), "-r".into(), prefix_uri.clone()],
-        0,
-        "",
-        CompareRule::Ignore,
-        "",
-        CompareRule::Ignore,
-    );
-
-    if let Some(res) = download_result {
-        results.push(res);
-    }
-
-    results
 }

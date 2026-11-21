@@ -10,16 +10,19 @@ use pkcs8::EncodePrivateKey;
 use rsa::RsaPrivateKey;
 
 use gsutil_core::api::{
-    Bucket, BucketAccessControl, Channel, CloudApi, ComposeSourceObject, CopyOptions,
-    CreateNotificationOptions, CsObjectOrPrefix, DownloadOptions, EncryptionKey,
-    HmacKeyCreateResponse, HmacKeyMetadata, IamBinding, IamCondition, IamPolicy,
-    ListObjectsOptions, Notification, Object, Preconditions, ServiceAccount, SignUrlOptions,
-    UploadOptions,
+    Bucket, BucketAccessControl, BucketIamConfiguration, Channel, CloudApi, ComposeSourceObject,
+    CopyOptions, CreateNotificationOptions, CsObjectOrPrefix, DownloadOptions, EncryptionKey,
+    HmacKeyCreateResponse, HmacKeyMetadata, IamBinding, IamCondition, IamPolicy, KmsApi,
+    ListObjectsOptions, Notification, Object, Preconditions, PubsubApi, ServiceAccount,
+    SignUrlOptions, UniformBucketLevelAccess, UploadOptions,
 };
 use gsutil_core::config::BotoConfig;
 use gsutil_core::error::{GsutilError, Result, ServiceError};
 
-use crate::{dispatch_admin_command, is_admin_command, parse_duration_secs, AdminContext};
+use crate::{
+    dispatch_admin_command, is_admin_command, parse_duration_secs, parse_retention_duration_secs,
+    AdminContext, SECONDS_IN_MONTH,
+};
 
 #[derive(Default)]
 struct MockState {
@@ -134,6 +137,53 @@ impl CloudApi for MockCloudApi {
                 None,
             ))
         })?;
+        // Strict GCS JSON PATCH merge-with-null semantics using `to_patch_value()`!
+        let patch_val = metadata.to_patch_value();
+        if let Some(map) = patch_val.as_object() {
+            if let Some(v) = map.get("logging") {
+                if v.is_null() {
+                    b.logging = None;
+                } else {
+                    b.logging = serde_json::from_value(v.clone()).ok();
+                }
+            }
+            if let Some(v) = map.get("encryption") {
+                if v.is_null() {
+                    b.encryption = None;
+                } else {
+                    b.encryption = serde_json::from_value(v.clone()).ok();
+                }
+            }
+            if let Some(v) = map.get("website") {
+                if v.is_null() {
+                    b.website = None;
+                } else {
+                    b.website = serde_json::from_value(v.clone()).ok();
+                }
+            }
+            if let Some(v) = map.get("retentionPolicy") {
+                if v.is_null() {
+                    b.retention_policy = None;
+                } else if let Ok(mut rp) =
+                    serde_json::from_value::<gsutil_core::api::BucketRetentionPolicy>(v.clone())
+                {
+                    if rp.effective_time.is_none() {
+                        rp.effective_time = Some("2025-01-15T12:00:00Z".to_string());
+                    }
+                    b.retention_policy = Some(rp);
+                }
+            }
+            if let Some(lbl_val) = map.get("labels").and_then(|v| v.as_object()) {
+                let target = b.labels.get_or_insert_with(BTreeMap::new);
+                for (k, v) in lbl_val {
+                    if v.is_null() {
+                        target.remove(k);
+                    } else if let Some(s) = v.as_str() {
+                        target.insert(k.clone(), s.to_string());
+                    }
+                }
+            }
+        }
         if metadata.versioning.is_some() {
             b.versioning = metadata.versioning.clone();
         }
@@ -142,15 +192,6 @@ impl CloudApi for MockCloudApi {
         }
         if metadata.lifecycle.is_some() {
             b.lifecycle = metadata.lifecycle.clone();
-        }
-        if metadata.logging.is_some() {
-            b.logging = metadata.logging.clone();
-        }
-        if metadata.website.is_some() {
-            b.website = metadata.website.clone();
-        }
-        if metadata.labels.is_some() {
-            b.labels = metadata.labels.clone();
         }
         if metadata.billing.is_some() {
             b.billing = metadata.billing.clone();
@@ -167,14 +208,8 @@ impl CloudApi for MockCloudApi {
         if metadata.autoclass.is_some() {
             b.autoclass = metadata.autoclass.clone();
         }
-        if metadata.retention_policy.is_some() {
-            b.retention_policy = metadata.retention_policy.clone();
-        }
         if metadata.default_event_based_hold.is_some() {
             b.default_event_based_hold = metadata.default_event_based_hold;
-        }
-        if metadata.encryption.is_some() {
-            b.encryption = metadata.encryption.clone();
         }
         if metadata.acl.is_some() {
             b.acl = metadata.acl.clone();
@@ -579,7 +614,67 @@ impl CloudApi for MockCloudApi {
     }
 }
 
+#[derive(Default)]
+struct MockKmsApi {
+    authorized: Mutex<Vec<(String, String)>>,
+}
+
+#[async_trait]
+impl KmsApi for MockKmsApi {
+    async fn authorize_service_account(
+        &self,
+        kms_key_name: &str,
+        service_account_email: &str,
+    ) -> Result<bool> {
+        self.authorized
+            .lock()
+            .unwrap()
+            .push((kms_key_name.to_string(), service_account_email.to_string()));
+        Ok(true)
+    }
+}
+
+#[derive(Default)]
+struct MockPubsubApi {
+    created_topics: Mutex<Vec<String>>,
+    authorized: Mutex<Vec<(String, String)>>,
+}
+
+#[async_trait]
+impl PubsubApi for MockPubsubApi {
+    async fn create_topic(&self, topic_name: &str) -> Result<()> {
+        self.created_topics
+            .lock()
+            .unwrap()
+            .push(topic_name.to_string());
+        Ok(())
+    }
+
+    async fn authorize_publisher(
+        &self,
+        topic_name: &str,
+        service_account_email: &str,
+    ) -> Result<()> {
+        self.authorized
+            .lock()
+            .unwrap()
+            .push((topic_name.to_string(), service_account_email.to_string()));
+        Ok(())
+    }
+}
+
 async fn run_cmd(api: &MockCloudApi, cmd: &str, args: &[&str]) -> Result<(String, String)> {
+    run_cmd_with_opts(api, None, None, None, cmd, args).await
+}
+
+async fn run_cmd_with_opts(
+    api: &MockCloudApi,
+    kms_api: Option<&dyn KmsApi>,
+    pubsub_api: Option<&dyn PubsubApi>,
+    confirm_fn: Option<&dyn Fn(&str) -> bool>,
+    cmd: &str,
+    args: &[&str],
+) -> Result<(String, String)> {
     let cfg = BotoConfig::new();
     let mut out = Vec::new();
     let mut err = Vec::new();
@@ -589,6 +684,12 @@ async fn run_cmd(api: &MockCloudApi, cmd: &str, args: &[&str]) -> Result<(String
         config: &cfg,
         project_id: Some("my-proj".to_string()),
         parallel_operations: false,
+        quiet: false,
+        debug_level: 0,
+        headers: BTreeMap::new(),
+        kms_api,
+        pubsub_api,
+        confirm_fn,
         out: &mut out,
         err: &mut err,
     };
@@ -641,6 +742,18 @@ fn test_parse_duration_secs() {
     assert_eq!(parse_duration_secs("1d").unwrap(), 86_400);
     assert_eq!(parse_duration_secs("1y").unwrap(), 31_557_600);
     assert!(parse_duration_secs("10x").is_err());
+
+    // Retention durations: m = 31-day month (2,678,400s), h rejected!
+    assert_eq!(parse_retention_duration_secs("10s").unwrap(), 10);
+    assert_eq!(parse_retention_duration_secs("1d").unwrap(), 86_400);
+    assert_eq!(
+        parse_retention_duration_secs("1m").unwrap(),
+        SECONDS_IN_MONTH
+    );
+    assert_eq!(parse_retention_duration_secs("1y").unwrap(), 31_557_600);
+    assert!(parse_retention_duration_secs("1h").is_err());
+    assert!(parse_retention_duration_secs("60").is_err());
+    assert!(parse_retention_duration_secs("0s").is_err());
 }
 
 #[tokio::test]
@@ -669,32 +782,43 @@ async fn test_bucket_config_commands() {
         .unwrap();
     assert_eq!(out.trim(), "gs://test-bkt: Enabled");
 
-    // defstorageclass
-    run_cmd(
-        &api,
-        "defstorageclass",
-        &["set", "nearline", "gs://test-bkt"],
-    )
-    .await
-    .unwrap();
+    // defstorageclass (shorthand alias `nl` -> NEARLINE, NO trailing slash on get!)
+    run_cmd(&api, "defstorageclass", &["set", "nl", "gs://test-bkt"])
+        .await
+        .unwrap();
     let (out, _) = run_cmd(&api, "defstorageclass", &["get", "gs://test-bkt"])
         .await
         .unwrap();
-    assert_eq!(out.trim(), "gs://test-bkt/: NEARLINE");
+    assert_eq!(out.trim(), "gs://test-bkt: NEARLINE");
 
-    // ubla & bucketpolicyonly
-    run_cmd(&api, "ubla", &["set", "on", "gs://test-bkt"])
-        .await
-        .unwrap();
+    // ubla & bucketpolicyonly (LockedTime formatting + trailing blank line)
+    api.state
+        .lock()
+        .unwrap()
+        .buckets
+        .get_mut("test-bkt")
+        .unwrap()
+        .iam_configuration = Some(BucketIamConfiguration {
+        uniform_bucket_level_access: Some(UniformBucketLevelAccess {
+            enabled: Some(true),
+            locked_time: Some("2027-02-18T22:14:00.922Z".to_string()),
+        }),
+        ..Default::default()
+    });
     let (out, _) = run_cmd(&api, "ubla", &["get", "gs://test-bkt"])
         .await
         .unwrap();
-    assert!(out.contains("Uniform bucket-level access setting for gs://test-bkt:"));
-    assert!(out.contains("Enabled: True"));
+    assert_eq!(
+        out,
+        "Uniform bucket-level access setting for gs://test-bkt:\n  Enabled: True\n  LockedTime: 2027-02-18 22:14:00.922000+00:00\n\n"
+    );
     let (out, _) = run_cmd(&api, "bucketpolicyonly", &["get", "gs://test-bkt"])
         .await
         .unwrap();
-    assert!(out.contains("Bucket Policy Only setting for gs://test-bkt:"));
+    assert!(out.starts_with("Bucket Policy Only setting for gs://test-bkt:\n"));
+    run_cmd(&api, "ubla", &["set", "on", "gs://test-bkt"])
+        .await
+        .unwrap();
 
     // pap
     run_cmd(&api, "pap", &["set", "enforced", "gs://test-bkt"])
@@ -723,7 +847,7 @@ async fn test_bucket_config_commands() {
         .unwrap();
     assert!(out.contains("Enabled: True"));
 
-    // logging
+    // logging on + off (null tombstone)
     run_cmd(
         &api,
         "logging",
@@ -743,6 +867,13 @@ async fn test_bucket_config_commands() {
         .await
         .unwrap();
     assert!(out.contains("log-bkt"));
+    run_cmd(&api, "logging", &["set", "off", "gs://test-bkt"])
+        .await
+        .unwrap();
+    let (out, _) = run_cmd(&api, "logging", &["get", "gs://test-bkt"])
+        .await
+        .unwrap();
+    assert!(out.contains("has no logging configuration."));
 
     // web
     run_cmd(
@@ -808,22 +939,56 @@ async fn test_bucket_config_commands() {
         .unwrap();
     assert!(out.contains("Delete"));
 
-    // retention (set, get, lock, event-default, event, temp, clear)
-    run_cmd(&api, "retention", &["set", "30d", "gs://test-bkt"])
+    // retention (1m = 31 days, 1h rejected, exact get format, lock prompt abort/confirm, holds, clear)
+    assert!(run_cmd(&api, "retention", &["set", "1h", "gs://test-bkt"])
+        .await
+        .is_err());
+    run_cmd(&api, "retention", &["set", "1m", "gs://test-bkt"])
         .await
         .unwrap();
     let (out, _) = run_cmd(&api, "retention", &["get", "gs://test-bkt"])
         .await
         .unwrap();
-    assert!(out.contains("2592000 Second(s)"));
-    assert!(out.contains("UNLOCKED"));
-    run_cmd(&api, "retention", &["lock", "gs://test-bkt"])
-        .await
-        .unwrap();
+    assert!(out.starts_with(
+        "  Retention Policy (UNLOCKED):\n    Duration: 1 Month(s)\n    Effective Time: "
+    ));
+
+    // Lock aborted when user says No
+    let deny = |_q: &str| false;
+    run_cmd_with_opts(
+        &api,
+        None,
+        None,
+        Some(&deny),
+        "retention",
+        &["lock", "gs://test-bkt"],
+    )
+    .await
+    .unwrap();
     let (out, _) = run_cmd(&api, "retention", &["get", "gs://test-bkt"])
         .await
         .unwrap();
-    assert!(out.contains("LOCKED"));
+    assert!(out.contains("(UNLOCKED)"));
+
+    // Lock proceeds when user confirms Yes
+    let allow = |q: &str| {
+        assert!(q.contains("PERMANENTLY set the Retention Policy"));
+        true
+    };
+    run_cmd_with_opts(
+        &api,
+        None,
+        None,
+        Some(&allow),
+        "retention",
+        &["lock", "gs://test-bkt"],
+    )
+    .await
+    .unwrap();
+    let (out, _) = run_cmd(&api, "retention", &["get", "gs://test-bkt"])
+        .await
+        .unwrap();
+    assert!(out.contains("(LOCKED)"));
     run_cmd(
         &api,
         "retention",
@@ -848,6 +1013,10 @@ async fn test_bucket_config_commands() {
     run_cmd(&api, "retention", &["clear", "gs://test-bkt"])
         .await
         .unwrap();
+    let (out, _) = run_cmd(&api, "retention", &["get", "gs://test-bkt"])
+        .await
+        .unwrap();
+    assert!(out.contains("has no Retention Policy."));
 }
 
 #[tokio::test]
@@ -935,6 +1104,9 @@ async fn test_acl_defacl_and_iam() {
 async fn test_kms_hmac_notification() {
     let api = MockCloudApi::with_bucket("ops-bkt");
 
+    let kms_mock = MockKmsApi::default();
+    let pubsub_mock = MockPubsubApi::default();
+
     // kms
     let (out, _) = run_cmd(&api, "kms", &["serviceaccount"]).await.unwrap();
     assert!(out.contains("gs-project-accounts.iam.gserviceaccount.com"));
@@ -954,8 +1126,20 @@ async fn test_kms_hmac_notification() {
         .await
         .unwrap();
     assert!(out.contains("cryptoKeys/k"));
-    let (out, _) = run_cmd(
+    // Clearing default encryption key uses explicit null tombstone
+    run_cmd(&api, "kms", &["encryption", "-d", "gs://ops-bkt"])
+        .await
+        .unwrap();
+    let (out, _) = run_cmd(&api, "kms", &["encryption", "gs://ops-bkt"])
+        .await
+        .unwrap();
+    assert!(out.contains("has no default encryption key"));
+    // kms authorize actually calls KmsApi
+    let (out, _) = run_cmd_with_opts(
         &api,
+        Some(&kms_mock),
+        None,
+        None,
         "kms",
         &[
             "authorize",
@@ -966,6 +1150,7 @@ async fn test_kms_hmac_notification() {
     .await
     .unwrap();
     assert!(out.contains("Authorized project my-proj"));
+    assert_eq!(kms_mock.authorized.lock().unwrap().len(), 1);
 
     // hmac
     let (out, _) = run_cmd(
@@ -990,9 +1175,12 @@ async fn test_kms_hmac_notification() {
         .await
         .unwrap();
 
-    // notification
-    let (out, _) = run_cmd(
+    // notification (verifying PubsubApi create_topic + authorize_publisher called)
+    let (out, _) = run_cmd_with_opts(
         &api,
+        None,
+        Some(&pubsub_mock),
+        None,
         "notification",
         &[
             "create",
@@ -1008,6 +1196,8 @@ async fn test_kms_hmac_notification() {
     .await
     .unwrap();
     assert!(out.contains("Created notification config"));
+    assert_eq!(pubsub_mock.created_topics.lock().unwrap().len(), 1);
+    assert_eq!(pubsub_mock.authorized.lock().unwrap().len(), 1);
     let (out, _) = run_cmd(&api, "notification", &["list", "gs://ops-bkt"])
         .await
         .unwrap();
@@ -1107,20 +1297,46 @@ async fn test_signurl_v4_and_v2_with_real_rsa_key() {
         .unwrap();
     assert!(out.contains("x-goog-signature=iam-signed"));
 
-    // Sanity check V4 payload helper determinism
+    // Sanity check V4 payload helper determinism + RESUMABLE + %20 encoding
     let mut hdrs = BTreeMap::new();
     hdrs.insert("host".to_string(), "storage.googleapis.com".to_string());
+    hdrs.insert("x-goog-resumable".to_string(), "start".to_string());
     let (sts, qs) = crate::signurl::build_v4_payload(
-        "signer@test-proj.iam.gserviceaccount.com",
-        "GET",
-        600,
-        "sign-bkt/file.txt",
+        "test.apps.googleusercontent.com",
+        "POST",
+        3600,
+        "test/test%20file.txt",
         None,
-        "auto",
+        "us-east",
         &hdrs,
         None,
-        Utc::now(),
+        chrono::DateTime::parse_from_rfc3339("1900-01-01T00:05:55Z")
+            .unwrap()
+            .with_timezone(&Utc),
     );
-    assert!(sts.starts_with("GOOG4-RSA-SHA256\n"));
-    assert!(qs.contains("x-goog-signedheaders=host"));
+    assert!(sts.starts_with(
+        "GOOG4-RSA-SHA256\n19000101T000555Z\n19000101/us-east/storage/goog4_request\n"
+    ));
+    assert_eq!(
+        qs,
+        "x-goog-algorithm=GOOG4-RSA-SHA256&x-goog-credential=test.apps.googleusercontent.com%2F19000101%2Fus-east%2Fstorage%2Fgoog4_request&x-goog-date=19000101T000555Z&x-goog-expires=3600&x-goog-signedheaders=host%3Bx-goog-resumable"
+    );
+
+    // -m RESUMABLE via CLI
+    let (out, _) = run_cmd(
+        &api,
+        "signurl",
+        &[
+            "-m",
+            "RESUMABLE",
+            "-d",
+            "1h",
+            key_path.to_str().unwrap(),
+            "gs://sign-bkt/file.txt",
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(out.contains("\tPOST\t"));
+    assert!(out.contains("x-goog-signedheaders=host%3Bx-goog-resumable"));
 }

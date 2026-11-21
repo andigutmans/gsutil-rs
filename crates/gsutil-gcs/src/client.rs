@@ -77,6 +77,8 @@ pub struct GcsJsonClientConfig {
     pub resumable_chunk_size: usize,
     /// Retry policy for transient failures.
     pub retry_policy: RetryPolicy,
+    /// Debug verbosity level (`0` = off, `2` = `-d`/`-D` headers, `3` = `-DD` headers + body).
+    pub debug_level: u8,
 }
 
 impl GcsJsonClientConfig {
@@ -182,6 +184,7 @@ impl GcsJsonClientConfig {
             user_agent: DEFAULT_USER_AGENT.to_string(),
             resumable_chunk_size: chunk_size,
             retry_policy: RetryPolicy::from_config(config),
+            debug_level: 0,
         })
     }
 
@@ -200,6 +203,7 @@ impl GcsJsonClientConfig {
             user_agent: DEFAULT_USER_AGENT.to_string(),
             resumable_chunk_size: RESUMABLE_CHUNK_QUANTUM as usize,
             retry_policy: RetryPolicy::fast_for_tests(3),
+            debug_level: 0,
         }
     }
 }
@@ -208,6 +212,9 @@ impl GcsJsonClientConfig {
 #[derive(Clone)]
 pub struct GcsJsonClient {
     http: Client,
+    /// Separate HTTP client with `.no_gzip()` for object media downloads so `Accept-Encoding: gzip`
+    /// is never injected automatically and compressed payloads are never transparently decompressed.
+    media_http: Client,
     credentials: Arc<dyn TokenProvider>,
     config: GcsJsonClientConfig,
     ecp_proxy: Option<Arc<EcpProxy>>,
@@ -278,27 +285,6 @@ impl GcsJsonClient {
         mut client_config: GcsJsonClientConfig,
         credentials: Arc<dyn TokenProvider>,
     ) -> Result<Self> {
-        let mut builder = Client::builder()
-            .pool_max_idle_per_host(32)
-            .tcp_keepalive(Duration::from_secs(60))
-            .danger_accept_invalid_certs(!boto_config.https_validate_certificates());
-
-        if let Some(ca_path) = boto_config.ca_certificates_file() {
-            let pem = std::fs::read(ca_path).map_err(|e| {
-                GsutilError::command(format!(
-                    "Failed to read ca_certificates_file \"{ca_path}\": {e}"
-                ))
-            })?;
-            let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| {
-                GsutilError::command(format!(
-                    "Failed to parse PEM certificates from \"{ca_path}\": {e}"
-                ))
-            })?;
-            for cert in certs {
-                builder = builder.add_root_certificate(cert);
-            }
-        }
-
         let mut ecp_proxy = None;
         let targets_google_storage = client_config
             .storage_base_url
@@ -308,12 +294,7 @@ impl GcsJsonClient {
                 .starts_with("https://storage.mtls.googleapis.com");
 
         if is_mtls_enabled(boto_config) {
-            if let Some(identity_pem) = resolve_client_identity_pem(boto_config) {
-                let identity = reqwest::Identity::from_pem(&identity_pem).map_err(|e| {
-                    GsutilError::command(format!("Failed to load mTLS client identity: {e}"))
-                })?;
-                builder = builder.identity(identity);
-            } else if targets_google_storage {
+            if resolve_client_identity_pem(boto_config).is_none() && targets_google_storage {
                 if let Some(proxy) = EcpProxy::detect_or_spawn(boto_config)? {
                     client_config.storage_base_url =
                         proxy.rewrite_gcs_url(&client_config.storage_base_url);
@@ -340,18 +321,12 @@ impl GcsJsonClient {
             }
         }
 
-        if let Some(proxy) = boto_config.resolve_proxy() {
-            let reqwest_proxy = reqwest::Proxy::all(proxy.to_url())
-                .map_err(|e| GsutilError::command(format!("Invalid proxy config: {e}")))?;
-            builder = builder.proxy(reqwest_proxy);
-        }
-
-        let http = builder
-            .build()
-            .map_err(|e| GsutilError::command(format!("Failed to build GCS HTTP client: {e}")))?;
+        let http = build_reqwest_client(boto_config, false)?;
+        let media_http = build_reqwest_client(boto_config, true)?;
 
         Ok(Self {
             http,
+            media_http,
             credentials,
             config: client_config,
             ecp_proxy,
@@ -364,8 +339,16 @@ impl GcsJsonClient {
             .pool_max_idle_per_host(32)
             .build()
             .map_err(|e| GsutilError::command(format!("Failed to build GCS HTTP client: {e}")))?;
+        let media_http = Client::builder()
+            .pool_max_idle_per_host(32)
+            .no_gzip()
+            .build()
+            .map_err(|e| {
+                GsutilError::command(format!("Failed to build GCS media HTTP client: {e}"))
+            })?;
         Ok(Self {
             http,
+            media_http,
             credentials,
             config,
             ecp_proxy: None,
@@ -434,8 +417,23 @@ impl GcsJsonClient {
         query: &[(String, String)],
         extra_headers: Option<&HeaderMap>,
     ) -> Result<RequestBuilder> {
+        self.prepare_request_with_client(&self.http, method, url, query, extra_headers)
+            .await
+    }
+
+    async fn prepare_request_with_client(
+        &self,
+        client: &Client,
+        method: Method,
+        url: &str,
+        query: &[(String, String)],
+        extra_headers: Option<&HeaderMap>,
+    ) -> Result<RequestBuilder> {
         let headers = self.base_headers(extra_headers)?;
-        let mut req = self.http.request(method, url).headers(headers);
+        if self.config.debug_level >= 2 {
+            log_wire_request(&method, url, query, &headers);
+        }
+        let mut req = client.request(method, url).headers(headers);
 
         if let Some(tok) = self.credentials.token().await? {
             req = req.bearer_auth(&tok.token);
@@ -490,16 +488,25 @@ impl GcsJsonClient {
                         .prepare_request(method.clone(), url, query, extra_headers)
                         .await?;
                     if let Some(b) = body {
+                        if self.config.debug_level >= 3 {
+                            eprintln!("send body: {b}");
+                        }
                         req = req.json(b);
                     }
                     let resp = req.send().await.map_err(reqwest_to_service_error)?;
                     let status = resp.status().as_u16();
+                    if self.config.debug_level >= 2 {
+                        log_wire_response(status, resp.headers());
+                    }
                     let www_auth = resp
                         .headers()
                         .get("www-authenticate")
                         .and_then(|v| v.to_str().ok())
                         .map(ToString::to_string);
                     let text = resp.text().await.unwrap_or_default();
+                    if self.config.debug_level >= 3 && !text.is_empty() {
+                        eprintln!("reply body: {text}");
+                    }
                     if (200..300).contains(&status) {
                         Ok(text)
                     } else {
@@ -684,8 +691,7 @@ impl CloudApi for GcsJsonClient {
         add_user_project(&mut query, self.effective_user_project());
         add_fields_param(&mut query, fields, false);
 
-        let body_val = serde_json::to_value(metadata)
-            .map_err(|e| GsutilError::command(format!("Failed to serialize bucket patch: {e}")))?;
+        let body_val = metadata.to_patch_value();
         let ctx = ErrorContext::bucket(bucket_name);
         self.send_json_request(Method::PATCH, &url, &query, Some(&body_val), None, &ctx)
             .await
@@ -921,8 +927,7 @@ impl CloudApi for GcsJsonClient {
         add_user_project(&mut query, self.effective_user_project());
         add_fields_param(&mut query, fields, false);
 
-        let body_val = serde_json::to_value(metadata)
-            .map_err(|e| GsutilError::command(format!("Failed to serialize object patch: {e}")))?;
+        let body_val = metadata.to_patch_value();
         let ctx = ErrorContext::object(bucket_name, object_name, generation);
         self.send_json_request(Method::PATCH, &url, &query, Some(&body_val), None, &ctx)
             .await
@@ -1015,10 +1020,19 @@ impl CloudApi for GcsJsonClient {
 
         let do_fetch = || async {
             let req = self
-                .prepare_request(Method::GET, &url, &query, Some(&extra))
+                .prepare_request_with_client(
+                    &self.media_http,
+                    Method::GET,
+                    &url,
+                    &query,
+                    Some(&extra),
+                )
                 .await?;
             let resp = req.send().await.map_err(reqwest_to_service_error)?;
             let status = resp.status().as_u16();
+            if self.config.debug_level >= 2 {
+                log_wire_response(status, resp.headers());
+            }
             let www_auth = resp
                 .headers()
                 .get("www-authenticate")
@@ -2214,4 +2228,96 @@ fn resolve_client_identity_pem(config: &BotoConfig) -> Option<Vec<u8>> {
                 .filter(|s| !s.trim().is_empty())
         })?;
     std::fs::read(path).ok()
+}
+
+fn build_reqwest_client(boto_config: &BotoConfig, no_gzip: bool) -> Result<Client> {
+    let mut builder = Client::builder()
+        .pool_max_idle_per_host(32)
+        .tcp_keepalive(Duration::from_secs(60))
+        .danger_accept_invalid_certs(!boto_config.https_validate_certificates());
+
+    if no_gzip {
+        builder = builder.no_gzip();
+    }
+
+    if let Some(ca_path) = boto_config.ca_certificates_file() {
+        let pem = std::fs::read(ca_path).map_err(|e| {
+            GsutilError::command(format!(
+                "Failed to read ca_certificates_file \"{ca_path}\": {e}"
+            ))
+        })?;
+        let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| {
+            GsutilError::command(format!(
+                "Failed to parse PEM certificates from \"{ca_path}\": {e}"
+            ))
+        })?;
+        for cert in certs {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+
+    if is_mtls_enabled(boto_config) {
+        if let Some(identity_pem) = resolve_client_identity_pem(boto_config) {
+            let identity = reqwest::Identity::from_pem(&identity_pem).map_err(|e| {
+                GsutilError::command(format!("Failed to load mTLS client identity: {e}"))
+            })?;
+            builder = builder.identity(identity);
+        }
+    }
+
+    if let Some(proxy) = boto_config.resolve_proxy() {
+        let reqwest_proxy = reqwest::Proxy::all(proxy.to_url())
+            .map_err(|e| GsutilError::command(format!("Invalid proxy config: {e}")))?;
+        builder = builder.proxy(reqwest_proxy);
+    }
+
+    builder
+        .build()
+        .map_err(|e| GsutilError::command(format!("Failed to build GCS HTTP client: {e}")))
+}
+
+/// Log an outgoing HTTP request to stderr for `-D` / `-DD` with sensitive headers redacted.
+pub(crate) fn log_wire_request(
+    method: &Method,
+    url: &str,
+    query: &[(String, String)],
+    headers: &HeaderMap,
+) {
+    if query.is_empty() {
+        eprintln!("send: {} {}", method, url);
+    } else {
+        let q = query
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        eprintln!("send: {} {}?{}", method, url, q);
+    }
+    for (k, v) in headers {
+        let lower = k.as_str().to_ascii_lowercase();
+        let val = if matches!(
+            lower.as_str(),
+            "authorization"
+                | "cookie"
+                | "x-goog-encryption-key"
+                | "x-goog-copy-source-encryption-key"
+        ) {
+            "REDACTED"
+        } else {
+            v.to_str().unwrap_or("<binary>")
+        };
+        eprintln!("send header: {}: {}", k.as_str(), val);
+    }
+}
+
+/// Log an incoming HTTP response status & headers to stderr for `-D` / `-DD`.
+pub(crate) fn log_wire_response(status: u16, headers: &HeaderMap) {
+    eprintln!("reply: HTTP/1.1 {status}");
+    for (k, v) in headers {
+        eprintln!(
+            "header: {}: {}",
+            k.as_str(),
+            v.to_str().unwrap_or("<binary>")
+        );
+    }
 }

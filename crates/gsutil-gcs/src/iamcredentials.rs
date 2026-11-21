@@ -11,6 +11,7 @@ use gsutil_core::error::{GsutilError, Result, ServiceError};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::ecp::{EcpProxy, ECP_TARGET_HOST_HEADER};
 use crate::retry::RetryPolicy;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -41,6 +42,8 @@ struct SignBlobRequest {
 #[derive(Clone)]
 pub struct IamCredentialsClient {
     base_url: String,
+    ecp_target_host: Option<String>,
+    _ecp_proxy: Option<Arc<EcpProxy>>,
     http: Client,
     credentials: Arc<dyn TokenProvider>,
     retry_policy: RetryPolicy,
@@ -48,7 +51,17 @@ pub struct IamCredentialsClient {
 
 impl IamCredentialsClient {
     pub fn new(config: &BotoConfig, credentials: Arc<dyn TokenProvider>) -> Result<Self> {
-        let base_url = resolve_iamcredentials_base_url(config);
+        let mut base_url = resolve_iamcredentials_base_url(config);
+        let mut ecp_target_host = None;
+        let mut ecp_proxy = None;
+        if base_url.starts_with("https://iamcredentials.googleapis.com") {
+            if let Some(proxy) = EcpProxy::detect_or_spawn(config)? {
+                let (rewritten, target) = proxy.rewrite_google_api_url(&base_url);
+                base_url = rewritten;
+                ecp_target_host = target;
+                ecp_proxy = Some(proxy);
+            }
+        }
         let http = Client::builder()
             .danger_accept_invalid_certs(!config.https_validate_certificates())
             .build()
@@ -57,6 +70,8 @@ impl IamCredentialsClient {
             })?;
         Ok(Self {
             base_url,
+            ecp_target_host,
+            _ecp_proxy: ecp_proxy,
             http,
             credentials,
             retry_policy: RetryPolicy::from_config(config),
@@ -70,6 +85,8 @@ impl IamCredentialsClient {
     ) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            ecp_target_host: None,
+            _ecp_proxy: None,
             http: Client::new(),
             credentials,
             retry_policy,
@@ -80,6 +97,9 @@ impl IamCredentialsClient {
         &self,
         mut req: reqwest::RequestBuilder,
     ) -> Result<reqwest::RequestBuilder> {
+        if let Some(ref target) = self.ecp_target_host {
+            req = req.header(ECP_TARGET_HOST_HEADER, target);
+        }
         if let Some(tok) = self.credentials.token().await? {
             req = req.bearer_auth(&tok.token);
         }

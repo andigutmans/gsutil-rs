@@ -128,13 +128,27 @@ struct PerfDiagResults {
     bucket: String,
     num_objects: usize,
     object_size_bytes: usize,
+    #[serde(default = "default_one")]
+    processes: usize,
+    #[serde(default = "default_one")]
+    threads: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    directory: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gzip_encoded_writes: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<String>,
     write_throughput_bps: Option<f64>,
     read_throughput_bps: Option<f64>,
     list_latency_ms: Option<f64>,
     delete_latency_ms: Option<f64>,
 }
 
-/// `gsutil perfdiag [-i in.json] [-o out.json] [-n objects] [-s size] [-t tests] gs://<bucket>`
+fn default_one() -> usize {
+    1
+}
+
+/// `gsutil perfdiag [-i in.json] [-o out.json] [-n objects] [-c procs] [-k threads] [-s size] [-d dir] [-t tests] [-m meta] [-j] [-p] [-y] gs://<bucket>`
 pub async fn run_perfdiag(
     ctx: &mut CommandContext,
     sub_opts: &[OptPair],
@@ -144,6 +158,11 @@ pub async fn run_perfdiag(
     let mut output_json: Option<PathBuf> = None;
     let mut num_objects: usize = 5;
     let mut obj_size: usize = 1024 * 1024;
+    let mut processes: usize = 1;
+    let mut threads: usize = 1;
+    let mut directory: Option<String> = None;
+    let mut metadata_kv: Option<String> = None;
+    let mut gzip_writes = false;
     let mut tests_spec = String::from("rthru,wthru,lat,list");
 
     for (o, a) in sub_opts {
@@ -155,6 +174,20 @@ pub async fn run_perfdiag(
                     GsutilError::command(format!("Invalid -n value for perfdiag: {a}"))
                 })?;
             }
+            "-c" => {
+                processes = a.parse().map_err(|_| {
+                    GsutilError::command(format!("Invalid -c value for perfdiag: {a}"))
+                })?;
+            }
+            "-k" => {
+                threads = a.parse().map_err(|_| {
+                    GsutilError::command(format!("Invalid -k value for perfdiag: {a}"))
+                })?;
+            }
+            "-p" | "-y" => {}
+            "-d" => directory = Some(a.clone()),
+            "-m" => metadata_kv = Some(a.clone()),
+            "-j" => gzip_writes = true,
             "-s" => {
                 obj_size = gsutil_core::config::parse_human_readable_bytes(a).ok_or_else(|| {
                     GsutilError::command(format!("Invalid -s size for perfdiag: {a}"))
@@ -201,6 +234,11 @@ pub async fn run_perfdiag(
         bucket: bucket.to_string(),
         num_objects,
         object_size_bytes: obj_size,
+        processes,
+        threads,
+        directory,
+        gzip_encoded_writes: gzip_writes.then_some(true),
+        metadata: metadata_kv,
         write_throughput_bps: None,
         read_throughput_bps: None,
         list_latency_ms: None,

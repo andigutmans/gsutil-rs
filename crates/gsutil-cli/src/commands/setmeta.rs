@@ -1,6 +1,10 @@
 //! `gsutil setmeta` (`setheader`) command (`-h`, `-r`/`-R`).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use futures::stream::{self, StreamExt};
 
 use gsutil_core::api::{BucketListingRef, Object, Preconditions};
 use gsutil_core::error::{no_urls_matched_target, GsutilError, Result, ServiceErrorKind};
@@ -141,43 +145,73 @@ fn parse_metadata_headers(headers: &[String]) -> Result<BTreeMap<String, String>
 fn apply_metadata_changes(existing: &Object, changes: &BTreeMap<String, String>) -> Object {
     let mut patch = Object::default();
     let mut custom_meta = existing.metadata.clone().unwrap_or_default();
-    let mut custom_changed = false;
+    let mut custom_set = false;
 
     for (k, v) in changes {
         let lower = k.to_ascii_lowercase();
-        let val = if v.is_empty() {
-            Some(String::new())
-        } else {
-            Some(v.clone())
-        };
+        let is_clear = v.is_empty();
         match lower.as_str() {
-            "cache-control" => patch.cache_control = val,
-            "content-disposition" => patch.content_disposition = val,
-            "content-encoding" => patch.content_encoding = val,
-            "content-language" => patch.content_language = val,
-            "content-type" => patch.content_type = val,
-            "custom-time" => patch.custom_time = val,
+            "cache-control" => {
+                if is_clear {
+                    patch.clear_fields.push("cacheControl".to_string());
+                } else {
+                    patch.cache_control = Some(v.clone());
+                }
+            }
+            "content-disposition" => {
+                if is_clear {
+                    patch.clear_fields.push("contentDisposition".to_string());
+                } else {
+                    patch.content_disposition = Some(v.clone());
+                }
+            }
+            "content-encoding" => {
+                if is_clear {
+                    patch.clear_fields.push("contentEncoding".to_string());
+                } else {
+                    patch.content_encoding = Some(v.clone());
+                }
+            }
+            "content-language" => {
+                if is_clear {
+                    patch.clear_fields.push("contentLanguage".to_string());
+                } else {
+                    patch.content_language = Some(v.clone());
+                }
+            }
+            "content-type" => {
+                if is_clear {
+                    patch.clear_fields.push("contentType".to_string());
+                } else {
+                    patch.content_type = Some(v.clone());
+                }
+            }
+            "custom-time" => {
+                if is_clear {
+                    patch.clear_fields.push("customTime".to_string());
+                } else {
+                    patch.custom_time = Some(v.clone());
+                }
+            }
             _ if is_custom_metadata_header(&lower) => {
-                let meta_key = k
-                    .get(12..) // len("x-goog-meta-") == 12, len("x-amz-meta-") == 11
-                    .unwrap_or(k);
                 let meta_key = if lower.starts_with("x-amz-meta-") {
                     &k[11..]
                 } else {
-                    meta_key
+                    k.get(12..).unwrap_or(k)
                 };
-                if v.is_empty() {
+                if is_clear {
                     custom_meta.remove(meta_key);
+                    patch.metadata_removals.push(meta_key.to_string());
                 } else {
                     custom_meta.insert(meta_key.to_string(), v.clone());
+                    custom_set = true;
                 }
-                custom_changed = true;
             }
             _ => {}
         }
     }
 
-    if custom_changed {
+    if custom_set {
         patch.metadata = Some(custom_meta);
     }
     patch
@@ -223,7 +257,8 @@ pub async fn run(ctx: &mut CommandContext, sub_opts: &[OptPair], args: &[String]
     let project_id = ctx.effective_project_id(None).map(ToString::to_string);
     let base_precond = ctx.preconditions_from_headers()?;
 
-    let mut everything_ok = true;
+    let everything_ok = Arc::new(AtomicBool::new(true));
+    let mut work_items: Vec<(StorageUrl, Object)> = Vec::new();
 
     for url_str in args {
         let url = StorageUrl::parse(url_str)?;
@@ -257,60 +292,135 @@ pub async fn run(ctx: &mut CommandContext, sub_opts: &[OptPair], args: &[String]
                 metadata,
             } = blr
             {
-                ctx.info(&format!("Setting metadata on {obj_url}..."));
                 let existing = metadata.as_deref().cloned().unwrap_or_default();
-                let precond = Preconditions {
-                    gen_match: base_precond
-                        .gen_match
-                        .or_else(|| existing.generation.as_deref().and_then(|g| g.parse().ok())),
-                    meta_gen_match: base_precond.meta_gen_match.or_else(|| {
-                        existing
-                            .metageneration
-                            .as_deref()
-                            .and_then(|mg| mg.parse().ok())
-                    }),
-                };
-                let patch = apply_metadata_changes(&existing, &metadata_change);
-                let bucket = obj_url.bucket_name().unwrap_or("");
-                let name = obj_url.object_name().unwrap_or("");
-
-                let mut attempts = 0;
-                loop {
-                    attempts += 1;
-                    match api
-                        .patch_object_metadata(
-                            bucket,
-                            name,
-                            &patch,
-                            None,
-                            obj_url.generation(),
-                            Some(&precond),
-                            Some(&["id".to_string()]),
-                        )
-                        .await
-                    {
-                        Ok(_) => break,
-                        Err(GsutilError::Service(se))
-                            if se.kind == ServiceErrorKind::Precondition && attempts < 3 =>
-                        {
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        }
-                        Err(e) => {
-                            ctx.error(&e.to_string());
-                            everything_ok = false;
-                            break;
-                        }
-                    }
-                }
+                work_items.push((obj_url, existing));
             }
         }
     }
 
-    if !everything_ok {
+    let concurrency = if ctx.global.parallel_operations {
+        ctx.config.parallel_thread_count().max(1)
+    } else {
+        1
+    };
+
+    if concurrency == 1 {
+        for (obj_url, existing) in work_items {
+            ctx.info(&format!("Setting metadata on {obj_url}..."));
+            if let Err(e) = patch_single_object(
+                api.as_ref(),
+                &obj_url,
+                &existing,
+                &metadata_change,
+                &base_precond,
+            )
+            .await
+            {
+                ctx.error(&e.to_string());
+                everything_ok.store(false, Ordering::Relaxed);
+            }
+        }
+    } else {
+        let quiet = ctx.global.quiet;
+        let stderr_cap = ctx.stderr_capture.clone();
+        let metadata_change = Arc::new(metadata_change);
+        let base_precond = Arc::new(base_precond);
+        stream::iter(work_items)
+            .for_each_concurrent(concurrency, |(obj_url, existing)| {
+                let api = api.clone();
+                let metadata_change = metadata_change.clone();
+                let base_precond = base_precond.clone();
+                let everything_ok = everything_ok.clone();
+                let stderr_cap = stderr_cap.clone();
+                async move {
+                    if !quiet {
+                        if let Some(ref buf) = stderr_cap {
+                            if let Ok(mut g) = buf.lock() {
+                                use std::io::Write;
+                                let _ = writeln!(g, "Setting metadata on {obj_url}...");
+                            }
+                        } else {
+                            eprintln!("Setting metadata on {obj_url}...");
+                        }
+                    }
+                    if let Err(e) = patch_single_object(
+                        api.as_ref(),
+                        &obj_url,
+                        &existing,
+                        &metadata_change,
+                        &base_precond,
+                    )
+                    .await
+                    {
+                        if let Some(ref buf) = stderr_cap {
+                            if let Ok(mut g) = buf.lock() {
+                                use std::io::Write;
+                                let _ = writeln!(g, "{e}");
+                            }
+                        } else {
+                            eprintln!("{e}");
+                        }
+                        everything_ok.store(false, Ordering::Relaxed);
+                    }
+                }
+            })
+            .await;
+    }
+
+    if !everything_ok.load(Ordering::Relaxed) {
         return Err(GsutilError::command(
             "Metadata for some objects could not be set.",
         ));
     }
 
     Ok(0)
+}
+
+async fn patch_single_object(
+    api: &dyn gsutil_core::api::CloudApi,
+    obj_url: &StorageUrl,
+    existing: &Object,
+    metadata_change: &BTreeMap<String, String>,
+    base_precond: &Preconditions,
+) -> Result<()> {
+    let provider_api = api.for_provider(obj_url.scheme())?;
+    let precond = Preconditions {
+        gen_match: base_precond
+            .gen_match
+            .or_else(|| existing.generation.as_deref().and_then(|g| g.parse().ok())),
+        meta_gen_match: base_precond.meta_gen_match.or_else(|| {
+            existing
+                .metageneration
+                .as_deref()
+                .and_then(|mg| mg.parse().ok())
+        }),
+    };
+    let patch = apply_metadata_changes(existing, metadata_change);
+    let bucket = obj_url.bucket_name().unwrap_or("");
+    let name = obj_url.object_name().unwrap_or("");
+
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match provider_api
+            .patch_object_metadata(
+                bucket,
+                name,
+                &patch,
+                None,
+                obj_url.generation(),
+                Some(&precond),
+                Some(&["id".to_string()]),
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(GsutilError::Service(se))
+                if se.kind == ServiceErrorKind::Precondition && attempts < 3 =>
+            {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }

@@ -26,7 +26,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE, HOST, RA
 use reqwest::{Client, Method};
 use sha2::{Digest, Sha256};
 
-use crate::client::DEFAULT_USER_AGENT;
+use crate::client::{log_wire_request, log_wire_response, DEFAULT_USER_AGENT};
 use crate::error_translation::{
     create_bucket_not_found, create_not_found_for_object_write, create_object_not_found,
     ErrorContext,
@@ -47,6 +47,7 @@ pub struct XmlClientConfig {
     pub default_project_id: Option<String>,
     pub custom_headers: BTreeMap<String, String>,
     pub retry_policy: RetryPolicy,
+    pub debug_level: u8,
 }
 
 impl XmlClientConfig {
@@ -103,6 +104,7 @@ impl XmlClientConfig {
             default_project_id: config.default_project_id().map(ToString::to_string),
             custom_headers: BTreeMap::new(),
             retry_policy: RetryPolicy::from_config(config),
+            debug_level: 0,
         }
     }
 
@@ -121,6 +123,7 @@ impl XmlClientConfig {
             default_project_id: Some("test-project".to_string()),
             custom_headers: BTreeMap::new(),
             retry_policy: RetryPolicy::fast_for_tests(3),
+            debug_level: 0,
         }
     }
 
@@ -398,8 +401,14 @@ impl XmlApiClient {
                         req = req.bearer_auth(&tok.token);
                     }
 
+                    if self.config.debug_level >= 2 {
+                        log_wire_request(&method, &url, query, &headers);
+                    }
                     req = req.headers(headers);
                     if !body.is_empty() {
+                        if self.config.debug_level >= 3 {
+                            eprintln!("send body: {}", String::from_utf8_lossy(&body));
+                        }
                         req = req.body(body.clone());
                     }
 
@@ -421,7 +430,13 @@ impl XmlApiClient {
 
                     let status = resp.status().as_u16();
                     let resp_headers = resp.headers().clone();
+                    if self.config.debug_level >= 2 {
+                        log_wire_response(status, &resp_headers);
+                    }
                     let resp_bytes = resp.bytes().await.unwrap_or_default();
+                    if self.config.debug_level >= 3 && !resp_bytes.is_empty() {
+                        eprintln!("reply body: {}", String::from_utf8_lossy(&resp_bytes));
+                    }
                     if (200..300).contains(&status) {
                         Ok((status, resp_headers, resp_bytes))
                     } else {

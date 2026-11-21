@@ -7,7 +7,7 @@ use gsutil_auth::{AccessToken, CredentialType, HmacCredentials, NoOpCredentials,
 use gsutil_core::api::{
     Bucket, CloudApi, ComposeSourceObject, CopyOptions, CreateNotificationOptions,
     CsObjectOrPrefix, DownloadOptions, DownloadStrategy, EncryptionKey, IamBinding, IamPolicy,
-    ListObjectsOptions, Object, Preconditions, UploadOptions,
+    KmsApi, ListObjectsOptions, Object, Preconditions, PubsubApi, UploadOptions,
 };
 use gsutil_core::config::BotoConfig;
 use gsutil_core::error::{GsutilError, Result, ServiceErrorKind};
@@ -21,7 +21,7 @@ use gsutil_gcs::kms::KmsClient;
 use gsutil_gcs::pubsub::PubsubClient;
 use gsutil_gcs::retry::RetryPolicy;
 use gsutil_gcs::xml::XmlApiClient;
-use wiremock::matchers::{header, method, path, query_param};
+use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 struct StaticTokenProvider {
@@ -876,4 +876,196 @@ async fn test_list_objects_normalizes_raw_fields_to_items_prefix() {
     };
     let items = client.list_objects("fields-bkt", &opts).await.unwrap();
     assert_eq!(items.len(), 1);
+}
+
+#[tokio::test]
+async fn test_patch_bucket_and_object_explicit_null_tombstones() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/storage/v1/b/tomb-bkt"))
+        .and(body_json(serde_json::json!({
+            "labels": { "keep": "yes", "drop": null },
+            "logging": null,
+            "encryption": null
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "tomb-bkt"
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/storage/v1/b/tomb-bkt/o/obj.txt"))
+        .and(body_json(serde_json::json!({
+            "metadata": { "k1": "v1", "old_key": null },
+            "cacheControl": null
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "bucket": "tomb-bkt",
+            "name": "obj.txt"
+        })))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server);
+
+    let mut labels = std::collections::BTreeMap::new();
+    labels.insert("keep".to_string(), "yes".to_string());
+    let bkt_patch = Bucket {
+        labels: Some(labels),
+        label_removals: vec!["drop".to_string()],
+        clear_fields: vec!["logging".to_string(), "encryption".to_string()],
+        ..Default::default()
+    };
+    let res_b = client
+        .patch_bucket("tomb-bkt", &bkt_patch, None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(res_b.name.as_deref(), Some("tomb-bkt"));
+
+    let mut meta_map = std::collections::BTreeMap::new();
+    meta_map.insert("k1".to_string(), "v1".to_string());
+    let obj_patch = Object {
+        metadata: Some(meta_map),
+        metadata_removals: vec!["old_key".to_string()],
+        clear_fields: vec!["cacheControl".to_string()],
+        ..Default::default()
+    };
+    let res_o = client
+        .patch_object_metadata("tomb-bkt", "obj.txt", &obj_patch, None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(res_o.name.as_deref(), Some("obj.txt"));
+}
+
+#[tokio::test]
+async fn test_get_object_media_gzip_preserves_raw_compressed_bytes() {
+    let server = MockServer::start().await;
+    // Valid minimal gzip payload (magic bytes 0x1f 0x8b ...)
+    let raw_gzip: Vec<u8> = vec![
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xcb, 0x48, 0xcd, 0xc9, 0xc9,
+        0x07, 0x00, 0x86, 0xa6, 0x10, 0x36, 0x05, 0x00, 0x00, 0x00,
+    ];
+
+    Mock::given(method("GET"))
+        .and(path("/storage/v1/b/gz-bkt/o/hello.txt"))
+        .and(query_param("alt", "media"))
+        .and(header("accept-encoding", "gzip"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-encoding", "gzip")
+                .set_body_bytes(raw_gzip.clone()),
+        )
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server);
+    let data = client
+        .get_object_media(
+            "gz-bkt",
+            "hello.txt",
+            &DownloadOptions {
+                compressed_encoding: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(data.as_ref(), raw_gzip.as_slice());
+}
+
+#[tokio::test]
+async fn test_kms_api_and_pubsub_api_trait_impls() {
+    let server = MockServer::start().await;
+    let creds = Arc::new(StaticTokenProvider {
+        token: "trait-tok".to_string(),
+    });
+
+    // KMS authorize_service_account: GET returns empty policy -> POST sets binding -> returns true
+    Mock::given(method("GET"))
+        .and(path(
+            "/v1/projects/p/locations/us/keyRings/kr/cryptoKeys/k:getIamPolicy",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "version": 1,
+            "bindings": []
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/projects/p/locations/us/keyRings/kr/cryptoKeys/k:setIamPolicy",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "version": 1,
+            "bindings": [{
+                "role": "roles/cloudkms.cryptoKeyEncrypterDecrypter",
+                "members": ["serviceAccount:gs-sa@gs-project-accounts.iam.gserviceaccount.com"]
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let kms: Arc<dyn KmsApi> = Arc::new(KmsClient::with_base_url(
+        server.uri(),
+        creds.clone(),
+        RetryPolicy::fast_for_tests(1),
+    ));
+    let changed = kms
+        .authorize_service_account(
+            "projects/p/locations/us/keyRings/kr/cryptoKeys/k",
+            "gs-sa@gs-project-accounts.iam.gserviceaccount.com",
+        )
+        .await
+        .unwrap();
+    assert!(changed);
+
+    // PubSub create_topic treats 409 as Ok(()), authorize_publisher sets roles/pubsub.publisher
+    Mock::given(method("PUT"))
+        .and(path("/v1/projects/p/topics/t-exist"))
+        .respond_with(ResponseTemplate::new(409).set_body_string("already exists"))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/projects/p/topics/t-exist:getIamPolicy"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "version": 1,
+            "bindings": []
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/projects/p/topics/t-exist:setIamPolicy"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "version": 1,
+            "bindings": [{
+                "role": "roles/pubsub.publisher",
+                "members": ["serviceAccount:gs-sa@gs-project-accounts.iam.gserviceaccount.com"]
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let pubsub: Arc<dyn PubsubApi> = Arc::new(PubsubClient::with_base_url(
+        server.uri(),
+        creds,
+        RetryPolicy::fast_for_tests(1),
+    ));
+    pubsub
+        .create_topic("projects/p/topics/t-exist")
+        .await
+        .unwrap();
+    pubsub
+        .authorize_publisher(
+            "projects/p/topics/t-exist",
+            "gs-sa@gs-project-accounts.iam.gserviceaccount.com",
+        )
+        .await
+        .unwrap();
 }

@@ -138,11 +138,12 @@ pub async fn run(ctx: &mut CommandContext, sub_opts: &[OptPair], args: &[String]
                     printed_one = true;
                 }
 
-                // Match CatHelper: if 0 < size <= start_byte, output nothing and return 0.
+                // Match CatHelper: if 0 < size <= start_byte, output nothing for this object
+                // and continue to any remaining objects.
                 if let (Some(meta), Some(sb)) = (&metadata, start_byte) {
                     let obj_size = meta.size_bytes();
                     if obj_size > 0 && sb >= 0 && (sb as u64) >= obj_size {
-                        return Ok(0);
+                        continue;
                     }
                 }
 
@@ -154,6 +155,22 @@ pub async fn run(ctx: &mut CommandContext, sub_opts: &[OptPair], args: &[String]
                     .and_then(|m| m.content_encoding.as_deref())
                     .is_some_and(|e| e.eq_ignore_ascii_case("gzip"));
 
+                let decryption_key = if let Some(sha) = metadata
+                    .as_ref()
+                    .and_then(|m| m.customer_encryption.as_ref())
+                    .and_then(|ce| ce.key_sha256.as_deref())
+                {
+                    let found = crate::encryption::find_matching_csek(&ctx.config, sha)?;
+                    if found.is_none() {
+                        return Err(GsutilError::Encryption(format!(
+                            "Missing decryption key with SHA256 hash {sha}. No decryption key matches object {obj_url}"
+                        )));
+                    }
+                    found
+                } else {
+                    crate::encryption::primary_decryption_key(&ctx.config)?
+                };
+
                 let opts = DownloadOptions {
                     generation: storage_url.generation().map(ToString::to_string),
                     start_byte: if start_byte == Some(0) && end_byte.is_none() {
@@ -163,10 +180,12 @@ pub async fn run(ctx: &mut CommandContext, sub_opts: &[OptPair], args: &[String]
                     },
                     end_byte,
                     compressed_encoding: compressed,
+                    decryption_key,
                     ..Default::default()
                 };
 
-                let bytes = api.get_object_media(bucket, name, &opts).await?;
+                let provider_api = api.for_provider(storage_url.scheme())?;
+                let bytes = provider_api.get_object_media(bucket, name, &opts).await?;
                 ctx.write_stdout(&bytes)?;
                 ctx.flush_stdout()?;
             }

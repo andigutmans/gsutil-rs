@@ -11,7 +11,7 @@ use bytes::Bytes;
 use gsutil_cli::context::CommandContext;
 use gsutil_cli::dispatch::run_named_command;
 use gsutil_cli::global_opts::GlobalOptions;
-use gsutil_cli::run_cli_with_api;
+use gsutil_cli::run_cli_captured;
 use gsutil_core::api::{
     Bucket, Channel, CloudApi, ComposeSourceObject, CopyOptions, CreateNotificationOptions,
     CsObjectOrPrefix, DownloadOptions, HmacKeyCreateResponse, HmacKeyMetadata, IamPolicy,
@@ -232,11 +232,25 @@ impl CloudApi for MockCloudApi {
         if metadata.cache_control.is_some() {
             entry.0.cache_control = metadata.cache_control.clone();
         }
+        if metadata.clear_fields.iter().any(|f| f == "cacheControl") {
+            entry.0.cache_control = None;
+        }
         if metadata.content_type.is_some() {
             entry.0.content_type = metadata.content_type.clone();
         }
-        if metadata.metadata.is_some() {
-            entry.0.metadata = metadata.metadata.clone();
+        if metadata.clear_fields.iter().any(|f| f == "contentType") {
+            entry.0.content_type = None;
+        }
+        if let Some(ref m) = metadata.metadata {
+            let map = entry.0.metadata.get_or_insert_with(BTreeMap::new);
+            for (k, v) in m {
+                map.insert(k.clone(), v.clone());
+            }
+        }
+        for removed in &metadata.metadata_removals {
+            if let Some(ref mut map) = entry.0.metadata {
+                map.remove(removed);
+            }
         }
         Ok(entry.0.clone())
     }
@@ -424,39 +438,85 @@ fn s(items: &[&str]) -> Vec<String> {
 
 #[tokio::test]
 async fn test_cli_exit_codes_no_args_vs_help_flag() {
-    assert_eq!(run_cli_with_api(&s(&["gsutil"]), None).await, 0);
-    assert_eq!(run_cli_with_api(&s(&["gsutil", "-?"]), None).await, 1);
-    assert_eq!(run_cli_with_api(&s(&["gsutil", "--help"]), None).await, 1);
-    assert_eq!(run_cli_with_api(&s(&["gsutil", "-v"]), None).await, 0);
-    assert_eq!(
-        run_cli_with_api(&s(&["gsutil", "version", "-l"]), None).await,
-        0
-    );
-    assert_eq!(
-        run_cli_with_api(&s(&["gsutil", "unknowncmd"]), None).await,
-        1
-    );
+    let r = run_cli_captured(&s(&["gsutil"]), None).await;
+    assert_eq!(r.exit_code, 0);
+    assert!(r.stdout.contains("Available commands:"));
+
+    let r = run_cli_captured(&s(&["gsutil", "-?"]), None).await;
+    assert_eq!(r.exit_code, 1);
+    assert!(r.stdout.contains("Usage: gsutil"));
+
+    let r = run_cli_captured(&s(&["gsutil", "--help"]), None).await;
+    assert_eq!(r.exit_code, 1);
+    assert!(r.stdout.contains("Usage: gsutil"));
+
+    let r = run_cli_captured(&s(&["gsutil", "-v"]), None).await;
+    assert_eq!(r.exit_code, 0);
+    assert_eq!(r.stdout.trim(), "gsutil version: 5.38");
+
+    let r = run_cli_captured(&s(&["gsutil", "version", "-l"]), None).await;
+    assert_eq!(r.exit_code, 0);
+    assert!(r.stdout.contains("gsutil version: 5.38"));
+    assert!(r.stdout.contains("compiled crcmod: True"));
+
+    let r = run_cli_captured(&s(&["gsutil", "unknowncmd"]), None).await;
+    assert_eq!(r.exit_code, 1);
+    assert!(r
+        .stderr
+        .contains("CommandException: Invalid command \"unknowncmd\"."));
 }
 
 #[tokio::test]
-async fn test_hash_local_file() {
+async fn test_hash_local_and_cloud_filtering() {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("hello.txt");
     std::fs::write(&f, b"hello").unwrap();
     let path_str = f.to_string_lossy().to_string();
 
+    let r = run_cli_captured(&s(&["gsutil", "hash", &path_str]), None).await;
+    assert_eq!(r.exit_code, 0);
+    assert!(r.stdout.contains("Hash (crc32c):\t\tmnG7TA=="));
+    assert!(r.stdout.contains("Hash (md5):\t\tXUFAKrxLKna5cZ2REBfFkg=="));
+
+    let r = run_cli_captured(&s(&["gsutil", "hash", "-c", "-h", &path_str]), None).await;
+    assert_eq!(r.exit_code, 0);
+    assert!(r.stdout.contains("Hash (crc32c):\t\t9A71BB4C"));
+    assert!(!r.stdout.contains("Hash (md5):"));
+
+    let r = run_cli_captured(&s(&["gsutil", "hash", "/nonexistent/file/xyz"]), None).await;
+    assert_eq!(r.exit_code, 1);
+    assert!(r.stderr.contains("CommandException: No files matched"));
+
+    // Cloud object hash filtering (-c only vs -m only)
+    let mock = Arc::new(MockCloudApi::default());
+    let api: Arc<dyn CloudApi> = mock.clone();
     assert_eq!(
-        run_cli_with_api(&s(&["gsutil", "hash", &path_str]), None).await,
+        run_cli_captured(&s(&["gsutil", "mb", "gs://hash-bkt"]), Some(api.clone()))
+            .await
+            .exit_code,
         0
     );
-    assert_eq!(
-        run_cli_with_api(&s(&["gsutil", "hash", "-c", "-h", &path_str]), None).await,
-        0
-    );
-    assert_eq!(
-        run_cli_with_api(&s(&["gsutil", "hash", "/nonexistent/file/xyz"]), None).await,
-        1
-    );
+    mock.seed_object("hash-bkt", "hello.txt", b"hello");
+
+    let r_c = run_cli_captured(
+        &s(&["gsutil", "hash", "-c", "gs://hash-bkt/hello.txt"]),
+        Some(api.clone()),
+    )
+    .await;
+    assert_eq!(r_c.exit_code, 0);
+    assert!(r_c.stdout.contains("Hash (crc32c):\t\tmnG7TA=="));
+    assert!(!r_c.stdout.contains("Hash (md5):"));
+
+    let r_m = run_cli_captured(
+        &s(&["gsutil", "hash", "-m", "gs://hash-bkt/hello.txt"]),
+        Some(api.clone()),
+    )
+    .await;
+    assert_eq!(r_m.exit_code, 0);
+    assert!(r_m
+        .stdout
+        .contains("Hash (md5):\t\tXUFAKrxLKna5cZ2REBfFkg=="));
+    assert!(!r_m.stdout.contains("Hash (crc32c):"));
 }
 
 #[tokio::test]
@@ -465,22 +525,21 @@ async fn test_mb_ls_stat_du_cat_setmeta_rm_rb_lifecycle() {
     let api: Arc<dyn CloudApi> = mock.clone();
 
     // mb
-    assert_eq!(
-        run_cli_with_api(
-            &s(&[
-                "gsutil",
-                "mb",
-                "-l",
-                "us-central1",
-                "-c",
-                "nearline",
-                "gs://my-test-bkt"
-            ]),
-            Some(api.clone())
-        )
-        .await,
-        0
-    );
+    let r = run_cli_captured(
+        &s(&[
+            "gsutil",
+            "mb",
+            "-l",
+            "us-central1",
+            "-c",
+            "nearline",
+            "gs://my-test-bkt",
+        ]),
+        Some(api.clone()),
+    )
+    .await;
+    assert_eq!(r.exit_code, 0);
+    assert!(r.stderr.contains("Creating gs://my-test-bkt/..."));
     assert!(mock
         .state
         .lock()
@@ -491,108 +550,129 @@ async fn test_mb_ls_stat_du_cat_setmeta_rm_rb_lifecycle() {
     // Seed objects
     mock.seed_object("my-test-bkt", "a.txt", b"hello world");
     mock.seed_object("my-test-bkt", "sub/b.txt", b"goodbye");
+    mock.seed_object("my-test-bkt", "long.txt", b"0123456789abcdefghij");
 
     // ls variants
-    assert_eq!(
-        run_cli_with_api(&s(&["gsutil", "ls"]), Some(api.clone())).await,
-        0
-    );
-    assert_eq!(
-        run_cli_with_api(
-            &s(&["gsutil", "ls", "-l", "-h", "gs://my-test-bkt"]),
-            Some(api.clone())
-        )
-        .await,
-        0
-    );
-    assert_eq!(
-        run_cli_with_api(
-            &s(&["gsutil", "ls", "-L", "-b", "gs://my-test-bkt"]),
-            Some(api.clone())
-        )
-        .await,
-        0
-    );
-    assert_eq!(
-        run_cli_with_api(
-            &s(&["gsutil", "ls", "-r", "gs://my-test-bkt"]),
-            Some(api.clone())
-        )
-        .await,
-        0
-    );
-    assert_eq!(
-        run_cli_with_api(
-            &s(&["gsutil", "ls", "gs://my-test-bkt/sub/"]),
-            Some(api.clone())
-        )
-        .await,
-        0
-    );
+    let r = run_cli_captured(&s(&["gsutil", "ls"]), Some(api.clone())).await;
+    assert_eq!(r.exit_code, 0);
+    assert_eq!(r.stdout.trim(), "gs://my-test-bkt/");
+
+    let r = run_cli_captured(
+        &s(&["gsutil", "ls", "-l", "-h", "gs://my-test-bkt"]),
+        Some(api.clone()),
+    )
+    .await;
+    assert_eq!(r.exit_code, 0);
+    assert!(r.stdout.contains("gs://my-test-bkt/a.txt"));
+    assert!(r.stdout.contains("TOTAL: 2 objects, 31 bytes"));
+
+    let r = run_cli_captured(
+        &s(&["gsutil", "ls", "-L", "-b", "gs://my-test-bkt"]),
+        Some(api.clone()),
+    )
+    .await;
+    assert_eq!(r.exit_code, 0);
+    assert!(r.stdout.contains("Storage class:\t\t\tNEARLINE"));
+    assert!(r.stdout.contains("Location constraint:\t\tus-central1"));
+
+    let r = run_cli_captured(
+        &s(&["gsutil", "ls", "-r", "gs://my-test-bkt"]),
+        Some(api.clone()),
+    )
+    .await;
+    assert_eq!(r.exit_code, 0);
+    assert!(r.stdout.contains("gs://my-test-bkt/sub/:"));
+    assert!(r.stdout.contains("gs://my-test-bkt/sub/b.txt"));
+
+    let r = run_cli_captured(
+        &s(&["gsutil", "ls", "gs://my-test-bkt/sub/"]),
+        Some(api.clone()),
+    )
+    .await;
+    assert_eq!(r.exit_code, 0);
+    assert_eq!(r.stdout.trim(), "gs://my-test-bkt/sub/b.txt");
 
     // stat existing & missing
-    assert_eq!(
-        run_cli_with_api(
-            &s(&["gsutil", "stat", "gs://my-test-bkt/a.txt"]),
-            Some(api.clone())
-        )
-        .await,
-        0
-    );
-    assert_eq!(
-        run_cli_with_api(
-            &s(&["gsutil", "-q", "stat", "gs://my-test-bkt/missing.txt"]),
-            Some(api.clone())
-        )
-        .await,
-        1
-    );
+    let r = run_cli_captured(
+        &s(&["gsutil", "stat", "gs://my-test-bkt/a.txt"]),
+        Some(api.clone()),
+    )
+    .await;
+    assert_eq!(r.exit_code, 0);
+    assert!(r.stdout.contains("Content-Length:         11"));
+
+    let r = run_cli_captured(
+        &s(&["gsutil", "-q", "stat", "gs://my-test-bkt/missing.txt"]),
+        Some(api.clone()),
+    )
+    .await;
+    assert_eq!(r.exit_code, 1);
+    assert!(r.stdout.is_empty());
+    assert!(r.stderr.is_empty());
 
     // du
-    assert_eq!(
-        run_cli_with_api(
-            &s(&["gsutil", "du", "-s", "-h", "-c", "gs://my-test-bkt"]),
-            Some(api.clone())
-        )
-        .await,
-        0
-    );
-    assert_eq!(
-        run_cli_with_api(
-            &s(&["gsutil", "du", "gs://my-test-bkt/sub/"]),
-            Some(api.clone())
-        )
-        .await,
-        0
-    );
+    let r = run_cli_captured(
+        &s(&["gsutil", "du", "-s", "-h", "-c", "gs://my-test-bkt"]),
+        Some(api.clone()),
+    )
+    .await;
+    assert_eq!(r.exit_code, 0);
+    assert!(r.stdout.contains("38 B         gs://my-test-bkt"));
+    assert!(r.stdout.contains("38 B         total"));
 
-    // cat with range
-    assert_eq!(
-        run_cli_with_api(
-            &s(&["gsutil", "cat", "-r", "0-4", "gs://my-test-bkt/a.txt"]),
-            Some(api.clone())
-        )
-        .await,
-        0
-    );
+    let r = run_cli_captured(&s(&["gsutil", "du", "gs://my-test-bkt"]), Some(api.clone())).await;
+    assert_eq!(r.exit_code, 0);
+    assert!(r.stdout.contains("7            gs://my-test-bkt/sub/b.txt"));
+    assert!(r.stdout.contains("7            gs://my-test-bkt/sub/"));
 
-    // setmeta
-    assert_eq!(
-        run_cli_with_api(
-            &s(&[
-                "gsutil",
-                "setmeta",
-                "-h",
-                "Cache-Control:public, max-age=60",
-                "-h",
-                "x-goog-meta-color:blue",
-                "gs://my-test-bkt/a.txt"
-            ]),
-            Some(api.clone())
-        )
-        .await,
-        0
-    );
+    let r = run_cli_captured(
+        &s(&["gsutil", "du", "gs://my-test-bkt/sub/"]),
+        Some(api.clone()),
+    )
+    .await;
+    assert_eq!(r.exit_code, 0);
+    assert_eq!(r.stdout.trim(), "7            gs://my-test-bkt/sub/b.txt");
+
+    // cat with range + multi-object range continuation past short object
+    let r = run_cli_captured(
+        &s(&["gsutil", "cat", "-r", "0-4", "gs://my-test-bkt/a.txt"]),
+        Some(api.clone()),
+    )
+    .await;
+    assert_eq!(r.exit_code, 0);
+    assert_eq!(r.stdout, "hello");
+
+    let r = run_cli_captured(
+        &s(&[
+            "gsutil",
+            "cat",
+            "-r",
+            "15-19",
+            "gs://my-test-bkt/a.txt",
+            "gs://my-test-bkt/long.txt",
+        ]),
+        Some(api.clone()),
+    )
+    .await;
+    assert_eq!(r.exit_code, 0);
+    assert_eq!(r.stdout, "fghij");
+
+    // setmeta set + parallel -m + remove (null tombstones)
+    let r = run_cli_captured(
+        &s(&[
+            "gsutil",
+            "-m",
+            "setmeta",
+            "-h",
+            "Cache-Control:public, max-age=60",
+            "-h",
+            "x-goog-meta-color:blue",
+            "gs://my-test-bkt/a.txt",
+        ]),
+        Some(api.clone()),
+    )
+    .await;
+    assert_eq!(r.exit_code, 0);
     {
         let st = mock.state.lock().unwrap();
         let (obj, _) = st
@@ -609,30 +689,51 @@ async fn test_mb_ls_stat_du_cat_setmeta_rm_rb_lifecycle() {
         );
     }
 
+    let r = run_cli_captured(
+        &s(&[
+            "gsutil",
+            "setmeta",
+            "-h",
+            "Cache-Control",
+            "-h",
+            "x-goog-meta-color",
+            "gs://my-test-bkt/a.txt",
+        ]),
+        Some(api.clone()),
+    )
+    .await;
+    assert_eq!(r.exit_code, 0);
+    {
+        let st = mock.state.lock().unwrap();
+        let (obj, _) = st
+            .objects
+            .get(&("my-test-bkt".to_string(), "a.txt".to_string()))
+            .unwrap();
+        assert_eq!(obj.cache_control, None);
+        assert_eq!(obj.metadata.as_ref().and_then(|m| m.get("color")), None);
+    }
+
     // rb on non-empty bucket should fail (409 NotEmpty)
-    assert_eq!(
-        run_cli_with_api(&s(&["gsutil", "rb", "gs://my-test-bkt"]), Some(api.clone())).await,
-        1
-    );
+    let r = run_cli_captured(&s(&["gsutil", "rb", "gs://my-test-bkt"]), Some(api.clone())).await;
+    assert_eq!(r.exit_code, 1);
+    assert!(r.stderr.contains("NotEmptyException: 409"));
 
     // rm single object
-    assert_eq!(
-        run_cli_with_api(
-            &s(&["gsutil", "rm", "gs://my-test-bkt/a.txt"]),
-            Some(api.clone())
-        )
-        .await,
-        0
-    );
+    let r = run_cli_captured(
+        &s(&["gsutil", "rm", "gs://my-test-bkt/a.txt"]),
+        Some(api.clone()),
+    )
+    .await;
+    assert_eq!(r.exit_code, 0);
+    assert!(r.stderr.contains("Removing gs://my-test-bkt/a.txt..."));
+
     // rm -r remaining bucket + objects
-    assert_eq!(
-        run_cli_with_api(
-            &s(&["gsutil", "rm", "-r", "gs://my-test-bkt"]),
-            Some(api.clone())
-        )
-        .await,
-        0
-    );
+    let r = run_cli_captured(
+        &s(&["gsutil", "rm", "-r", "gs://my-test-bkt"]),
+        Some(api.clone()),
+    )
+    .await;
+    assert_eq!(r.exit_code, 0);
     assert!(!mock
         .state
         .lock()
@@ -642,32 +743,30 @@ async fn test_mb_ls_stat_du_cat_setmeta_rm_rb_lifecycle() {
 }
 
 #[tokio::test]
-async fn test_help_subcommands_and_addlhelp() {
-    let mut ctx = CommandContext::new(BotoConfig::new(), GlobalOptions::default(), None);
-    assert_eq!(
-        run_named_command(&mut ctx, "help", &s(&["acl", "set"]))
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        run_named_command(&mut ctx, "help", &s(&["crc32c"]))
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        run_named_command(&mut ctx, "help", &s(&["getacl"]))
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        run_named_command(&mut ctx, "help", &s(&["nonexistent"]))
-            .await
-            .unwrap(),
-        0
-    );
+async fn test_help_subcommands_and_deprecated_alias_warning() {
+    let r = run_cli_captured(&s(&["gsutil", "help", "acl", "set"]), None).await;
+    assert_eq!(r.exit_code, 0);
+    assert!(r.stdout.contains("acl set"));
+
+    let r = run_cli_captured(&s(&["gsutil", "help", "crc32c"]), None).await;
+    assert_eq!(r.exit_code, 0);
+    assert!(r.stdout.contains("CRC32C"));
+
+    let r = run_cli_captured(&s(&["gsutil", "help", "getacl"]), None).await;
+    assert_eq!(r.exit_code, 0);
+    assert!(r.stdout.contains("DEPRECATION WARNING"));
+
+    let r = run_cli_captured(&s(&["gsutil", "help", "nonexistent"]), None).await;
+    assert_eq!(r.exit_code, 0);
+    assert!(r.stdout.contains("No help available for \"nonexistent\""));
+
+    // Executing a deprecated OLD_ALIAS_MAP alias emits the deprecation warning on stderr.
+    let mock = Arc::new(MockCloudApi::default());
+    let api: Arc<dyn CloudApi> = mock.clone();
+    let r = run_cli_captured(&s(&["gsutil", "getversioning", "gs://missing"]), Some(api)).await;
+    assert!(r.stderr.contains(
+        "You are using a deprecated alias, \"getversioning\", for the \"versioning\" command."
+    ));
 }
 
 #[tokio::test]
@@ -721,16 +820,13 @@ async fn test_config_and_test_commands() {
     let boto_path = dir.path().join("test.boto");
     let path_str = boto_path.to_string_lossy().to_string();
 
-    assert_eq!(
-        run_cli_with_api(&s(&["gsutil", "config", "-n", "-o", &path_str]), None).await,
-        0
-    );
+    let r = run_cli_captured(&s(&["gsutil", "config", "-n", "-o", &path_str]), None).await;
+    assert_eq!(r.exit_code, 0);
     let content = std::fs::read_to_string(&boto_path).unwrap();
     assert!(content.contains("[Credentials]"));
     assert!(content.contains("[GSUtil]"));
 
-    assert_eq!(
-        run_cli_with_api(&s(&["gsutil", "test", "-l"]), None).await,
-        0
-    );
+    let r = run_cli_captured(&s(&["gsutil", "test", "-l"]), None).await;
+    assert_eq!(r.exit_code, 0);
+    assert!(r.stdout.contains("cargo test --workspace"));
 }

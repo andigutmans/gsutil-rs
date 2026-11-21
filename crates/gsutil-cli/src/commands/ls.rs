@@ -152,11 +152,13 @@ pub async fn run(ctx: &mut CommandContext, sub_opts: &[OptPair], args: &[String]
                         metadata: None,
                     } = blr
                     {
-                        api.get_bucket(
-                            b_url.bucket_name().unwrap_or(""),
-                            Some(&["id".to_string()]),
-                        )
-                        .await?;
+                        let provider_api = api.for_provider(b_url.scheme())?;
+                        provider_api
+                            .get_bucket(
+                                b_url.bucket_name().unwrap_or(""),
+                                Some(&["id".to_string()]),
+                            )
+                            .await?;
                     }
                 }
                 print_bucket_info(ctx, &blr, opts.style)?;
@@ -297,6 +299,58 @@ fn print_prefix(ctx: &CommandContext, blr: &BucketListingRef, style: ListingStyl
     }
 }
 
+type LsFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(u64, u64, u64)>> + 'a>>;
+
+#[allow(clippy::too_many_arguments)]
+fn recurse_expand_and_print<'a>(
+    ctx: &'a CommandContext,
+    api: &'a dyn CloudApi,
+    pattern: String,
+    project_id: Option<&'a str>,
+    opts: &'a LsOpts,
+    mut print_initial_newline: bool,
+) -> LsFuture<'a> {
+    Box::pin(async move {
+        let items = iter_all(api, &pattern, project_id, opts.all_versions, None).await?;
+        let mut num_dirs = 0u64;
+        let mut num_objs = 0u64;
+        let mut num_bytes = 0u64;
+
+        for blr in &items {
+            match blr {
+                BucketListingRef::Object { .. } => {
+                    let (o, b) = print_object(ctx, blr, opts)?;
+                    num_objs += o;
+                    num_bytes += b;
+                }
+                BucketListingRef::Prefix { .. } => {
+                    if opts.recursive {
+                        if print_initial_newline {
+                            ctx.println("")?;
+                        } else {
+                            print_initial_newline = true;
+                        }
+                        ctx.println(&format!("{}:", blr.url().url_string()))?;
+                        let sub_pat = blr.url().create_prefix_url(Some("*"));
+                        let (nd, no, nb) =
+                            recurse_expand_and_print(ctx, api, sub_pat, project_id, opts, true)
+                                .await?;
+                        num_dirs += nd;
+                        num_objs += no;
+                        num_bytes += nb;
+                    } else {
+                        print_prefix(ctx, blr, opts.style)?;
+                        num_dirs += 1;
+                    }
+                }
+                BucketListingRef::Bucket { .. } => {}
+            }
+        }
+        Ok((num_dirs, num_objs, num_bytes))
+    })
+}
+
 async fn list_url(
     ctx: &CommandContext,
     api: &dyn CloudApi,
@@ -305,28 +359,51 @@ async fn list_url(
     project_id: Option<&str>,
     opts: &LsOpts,
 ) -> Result<(bool, u64, u64)> {
-    let mut total_objs = 0u64;
-    let mut total_bytes = 0u64;
-
     if storage_url.is_bucket() {
         if print_bucket_header {
             ctx.println(&format!("{}:", storage_url.url_string()))?;
         }
-        let pattern = if opts.recursive {
-            storage_url.create_prefix_url(Some("**"))
-        } else {
-            storage_url.create_prefix_url(Some("*"))
-        };
-        let items = iter_all(api, &pattern, project_id, opts.all_versions, None).await?;
+        let pattern = storage_url.create_prefix_url(Some("*"));
+        let (_, total_objs, total_bytes) =
+            recurse_expand_and_print(ctx, api, pattern, project_id, opts, false).await?;
+        return Ok((true, total_objs, total_bytes));
+    }
+
+    if opts.recursive {
+        let items = iter_all(
+            api,
+            &storage_url.url_string(),
+            project_id,
+            opts.all_versions,
+            None,
+        )
+        .await?;
+        if items.is_empty() {
+            return Ok((false, 0, 0));
+        }
+        let mut total_objs = 0u64;
+        let mut total_bytes = 0u64;
+        let mut print_newline = false;
         for blr in &items {
             match blr {
                 BucketListingRef::Object { .. } => {
                     let (o, b) = print_object(ctx, blr, opts)?;
                     total_objs += o;
                     total_bytes += b;
+                    print_newline = true;
                 }
                 BucketListingRef::Prefix { .. } => {
-                    print_prefix(ctx, blr, opts.style)?;
+                    if print_newline {
+                        ctx.println("")?;
+                    } else {
+                        print_newline = true;
+                    }
+                    ctx.println(&format!("{}:", blr.url().url_string()))?;
+                    let sub_pat = blr.url().create_prefix_url(Some("*"));
+                    let (_, no, nb) =
+                        recurse_expand_and_print(ctx, api, sub_pat, project_id, opts, true).await?;
+                    total_objs += no;
+                    total_bytes += nb;
                 }
                 BucketListingRef::Bucket { .. } => {}
             }
@@ -334,7 +411,7 @@ async fn list_url(
         return Ok((true, total_objs, total_bytes));
     }
 
-    // Object or subdirectory URL.
+    // Non-recursive object or subdirectory URL.
     let items = iter_all(
         api,
         &storage_url.url_string(),
@@ -348,6 +425,8 @@ async fn list_url(
         return Ok((false, 0, 0));
     }
 
+    let mut total_objs = 0u64;
+    let mut total_bytes = 0u64;
     let mut subdirs = Vec::new();
     for blr in &items {
         match blr {
@@ -368,28 +447,14 @@ async fn list_url(
     }
 
     for subdir in subdirs {
-        let pattern = if opts.recursive {
-            subdir.create_prefix_url(Some("**"))
-        } else {
-            subdir.create_prefix_url(Some("*"))
-        };
-        if items.len() > 1 || opts.recursive {
+        let pattern = subdir.create_prefix_url(Some("*"));
+        if items.len() > 1 {
             ctx.println(&format!("{}:", subdir.url_string()))?;
         }
-        let sub_items = iter_all(api, &pattern, project_id, opts.all_versions, None).await?;
-        for sub_blr in &sub_items {
-            match sub_blr {
-                BucketListingRef::Object { .. } => {
-                    let (o, b) = print_object(ctx, sub_blr, opts)?;
-                    total_objs += o;
-                    total_bytes += b;
-                }
-                BucketListingRef::Prefix { .. } => {
-                    print_prefix(ctx, sub_blr, opts.style)?;
-                }
-                BucketListingRef::Bucket { .. } => {}
-            }
-        }
+        let (_, no, nb) =
+            recurse_expand_and_print(ctx, api, pattern, project_id, opts, true).await?;
+        total_objs += no;
+        total_bytes += nb;
     }
 
     Ok((true, total_objs, total_bytes))

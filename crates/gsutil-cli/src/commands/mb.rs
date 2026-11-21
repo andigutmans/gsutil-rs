@@ -259,7 +259,8 @@ pub async fn run(ctx: &mut CommandContext, sub_opts: &[OptPair], args: &[String]
         validate_bucket_name(bucket_name)?;
 
         ctx.info(&format!("Creating {bucket_url}..."));
-        match api
+        let provider_api = api.for_provider(bucket_url.scheme())?;
+        match provider_api
             .create_bucket(
                 bucket_name,
                 effective_project.as_deref(),

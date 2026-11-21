@@ -59,8 +59,7 @@ impl ServiceErrorKind {
     /// Exact Python exception class name used in `ServiceException.__str__`.
     pub fn class_name(&self) -> &'static str {
         match self {
-            Self::Service => "ServiceException",
-            Self::RetryableService => "RetryableServiceException",
+            Self::Service | Self::RetryableService => "ServiceException",
             Self::ResumableDownload => "ResumableDownloadException",
             Self::ResumableUpload => "ResumableUploadException",
             Self::ResumableUploadStartOver => "ResumableUploadStartOverException",

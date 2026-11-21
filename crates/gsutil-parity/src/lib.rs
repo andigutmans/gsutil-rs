@@ -8,6 +8,8 @@
 //! - Side effects (local files, mock GCS state, or live GCS bucket state)
 
 pub mod cases;
+pub mod live_cases;
+pub mod mock_cases;
 pub mod mock_gcs;
 pub mod normalize;
 pub mod runner;

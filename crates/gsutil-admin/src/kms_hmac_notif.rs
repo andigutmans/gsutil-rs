@@ -85,12 +85,11 @@ pub async fn run_kms(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
                         b.bucket_url_string()
                     )?;
                     let patch = Bucket {
-                        encryption: Some(BucketEncryption {
-                            default_kms_key_name: None,
-                        }),
+                        clear_fields: vec!["encryption".to_string()],
                         ..Default::default()
                     };
                     ctx.api
+                        .for_provider(b.scheme.as_str())?
                         .patch_bucket(name, &patch, None, None, None, None)
                         .await?;
                 } else if let Some(ref key) = kms_key {
@@ -173,10 +172,23 @@ pub async fn run_kms(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
                 })?;
             let sa = ctx.api.get_project_service_account(&project).await?;
             let email = sa.email_address.unwrap_or_default();
-            writeln!(
-                ctx.out,
-                "Authorized project {project} ({email}) to encrypt and decrypt with key:\n{key}"
-            )?;
+            let kms_api = ctx.kms_api.ok_or_else(|| {
+                GsutilError::command(
+                    "Cloud KMS API client is not configured; cannot authorize KMS key.",
+                )
+            })?;
+            let modified = kms_api.authorize_service_account(&key, &email).await?;
+            if modified {
+                writeln!(
+                    ctx.out,
+                    "Authorized project {project} to encrypt and decrypt with key:\n{key}"
+                )?;
+            } else {
+                writeln!(
+                    ctx.out,
+                    "Project {project} was already authorized to encrypt and decrypt with key:\n{key}."
+                )?;
+            }
             Ok(())
         }
         other => Err(GsutilError::command(format!(
@@ -389,6 +401,7 @@ pub async fn run_notification(ctx: &mut AdminContext<'_>, args: &[String]) -> Re
             let mut event_types: Vec<String> = Vec::new();
             let mut custom_attrs: BTreeMap<String, String> = BTreeMap::new();
             let mut prefix: Option<String> = None;
+            let mut skip_topic_setup = false;
             let mut url_args = Vec::new();
             let mut i = 1;
             while i < args.len() {
@@ -450,7 +463,7 @@ pub async fn run_notification(ctx: &mut AdminContext<'_>, args: &[String]) -> Re
                                 .clone(),
                         );
                     }
-                    "-s" => {} // skip topic creation (handled at Pub/Sub layer)
+                    "-s" => skip_topic_setup = true,
                     other => url_args.push(other.to_string()),
                 }
                 i += 1;
@@ -458,10 +471,21 @@ pub async fn run_notification(ctx: &mut AdminContext<'_>, args: &[String]) -> Re
             let buckets = expand_bucket_urls(ctx, &url_args, "notification").await?;
             let b = &buckets[0];
             let bname = b.bucket_name.as_deref().unwrap_or("");
-            let pubsub_topic = topic.unwrap_or_else(|| {
-                let proj = ctx.effective_project_id().unwrap_or("default");
-                format!("projects/{proj}/topics/{bname}")
-            });
+            let proj = ctx.effective_project_id().unwrap_or("default");
+            let pubsub_topic = match topic {
+                Some(t) if t.starts_with("projects/") => t,
+                Some(t) => format!("projects/{proj}/topics/{t}"),
+                None => format!("projects/{proj}/topics/{bname}"),
+            };
+            if !skip_topic_setup {
+                if let Some(pubsub_api) = ctx.pubsub_api {
+                    pubsub_api.create_topic(&pubsub_topic).await?;
+                    let sa = ctx.api.get_project_service_account(proj).await?;
+                    if let Some(email) = sa.email_address.as_deref() {
+                        pubsub_api.authorize_publisher(&pubsub_topic, email).await?;
+                    }
+                }
+            }
             let opts = CreateNotificationOptions {
                 pubsub_topic,
                 payload_format,

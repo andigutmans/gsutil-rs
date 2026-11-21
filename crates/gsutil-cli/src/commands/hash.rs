@@ -134,28 +134,32 @@ pub async fn run(ctx: &mut CommandContext, sub_opts: &[OptPair], args: &[String]
                 {
                     matched_one = true;
                     let obj_name = obj_url.object_name().unwrap_or("");
-                    let md5_present = meta.md5_hash.is_some();
-                    let crc_present = meta.crc32c.is_some();
-                    if !md5_present && !crc_present {
+                    let show_md5 = calc_md5 && meta.md5_hash.is_some();
+                    let show_crc = calc_crc32c && meta.crc32c.is_some();
+                    if !show_md5 && !show_crc {
                         ctx.warn(&format!("No hashes present for {url_str}"));
                         continue;
                     }
                     ctx.println(&format!("Hashes [{output_format}] for {obj_name}:"))?;
-                    if let Some(ref md5) = meta.md5_hash {
-                        let val = if hex_output {
-                            base64_to_hex_hash(md5)?
-                        } else {
-                            md5.clone()
-                        };
-                        ctx.println(&format!("\tHash (md5):\t\t{val}"))?;
+                    if show_md5 {
+                        if let Some(ref md5) = meta.md5_hash {
+                            let val = if hex_output {
+                                base64_to_hex_hash(md5)?
+                            } else {
+                                md5.clone()
+                            };
+                            ctx.println(&format!("\tHash (md5):\t\t{val}"))?;
+                        }
                     }
-                    if let Some(ref crc) = meta.crc32c {
-                        let val = if hex_output {
-                            base64_to_hex_hash(crc)?
-                        } else {
-                            crc.clone()
-                        };
-                        ctx.println(&format!("\tHash (crc32c):\t\t{val}"))?;
+                    if show_crc {
+                        if let Some(ref crc) = meta.crc32c {
+                            let val = if hex_output {
+                                base64_to_hex_hash(crc)?
+                            } else {
+                                crc.clone()
+                            };
+                            ctx.println(&format!("\tHash (crc32c):\t\t{val}"))?;
+                        }
                     }
                 }
             }

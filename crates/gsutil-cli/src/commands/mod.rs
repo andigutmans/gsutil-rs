@@ -96,19 +96,60 @@ pub async fn execute(
         "version" => version::run(ctx, sub_opts, args).await,
         cmd if gsutil_admin::is_admin_command(cmd) => {
             let api = ctx.api().await?;
-            let mut stdout = std::io::stdout();
-            let mut stderr = std::io::stderr();
-            let mut admin_ctx = gsutil_admin::AdminContext {
-                api: api.as_ref(),
-                config: &ctx.config,
-                project_id: ctx.config.default_project_id().map(ToString::to_string),
-                parallel_operations: ctx.global.parallel_operations,
-                out: &mut stdout,
-                err: &mut stderr,
+            let kms_api = ctx.kms_api.clone();
+            let pubsub_api = ctx.pubsub_api.clone();
+            let mut stdout_vec: Vec<u8> = Vec::new();
+            let mut stderr_vec: Vec<u8> = Vec::new();
+            let capturing = ctx.stdout_capture.is_some();
+            let res = if capturing {
+                let mut admin_ctx = gsutil_admin::AdminContext {
+                    api: api.as_ref(),
+                    config: &ctx.config,
+                    project_id: ctx.config.default_project_id().map(ToString::to_string),
+                    parallel_operations: ctx.global.parallel_operations,
+                    quiet: ctx.global.quiet,
+                    debug_level: ctx.global.debug_level,
+                    headers: ctx.global.headers.clone(),
+                    kms_api: kms_api.as_deref(),
+                    pubsub_api: pubsub_api.as_deref(),
+                    confirm_fn: None,
+                    out: &mut stdout_vec,
+                    err: &mut stderr_vec,
+                };
+                gsutil_admin::dispatch_admin_command(cmd, &mut admin_ctx, args).await
+            } else {
+                let mut stdout = std::io::stdout();
+                let mut stderr = std::io::stderr();
+                let mut admin_ctx = gsutil_admin::AdminContext {
+                    api: api.as_ref(),
+                    config: &ctx.config,
+                    project_id: ctx.config.default_project_id().map(ToString::to_string),
+                    parallel_operations: ctx.global.parallel_operations,
+                    quiet: ctx.global.quiet,
+                    debug_level: ctx.global.debug_level,
+                    headers: ctx.global.headers.clone(),
+                    kms_api: kms_api.as_deref(),
+                    pubsub_api: pubsub_api.as_deref(),
+                    confirm_fn: None,
+                    out: &mut stdout,
+                    err: &mut stderr,
+                };
+                gsutil_admin::dispatch_admin_command(cmd, &mut admin_ctx, args).await
             };
-            if let Some(res) = gsutil_admin::dispatch_admin_command(cmd, &mut admin_ctx, args).await
-            {
-                res?;
+            if capturing {
+                if !stdout_vec.is_empty() {
+                    let _ = ctx.write_stdout(&stdout_vec);
+                }
+                if !stderr_vec.is_empty() {
+                    if let Some(ref buf) = ctx.stderr_capture {
+                        if let Ok(mut g) = buf.lock() {
+                            g.extend_from_slice(&stderr_vec);
+                        }
+                    }
+                }
+            }
+            if let Some(r) = res {
+                r?;
                 Ok(0)
             } else {
                 stubs::run_stub(ctx, spec, sub_opts, args).await

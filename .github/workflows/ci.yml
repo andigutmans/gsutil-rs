@@ -25,3 +25,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run unit & integration tests
         run: cargo test --workspace
+      - name: Build gsutil CLI binary
+        run: cargo build -p gsutil-cli
+      - name: Run differential parity (offline)
+        run: cargo run -p gsutil-parity -- --mode offline
+      - name: Run differential parity (mock GCS)
+        run: cargo run -p gsutil-parity -- --mode mock

@@ -7,7 +7,7 @@
 //!   `-u`, `-U`, `-x` (regex exclusion), `-a`, `-j`, `-m`
 
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -277,7 +277,8 @@ pub async fn run_rsync(
                             if let (Some(b), Some(o)) =
                                 (c.bucket_name.as_deref(), c.object_name.as_deref())
                             {
-                                api.delete_object(b, o, c.generation.as_deref(), None)
+                                api.for_provider(c.scheme.as_str())?
+                                    .delete_object(b, o, c.generation.as_deref(), None)
                                     .await?;
                             }
                         }
@@ -318,7 +319,8 @@ pub async fn run_rsync(
                                     metadata: Some(meta_map),
                                     ..Default::default()
                                 };
-                                api.patch_object_metadata(b, o, &patch, None, None, None, None)
+                                api.for_provider(c.scheme.as_str())?
+                                    .patch_object_metadata(b, o, &patch, None, None, None, None)
                                     .await?;
                             }
                         }
@@ -630,7 +632,11 @@ fn list_local_tree(
         return Ok(Vec::new());
     }
     let mut entries = Vec::new();
-    walk_local_rsync(root, root, cfg, exclude_re, &mut entries)?;
+    let mut visited = HashSet::new();
+    if let Ok(canon) = fs::canonicalize(root) {
+        visited.insert(canon);
+    }
+    walk_local_rsync(root, root, cfg, exclude_re, &mut visited, &mut entries)?;
     Ok(entries)
 }
 
@@ -639,6 +645,7 @@ fn walk_local_rsync(
     dir: &Path,
     cfg: &RsyncConfig,
     exclude_re: Option<&Regex>,
+    visited_dirs: &mut HashSet<PathBuf>,
     out: &mut Vec<RsyncEntry>,
 ) -> Result<()> {
     for entry in fs::read_dir(dir)? {
@@ -661,8 +668,17 @@ fn walk_local_rsync(
         };
 
         if meta.is_dir() {
+            // Python gsutil rsync skips symlinks pointing to directories.
+            if sym_meta.file_type().is_symlink() {
+                continue;
+            }
             if cfg.recursive {
-                walk_local_rsync(root, &path, cfg, exclude_re, out)?;
+                if let Ok(canon) = fs::canonicalize(&path) {
+                    if !visited_dirs.insert(canon) {
+                        continue;
+                    }
+                }
+                walk_local_rsync(root, &path, cfg, exclude_re, visited_dirs, out)?;
             }
             continue;
         }
@@ -726,6 +742,7 @@ async fn list_cloud_tree(
     };
 
     let listed = api
+        .for_provider(scheme)?
         .list_objects(
             bucket,
             &ListObjectsOptions {
