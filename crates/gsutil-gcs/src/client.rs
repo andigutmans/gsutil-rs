@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use bytes::Bytes;
 use chrono::Utc;
 use futures::StreamExt;
@@ -84,6 +86,9 @@ pub struct GcsJsonClientConfig {
     pub retry_policy: RetryPolicy,
     /// Debug verbosity level (`0` = off, `2` = `-d`/`-D` headers, `3` = `-DD` headers + body).
     pub debug_level: u8,
+    /// Configured CSEK keys from `.boto` (`[GSUtil] encryption_key` and `decryption_key1..100`)
+    /// stored as `(key_b64, key_sha256_b64)` pairs for transparent metadata/hash decryption.
+    pub csek_keys: Vec<(String, String)>,
 }
 
 impl GcsJsonClientConfig {
@@ -93,11 +98,12 @@ impl GcsJsonClientConfig {
         let gs_json_host = config
             .get("Credentials", "gs_json_host")
             .filter(|s| !s.is_empty());
+        let explicit_boto_mtls = config.get_bool("Credentials", "use_client_certificate", false);
         let use_mtls = is_mtls_enabled(config);
         let has_client_identity = resolve_client_identity_pem(config).is_some();
 
-        let host_base = if use_mtls {
-            if let Some(custom) = gs_json_host {
+        let host_base = if let Some(custom) = gs_json_host {
+            if explicit_boto_mtls {
                 return Err(GsutilError::argument(format!(
                     "\"use_client_certificate\" is enabled, which sets gsutil to use the \
                      host {MTLS_GCS_HOST}. However, a custom host was set using \
@@ -105,6 +111,8 @@ impl GcsJsonClientConfig {
                      \"False\" or comment out the \"gs_json_host\" line in the Boto config."
                 )));
             }
+            custom
+        } else if use_mtls {
             if has_client_identity {
                 MTLS_GCS_HOST
             } else {
@@ -115,7 +123,7 @@ impl GcsJsonClientConfig {
                 DEFAULT_GCS_HOST
             }
         } else {
-            gs_json_host.unwrap_or(DEFAULT_GCS_HOST)
+            DEFAULT_GCS_HOST
         };
 
         if gs_json_host.is_none() {
@@ -190,6 +198,7 @@ impl GcsJsonClientConfig {
             resumable_chunk_size: chunk_size,
             retry_policy: RetryPolicy::from_config(config),
             debug_level: 0,
+            csek_keys: load_csek_keys_from_boto(config),
         })
     }
 
@@ -209,6 +218,7 @@ impl GcsJsonClientConfig {
             resumable_chunk_size: RESUMABLE_CHUNK_QUANTUM as usize,
             retry_policy: RetryPolicy::fast_for_tests(3),
             debug_level: 0,
+            csek_keys: Vec::new(),
         }
     }
 }
@@ -855,7 +865,34 @@ impl CloudApi for GcsJsonClient {
                 .await?;
 
             // gsutil ls depends on yielding objects before prefixes.
-            for obj in page.items {
+            let needs_hash_decrypt = fields_request_hashes(fields_slice);
+            for mut obj in page.items {
+                if needs_hash_decrypt {
+                    if let Some(ref ce) = obj.customer_encryption {
+                        if obj.crc32c.is_none() && obj.md5_hash.is_none() {
+                            if let (Some(ref key_sha256), Some(ref obj_name)) =
+                                (&ce.key_sha256, &obj.name)
+                            {
+                                if let Some(dec_key) = self.find_matching_csek(key_sha256) {
+                                    match self
+                                        .get_object_metadata_with_key(
+                                            bucket_name,
+                                            obj_name,
+                                            obj.generation.as_deref(),
+                                            None,
+                                            Some(&dec_key),
+                                        )
+                                        .await
+                                    {
+                                        Ok(decrypted) => obj = decrypted,
+                                        Err(e) if e.is_not_found() => continue,
+                                        Err(_) => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 results.push(CsObjectOrPrefix::Object(Box::new(obj)));
             }
             for prefix in page.prefixes {
@@ -878,25 +915,49 @@ impl CloudApi for GcsJsonClient {
         generation: Option<&str>,
         fields: Option<&[String]>,
     ) -> Result<Object> {
-        let url = format!(
-            "{}/b/{}/o/{}",
-            self.config.storage_base_url,
-            encode_path_segment(bucket_name),
-            encode_path_segment(object_name)
-        );
-        let mut query = vec![(
-            "projection".to_string(),
-            projection_for_fields(fields).to_string(),
-        )];
-        if let Some(gen) = generation {
-            query.push(("generation".to_string(), gen.to_string()));
-        }
-        add_user_project(&mut query, self.effective_user_project());
-        add_fields_param(&mut query, fields, false);
+        let obj = self
+            .get_object_metadata_with_key(bucket_name, object_name, generation, fields, None)
+            .await?;
 
-        let ctx = ErrorContext::object(bucket_name, object_name, generation);
-        self.send_json_request(Method::GET, &url, &query, None, None, &ctx)
-            .await
+        let obj = if let Some(ref ce) = obj.customer_encryption {
+            let need_hashes =
+                obj.crc32c.is_none() && obj.md5_hash.is_none() && fields_request_hashes(fields);
+            if need_hashes {
+                if let Some(ref key_sha256) = ce.key_sha256 {
+                    if let Some(dec_key) = self.find_matching_csek(key_sha256) {
+                        self.get_object_metadata_with_key(
+                            bucket_name,
+                            object_name,
+                            generation,
+                            fields,
+                            Some(&dec_key),
+                        )
+                        .await?
+                    } else if fields.is_some() {
+                        return Err(GsutilError::Encryption(format!(
+                            "Missing decryption key with SHA256 hash {key_sha256}. \
+                             No decryption key matches object gs://{bucket_name}/{object_name}"
+                        )));
+                    } else {
+                        obj
+                    }
+                } else {
+                    obj
+                }
+            } else {
+                obj
+            }
+        } else {
+            obj
+        };
+
+        if self.config.debug_level >= 2 {
+            if let Some(ref md5) = obj.md5_hash {
+                eprintln!("md5Hash: '{md5}'");
+            }
+        }
+
+        Ok(obj)
     }
 
     async fn patch_object_metadata(
@@ -1023,47 +1084,80 @@ impl CloudApi for GcsJsonClient {
 
         let ctx = ErrorContext::object(bucket_name, object_name, options.generation.as_deref());
 
-        let do_fetch = || async {
-            let req = self
-                .prepare_request_with_client(
-                    &self.media_http,
-                    Method::GET,
-                    &url,
-                    &query,
-                    Some(&extra),
-                )
-                .await?;
-            let resp = req.send().await.map_err(reqwest_to_service_error)?;
-            let status = resp.status().as_u16();
-            if self.config.debug_level >= 2 {
-                log_wire_response(status, resp.headers());
-            }
-            let www_auth = resp
-                .headers()
-                .get("www-authenticate")
-                .and_then(|v| v.to_str().ok())
-                .map(ToString::to_string);
-            if (200..300).contains(&status) {
-                resp.bytes().await.map_err(reqwest_to_service_error)
-            } else {
-                let text = resp.text().await.unwrap_or_default();
-                Err(translate_http_error(
-                    status,
-                    &text,
-                    www_auth.as_deref(),
-                    &ctx,
-                ))
+        let do_fetch = |extra_hdrs: HeaderMap| {
+            let url = url.clone();
+            let query = query.clone();
+            let ctx = ctx.clone();
+            async move {
+                let req = self
+                    .prepare_request_with_client(
+                        &self.media_http,
+                        Method::GET,
+                        &url,
+                        &query,
+                        Some(&extra_hdrs),
+                    )
+                    .await?;
+                let resp = req.send().await.map_err(reqwest_to_service_error)?;
+                let status = resp.status().as_u16();
+                if self.config.debug_level >= 2 {
+                    log_wire_response(status, resp.headers());
+                }
+                let www_auth = resp
+                    .headers()
+                    .get("www-authenticate")
+                    .and_then(|v| v.to_str().ok())
+                    .map(ToString::to_string);
+                if (200..300).contains(&status) {
+                    resp.bytes().await.map_err(reqwest_to_service_error)
+                } else {
+                    let text = resp.text().await.unwrap_or_default();
+                    Err(translate_http_error(
+                        status,
+                        &text,
+                        www_auth.as_deref(),
+                        &ctx,
+                    ))
+                }
             }
         };
 
-        match options.strategy {
+        let first_result = match options.strategy {
             DownloadStrategy::Resumable => {
                 self.config
                     .retry_policy
-                    .execute(do_fetch, is_retryable_gsutil_error)
+                    .execute(|| do_fetch(extra.clone()), is_retryable_gsutil_error)
                     .await
             }
-            DownloadStrategy::OneShot => do_fetch().await,
+            DownloadStrategy::OneShot => do_fetch(extra.clone()).await,
+        };
+
+        match first_result {
+            Ok(bytes) => Ok(bytes),
+            Err(err) if is_csek_required_error(&err) => {
+                let dec_key = self
+                    .resolve_csek_for_object(
+                        bucket_name,
+                        object_name,
+                        options.generation.as_deref(),
+                    )
+                    .await?;
+                if options.decryption_key.as_ref() == Some(&dec_key) {
+                    return Err(err);
+                }
+                let mut retry_extra = extra;
+                apply_encryption_headers(&mut retry_extra, Some(&dec_key));
+                match options.strategy {
+                    DownloadStrategy::Resumable => {
+                        self.config
+                            .retry_policy
+                            .execute(|| do_fetch(retry_extra.clone()), is_retryable_gsutil_error)
+                            .await
+                    }
+                    DownloadStrategy::OneShot => do_fetch(retry_extra).await,
+                }
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -1101,47 +1195,80 @@ impl CloudApi for GcsJsonClient {
 
         let ctx = ErrorContext::object(bucket_name, object_name, options.generation.as_deref());
 
-        let do_open = || async {
-            let req = self
-                .prepare_request_with_client(
-                    &self.media_http,
-                    Method::GET,
-                    &url,
-                    &query,
-                    Some(&extra),
-                )
-                .await?;
-            let resp = req.send().await.map_err(reqwest_to_service_error)?;
-            let status = resp.status().as_u16();
-            if self.config.debug_level >= 2 {
-                log_wire_response(status, resp.headers());
-            }
-            if (200..300).contains(&status) {
-                Ok(resp)
-            } else {
-                let www_auth = resp
-                    .headers()
-                    .get("www-authenticate")
-                    .and_then(|v| v.to_str().ok())
-                    .map(ToString::to_string);
-                let text = resp.text().await.unwrap_or_default();
-                Err(translate_http_error(
-                    status,
-                    &text,
-                    www_auth.as_deref(),
-                    &ctx,
-                ))
+        let do_open = |extra_hdrs: HeaderMap| {
+            let url = url.clone();
+            let query = query.clone();
+            let ctx = ctx.clone();
+            async move {
+                let req = self
+                    .prepare_request_with_client(
+                        &self.media_http,
+                        Method::GET,
+                        &url,
+                        &query,
+                        Some(&extra_hdrs),
+                    )
+                    .await?;
+                let resp = req.send().await.map_err(reqwest_to_service_error)?;
+                let status = resp.status().as_u16();
+                if self.config.debug_level >= 2 {
+                    log_wire_response(status, resp.headers());
+                }
+                if (200..300).contains(&status) {
+                    Ok(resp)
+                } else {
+                    let www_auth = resp
+                        .headers()
+                        .get("www-authenticate")
+                        .and_then(|v| v.to_str().ok())
+                        .map(ToString::to_string);
+                    let text = resp.text().await.unwrap_or_default();
+                    Err(translate_http_error(
+                        status,
+                        &text,
+                        www_auth.as_deref(),
+                        &ctx,
+                    ))
+                }
             }
         };
 
-        let resp = match options.strategy {
+        let first_resp = match options.strategy {
             DownloadStrategy::Resumable => {
                 self.config
                     .retry_policy
-                    .execute(do_open, is_retryable_gsutil_error)
-                    .await?
+                    .execute(|| do_open(extra.clone()), is_retryable_gsutil_error)
+                    .await
             }
-            DownloadStrategy::OneShot => do_open().await?,
+            DownloadStrategy::OneShot => do_open(extra.clone()).await,
+        };
+
+        let resp = match first_resp {
+            Ok(r) => r,
+            Err(err) if is_csek_required_error(&err) => {
+                let dec_key = self
+                    .resolve_csek_for_object(
+                        bucket_name,
+                        object_name,
+                        options.generation.as_deref(),
+                    )
+                    .await?;
+                if options.decryption_key.as_ref() == Some(&dec_key) {
+                    return Err(err);
+                }
+                let mut retry_extra = extra;
+                apply_encryption_headers(&mut retry_extra, Some(&dec_key));
+                match options.strategy {
+                    DownloadStrategy::Resumable => {
+                        self.config
+                            .retry_policy
+                            .execute(|| do_open(retry_extra.clone()), is_retryable_gsutil_error)
+                            .await?
+                    }
+                    DownloadStrategy::OneShot => do_open(retry_extra).await?,
+                }
+            }
+            Err(err) => return Err(err),
         };
 
         let total_hint = resp.content_length();
@@ -1241,6 +1368,9 @@ impl CloudApi for GcsJsonClient {
             )),
         };
 
+        if self.config.debug_level >= 2 {
+            eprintln!("send: multipart upload (media body omitted)");
+        }
         let text = self
             .config
             .retry_policy
@@ -1252,6 +1382,9 @@ impl CloudApi for GcsJsonClient {
                         .body(body_bytes.clone());
                     let resp = req.send().await.map_err(reqwest_to_service_error)?;
                     let status = resp.status().as_u16();
+                    if self.config.debug_level >= 2 {
+                        log_wire_response(status, resp.headers());
+                    }
                     let www_auth = resp
                         .headers()
                         .get("www-authenticate")
@@ -1916,10 +2049,36 @@ impl CloudApi for GcsJsonClient {
             dst_meta.kms_key_name = Some(kms_key_name.clone());
         }
 
+        // Resolve the best source decryption key: if `src_obj_metadata.customer_encryption`
+        // specifies a SHA256 hash, prefer the matching key from `.boto` `csek_keys` (or the
+        // caller's `options.decryption_key` if it matches) so key rotation (`encryption_key`
+        // != `decryption_key1`) automatically uses the right source key.
+        let mut effective_decryption_key = options.decryption_key.clone();
+        if let Some(sha) = src_obj_metadata
+            .customer_encryption
+            .as_ref()
+            .and_then(|ce| ce.key_sha256.as_deref())
+        {
+            let caller_matches = matches!(
+                effective_decryption_key.as_ref(),
+                Some(EncryptionKey::Csek { key_sha256_b64, .. }) if key_sha256_b64 == sha
+            );
+            if !caller_matches {
+                if let Some(matched) = self.find_matching_csek(sha) {
+                    effective_decryption_key = Some(matched);
+                } else {
+                    return Err(GsutilError::Encryption(format!(
+                        "Missing decryption key with SHA256 hash {sha}. \
+                         No decryption key matches object gs://{src_bucket}/{src_object}"
+                    )));
+                }
+            }
+        }
+
         let mut extra = HeaderMap::new();
         apply_rewrite_crypto_headers(
             &mut extra,
-            options.decryption_key.as_ref(),
+            effective_decryption_key.as_ref(),
             options.encryption_key.as_ref(),
         );
 
@@ -1944,6 +2103,7 @@ impl CloudApi for GcsJsonClient {
         };
 
         let mut rewrite_token: Option<String> = None;
+        let mut retried_csek = false;
         loop {
             let mut query = vec![(
                 "projection".to_string(),
@@ -1986,7 +2146,7 @@ impl CloudApi for GcsJsonClient {
                 query.push(("fields".to_string(), sorted.join(",")));
             }
 
-            let resp: RewriteResponse = self
+            let resp: RewriteResponse = match self
                 .send_json_request(
                     Method::POST,
                     &url,
@@ -1995,7 +2155,33 @@ impl CloudApi for GcsJsonClient {
                     Some(&extra),
                     &ctx,
                 )
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(err) if !retried_csek && is_csek_required_error(&err) => {
+                    retried_csek = true;
+                    let dec_key = self
+                        .resolve_csek_for_object(
+                            src_bucket,
+                            src_object,
+                            options.src_generation.as_deref(),
+                        )
+                        .await?;
+                    if effective_decryption_key.as_ref() == Some(&dec_key) {
+                        return Err(err);
+                    }
+                    effective_decryption_key = Some(dec_key);
+                    extra = HeaderMap::new();
+                    apply_rewrite_crypto_headers(
+                        &mut extra,
+                        effective_decryption_key.as_ref(),
+                        options.encryption_key.as_ref(),
+                    );
+                    rewrite_token = None;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
 
             if resp.done {
                 return resp.resource.ok_or_else(|| {
@@ -2438,6 +2624,76 @@ impl CloudApi for GcsJsonClient {
 }
 
 impl GcsJsonClient {
+    fn find_matching_csek(&self, key_sha256: &str) -> Option<EncryptionKey> {
+        self.config
+            .csek_keys
+            .iter()
+            .find(|(_, sha)| sha == key_sha256)
+            .map(|(key_b64, sha)| EncryptionKey::Csek {
+                key_b64: key_b64.clone(),
+                key_sha256_b64: sha.clone(),
+            })
+    }
+
+    async fn resolve_csek_for_object(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        generation: Option<&str>,
+    ) -> Result<EncryptionKey> {
+        let fields = vec!["customerEncryption".to_string()];
+        let meta = self
+            .get_object_metadata_with_key(bucket_name, object_name, generation, Some(&fields), None)
+            .await?;
+        let key_sha256 = meta
+            .customer_encryption
+            .and_then(|ce| ce.key_sha256)
+            .ok_or_else(|| {
+                GsutilError::Encryption(format!(
+                    "Object gs://{bucket_name}/{object_name} requires a decryption key."
+                ))
+            })?;
+        self.find_matching_csek(&key_sha256).ok_or_else(|| {
+            GsutilError::Encryption(format!(
+                "Missing decryption key with SHA256 hash {key_sha256}. \
+                 No decryption key matches object gs://{bucket_name}/{object_name}"
+            ))
+        })
+    }
+
+    async fn get_object_metadata_with_key(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        generation: Option<&str>,
+        fields: Option<&[String]>,
+        decryption_key: Option<&EncryptionKey>,
+    ) -> Result<Object> {
+        let url = format!(
+            "{}/b/{}/o/{}",
+            self.config.storage_base_url,
+            encode_path_segment(bucket_name),
+            encode_path_segment(object_name)
+        );
+        let mut query = vec![(
+            "projection".to_string(),
+            projection_for_fields(fields).to_string(),
+        )];
+        if let Some(gen) = generation {
+            query.push(("generation".to_string(), gen.to_string()));
+        }
+        add_user_project(&mut query, self.effective_user_project());
+        add_fields_param(&mut query, fields, false);
+
+        let mut extra = HeaderMap::new();
+        apply_encryption_headers(&mut extra, decryption_key);
+        let extra_opt = if extra.is_empty() { None } else { Some(&extra) };
+
+        let ctx = ErrorContext::object(bucket_name, object_name, generation);
+        self.send_json_request(Method::GET, &url, &query, None, extra_opt, &ctx)
+            .await
+    }
+
     fn rewrite_for_ecp(&self, uri: &str) -> String {
         match &self.ecp_proxy {
             Some(proxy) => proxy.rewrite_gcs_url(uri),
@@ -2767,6 +3023,44 @@ async fn read_exact_async<R: AsyncRead + Unpin>(
 // Helpers
 // ---------------------------------------------------------------------------
 
+fn fields_request_hashes(fields: Option<&[String]>) -> bool {
+    match fields {
+        None => true,
+        Some(list) => list.iter().any(|f| {
+            matches!(
+                f.as_str(),
+                "crc32c" | "md5Hash" | "items/crc32c" | "items/md5Hash"
+            )
+        }),
+    }
+}
+
+fn load_csek_keys_from_boto(config: &BotoConfig) -> Vec<(String, String)> {
+    let mut keys = Vec::new();
+    let mut try_push = |raw: &str| {
+        let trimmed = raw.trim();
+        if trimmed.len() == 44 {
+            if let Ok(decoded) = BASE64_STANDARD.decode(trimmed) {
+                if decoded.len() == 32 {
+                    let sha = BASE64_STANDARD.encode(Sha256::digest(&decoded));
+                    keys.push((trimmed.to_string(), sha));
+                }
+            }
+        }
+    };
+    if let Some(enc) = config.get("GSUtil", "encryption_key") {
+        try_push(enc);
+    }
+    for i in 1..=100 {
+        let key_name = format!("decryption_key{i}");
+        match config.get("GSUtil", &key_name) {
+            Some(v) => try_push(v),
+            None => break,
+        }
+    }
+    keys
+}
+
 fn projection_for_fields(fields: Option<&[String]>) -> &'static str {
     match fields {
         None => "full",
@@ -3042,6 +3336,18 @@ fn build_reqwest_client(boto_config: &BotoConfig, no_gzip: bool) -> Result<Clien
         .map_err(|e| GsutilError::command(format!("Failed to build GCS HTTP client: {e}")))
 }
 
+fn is_csek_required_error(err: &GsutilError) -> bool {
+    match err {
+        GsutilError::Service(se) if se.status == Some(400) => {
+            let lower = se.reason.to_ascii_lowercase();
+            lower.contains("customer-supplied encryption key")
+                || lower.contains("encryption key")
+                || lower.contains("encrypted")
+        }
+        _ => false,
+    }
+}
+
 /// Log an outgoing HTTP request to stderr for `-D` / `-DD` with sensitive headers redacted.
 pub(crate) fn log_wire_request(
     method: &Method,
@@ -3059,31 +3365,58 @@ pub(crate) fn log_wire_request(
             .join("&");
         eprintln!("send: {} {}?{}", method, url, q);
     }
+    let mut dict_entries = Vec::new();
     for (k, v) in headers {
         let lower = k.as_str().to_ascii_lowercase();
         let val = if matches!(
             lower.as_str(),
-            "authorization"
-                | "cookie"
-                | "x-goog-encryption-key"
-                | "x-goog-copy-source-encryption-key"
+            "authorization" | "x-goog-encryption-key" | "x-goog-copy-source-encryption-key"
         ) {
             "REDACTED"
         } else {
             v.to_str().unwrap_or("<binary>")
         };
-        eprintln!("send header: {}: {}", k.as_str(), val);
+        dict_entries.push(format!("'{}': '{}'", lower, val));
     }
+    eprintln!("Headers: {{{}}}", dict_entries.join(", "));
 }
 
 /// Log an incoming HTTP response status & headers to stderr for `-D` / `-DD`.
 pub(crate) fn log_wire_response(status: u16, headers: &HeaderMap) {
-    eprintln!("reply: HTTP/1.1 {status}");
+    let reason = reqwest::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|s| s.canonical_reason())
+        .unwrap_or("");
+    eprintln!("reply: 'HTTP/1.1 {status} {reason}\\r\\n'");
     for (k, v) in headers {
+        let display_name = canonical_header_name(k.as_str());
         eprintln!(
-            "header: {}: {}",
-            k.as_str(),
+            "header: {display_name}: {}",
             v.to_str().unwrap_or("<binary>")
         );
+    }
+}
+
+fn canonical_header_name(lower: &str) -> String {
+    match lower {
+        "etag" => "ETag".to_string(),
+        "content-type" => "Content-Type".to_string(),
+        "content-length" => "Content-Length".to_string(),
+        "cache-control" => "Cache-Control".to_string(),
+        "last-modified" => "Last-Modified".to_string(),
+        "date" => "Date".to_string(),
+        "expires" => "Expires".to_string(),
+        other if other.starts_with("x-goog-") || other.starts_with("x-amz-") => other.to_string(),
+        other => other
+            .split('-')
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("-"),
     }
 }

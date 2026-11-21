@@ -167,7 +167,7 @@ pub async fn run(ctx: &mut CommandContext, sub_opts: &[OptPair], args: &[String]
                 let trimmed = a.trim();
                 if trimmed != "ASYNC_TURBO" && trimmed != "DEFAULT" {
                     return Err(GsutilError::command(format!(
-                        "Invalid value for --rpo. Must be one of: ASYNC_TURBO|DEFAULT, provided: {a}"
+                        "Invalid value for --rpo. Must be one of: (ASYNC_TURBO|DEFAULT), provided: {a}"
                     )));
                 }
                 rpo = Some(trimmed.to_string());

@@ -49,6 +49,13 @@ fn parse_iam_spec(spec: &str, is_delete: bool) -> Result<IamGrantSpec> {
         }
         "user" | "serviceAccount" | "group" | "domain" | "projectOwner" | "projectEditor"
         | "projectViewer" => {
+            if !is_delete && matches!(parts[0], "projectOwner" | "projectEditor" | "projectViewer")
+            {
+                return Err(GsutilError::command(format!(
+                    "Granting {} bindings is not supported by iam ch.",
+                    parts[0]
+                )));
+            }
             if parts.len() < 2 {
                 return Err(GsutilError::command(format!(
                     "Invalid IAM member \"{spec}\": missing identifier."
@@ -149,6 +156,11 @@ pub async fn run_iam(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
     match args[0].as_str() {
         "get" => {
             let urls = expand_cloud_urls(ctx, &args[1..], false, false).await?;
+            if urls.len() != 1 {
+                return Err(GsutilError::command(
+                    "The iam get command must match a single cloud resource.",
+                ));
+            }
             let iam_fields = ["bindings".to_string(), "etag".to_string()];
             for u in urls {
                 let bname = u.bucket_name.as_deref().unwrap_or("");
@@ -192,21 +204,32 @@ pub async fn run_iam(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
             let mut positional = Vec::new();
             let mut i = 1;
             while i < args.len() {
-                match args[i].as_str() {
-                    "-r" | "-R" => recursive = true,
-                    "-a" => all_versions = true,
-                    "-f" => continue_on_error = true,
-                    "-e" => {
-                        i += 1;
-                        etag_override = Some(
-                            args.get(i)
-                                .ok_or_else(|| {
-                                    GsutilError::command("Option -e requires an etag value.")
-                                })?
-                                .clone(),
-                        );
+                let arg = args[i].as_str();
+                if arg == "-e" {
+                    i += 1;
+                    etag_override = Some(
+                        args.get(i)
+                            .ok_or_else(|| {
+                                GsutilError::command("Option -e requires an etag value.")
+                            })?
+                            .clone(),
+                    );
+                } else if arg.starts_with('-')
+                    && arg.len() > 1
+                    && arg[1..]
+                        .bytes()
+                        .all(|b| matches!(b, b'r' | b'R' | b'a' | b'f'))
+                {
+                    for ch in arg[1..].chars() {
+                        match ch {
+                            'r' | 'R' => recursive = true,
+                            'a' => all_versions = true,
+                            'f' => continue_on_error = true,
+                            _ => {}
+                        }
                     }
-                    other => positional.push(other.to_string()),
+                } else {
+                    positional.push(arg.to_string());
                 }
                 i += 1;
             }
@@ -215,9 +238,10 @@ pub async fn run_iam(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
                     "iam set requires <policy-file> and at least one URL.",
                 ));
             }
-            let raw = read_json_arg(&positional[0])?;
+            let raw =
+                read_json_arg(&positional[0]).map_err(|e| GsutilError::argument(e.to_string()))?;
             let mut policy: IamPolicy = serde_json::from_str(&raw).map_err(|e| {
-                GsutilError::command(format!(
+                GsutilError::argument(format!(
                     "Invalid IAM policy JSON in \"{}\": {e}",
                     positional[0]
                 ))
@@ -227,6 +251,14 @@ pub async fn run_iam(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
             }
 
             let urls = expand_cloud_urls(ctx, &positional[1..], recursive, all_versions).await?;
+            let has_bucket = urls.iter().any(|u| u.is_bucket());
+            let has_object = urls.iter().any(|u| u.is_object());
+            if has_bucket && has_object {
+                return Err(GsutilError::command(
+                    "Cannot mix bucket and object URLs in iam set.",
+                ));
+            }
+            ctx.maybe_report_seek_ahead(urls.len())?;
             let mut failed = false;
             for u in urls {
                 let bname = u.bucket_name.as_deref().unwrap_or("");
@@ -270,12 +302,22 @@ pub async fn run_iam(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
                     "-d" => {
                         i += 1;
                         let s = args.get(i).ok_or_else(|| {
-                            GsutilError::command("Option -d requires an IAM binding spec.")
+                            GsutilError::command(
+                                "A -d flag is missing an argument specifying bindings to remove.",
+                            )
                         })?;
+                        if s.starts_with("gs://") || s.starts_with("s3://") || s.starts_with('-') {
+                            return Err(GsutilError::command(
+                                "A -d flag is missing an argument specifying bindings to remove.",
+                            ));
+                        }
                         specs.push(parse_iam_spec(s, true)?);
                     }
                     other => {
-                        if other.starts_with("gs://") || other.starts_with("s3://") {
+                        if !url_args.is_empty()
+                            || other.starts_with("gs://")
+                            || other.starts_with("s3://")
+                        {
                             url_args.push(other.to_string());
                         } else {
                             specs.push(parse_iam_spec(other, false)?);
@@ -289,35 +331,65 @@ pub async fn run_iam(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
                     "iam ch requires at least one binding change.",
                 ));
             }
-            let urls = expand_cloud_urls(ctx, &url_args, recursive, false).await?;
-            let mut failed = false;
-            for u in urls {
-                let bname = u.bucket_name.as_deref().unwrap_or("");
-                let res: Result<()> = async {
-                    let mut policy = if let Some(oname) = u.object_name.as_deref() {
-                        ctx.api
-                            .get_object_iam_policy(bname, oname, u.generation.as_deref(), None)
-                            .await?
-                    } else {
-                        ctx.api.get_bucket_iam_policy(bname, None).await?
-                    };
-                    apply_iam_changes(&mut policy, &specs, &u.url_string())?;
-                    if let Some(oname) = u.object_name.as_deref() {
-                        ctx.api
-                            .set_object_iam_policy(bname, oname, &policy, u.generation.as_deref())
-                            .await?;
-                    } else {
-                        ctx.api.set_bucket_iam_policy(bname, &policy).await?;
+            if url_args.is_empty() {
+                return Err(GsutilError::command("Expected at least one URL argument."));
+            }
+            let mut has_bucket = false;
+            let mut has_object = false;
+            for raw in &url_args {
+                if let Ok(gsutil_core::url::StorageUrl::Cloud(c)) =
+                    gsutil_core::url::StorageUrl::parse(raw)
+                {
+                    if c.is_bucket() && !recursive {
+                        has_bucket = true;
+                    } else if c.is_object() || recursive {
+                        has_object = true;
                     }
-                    Ok(())
                 }
-                .await;
-                if let Err(e) = res {
-                    if continue_on_error {
-                        writeln!(ctx.err, "{e}")?;
-                        failed = true;
-                    } else {
-                        return Err(e);
+            }
+            if has_bucket && has_object {
+                return Err(GsutilError::command(
+                    "Cannot mix bucket and object URLs in iam ch.",
+                ));
+            }
+            let mut failed = false;
+            for raw in &url_args {
+                let urls =
+                    expand_cloud_urls(ctx, std::slice::from_ref(raw), recursive, false).await?;
+                ctx.maybe_report_seek_ahead(urls.len())?;
+                for u in urls {
+                    let bname = u.bucket_name.as_deref().unwrap_or("");
+                    let res: Result<()> = async {
+                        let mut policy = if let Some(oname) = u.object_name.as_deref() {
+                            ctx.api
+                                .get_object_iam_policy(bname, oname, u.generation.as_deref(), None)
+                                .await?
+                        } else {
+                            ctx.api.get_bucket_iam_policy(bname, None).await?
+                        };
+                        apply_iam_changes(&mut policy, &specs, &u.url_string())?;
+                        if let Some(oname) = u.object_name.as_deref() {
+                            ctx.api
+                                .set_object_iam_policy(
+                                    bname,
+                                    oname,
+                                    &policy,
+                                    u.generation.as_deref(),
+                                )
+                                .await?;
+                        } else {
+                            ctx.api.set_bucket_iam_policy(bname, &policy).await?;
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    if let Err(e) = res {
+                        if continue_on_error {
+                            writeln!(ctx.err, "{e}")?;
+                            failed = true;
+                        } else {
+                            return Err(e);
+                        }
                     }
                 }
             }

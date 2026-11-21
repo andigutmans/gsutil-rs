@@ -201,7 +201,7 @@ pub async fn run_signurl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
     let mut method = "GET".to_string();
     let mut duration_secs: u64 = 3600; // default 1h
     let mut content_type: Option<String> = None;
-    let mut region = "auto".to_string();
+    let mut region: Option<String> = None;
     let mut billing_project: Option<String> = None;
     let mut use_iam_sign = false;
     let mut version: u8 = 4;
@@ -235,10 +235,11 @@ pub async fn run_signurl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
             }
             "-r" => {
                 i += 1;
-                region = args
-                    .get(i)
-                    .ok_or_else(|| GsutilError::command("Option -r requires a region."))?
-                    .clone();
+                region = Some(
+                    args.get(i)
+                        .ok_or_else(|| GsutilError::command("Option -r requires a region."))?
+                        .clone(),
+                );
             }
             "-b" => {
                 i += 1;
@@ -250,7 +251,7 @@ pub async fn run_signurl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
                         .clone(),
                 );
             }
-            "-u" => use_iam_sign = true,
+            "-u" | "--use-service-account" => use_iam_sign = true,
             "-v" => {
                 i += 1;
                 let v = args
@@ -278,6 +279,32 @@ pub async fn run_signurl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
         i += 1;
     }
 
+    if use_iam_sign && billing_project.is_some() {
+        return Err(GsutilError::command(
+            "Specifying both the -b and --use-service-account options is not allowed.",
+        ));
+    }
+
+    if !matches!(
+        method.as_str(),
+        "GET" | "PUT" | "POST" | "DELETE" | "HEAD" | "RESUMABLE"
+    ) {
+        return Err(GsutilError::command(
+            "HTTP method must be one of [GET, HEAD, PUT, DELETE, POST, RESUMABLE].",
+        ));
+    }
+
+    if use_iam_sign && duration_secs > 12 * 3600 {
+        return Err(GsutilError::command(
+            "Max valid duration allowed is 12:00:00.",
+        ));
+    }
+    if version == 4 && duration_secs > MAX_V4_DURATION_SECS {
+        return Err(GsutilError::command(
+            "Max valid duration allowed is 7 days.",
+        ));
+    }
+
     let is_resumable = method == "RESUMABLE";
     let http_method = if is_resumable {
         "POST".to_string()
@@ -288,18 +315,27 @@ pub async fn run_signurl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
     let (key_file_opt, url_args) = if use_iam_sign {
         if positional.is_empty() {
             return Err(GsutilError::command(
-                "signurl -u requires at least one gs:// URL.",
+                "The command requires one or more URL arguments.",
             ));
         }
         (None, positional.as_slice())
     } else {
         if positional.len() < 2 {
             return Err(GsutilError::command(
-                "signurl requires a private key file and at least one gs:// URL.",
+                "The command requires a key file argument and one or more URL arguments.",
             ));
         }
         (Some(positional[0].as_str()), &positional[1..])
     };
+
+    // Validate all URLs are gs:// before reading key files or signing.
+    for raw in url_args {
+        if !raw.starts_with("gs://") {
+            return Err(GsutilError::command(format!(
+                "Can only create signed urls from gs:// urls, got: {raw}"
+            )));
+        }
+    }
 
     let loaded_key = if let Some(key_path) = key_file_opt {
         if key_path.to_ascii_lowercase().ends_with(".p12") {
@@ -326,6 +362,11 @@ pub async fn run_signurl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
     };
 
     let urls = expand_cloud_urls(ctx, url_args, false, false).await?;
+    if is_resumable && urls.iter().any(|u| u.is_bucket()) {
+        return Err(GsutilError::command(
+            "Resumable signed URLs require an object name.",
+        ));
+    }
     let now = Utc::now();
     let expiration_str = (now + Duration::seconds(duration_secs as i64))
         .format("%Y-%m-%d %H:%M:%S")
@@ -349,6 +390,37 @@ pub async fn run_signurl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
             signed_headers.insert("x-goog-resumable".to_string(), "start".to_string());
         }
 
+        let effective_region = match region.as_deref() {
+            Some(r) => r.to_ascii_lowercase(),
+            None => {
+                if u.is_bucket() {
+                    match ctx
+                        .api
+                        .get_bucket(bname, Some(&["location".to_string()]))
+                        .await
+                    {
+                        Ok(meta) => meta
+                            .location
+                            .map(|l| l.to_ascii_lowercase())
+                            .unwrap_or_else(|| "auto".to_string()),
+                        Err(_) => {
+                            return Err(GsutilError::command(
+                                "Generating signed URLs for creating buckets requires a region be specified via the -r option.",
+                            ));
+                        }
+                    }
+                } else {
+                    ctx.api
+                        .get_bucket(bname, Some(&["location".to_string()]))
+                        .await
+                        .ok()
+                        .and_then(|meta| meta.location)
+                        .map(|l| l.to_ascii_lowercase())
+                        .unwrap_or_else(|| "auto".to_string())
+                }
+            }
+        };
+
         let signed_url = if let Some((ref client_email, ref rsa_key)) = loaded_key {
             if version == 2 {
                 sign_url_v2(
@@ -371,7 +443,7 @@ pub async fn run_signurl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
                     DEFAULT_HOST,
                     &path,
                     u.generation.as_deref(),
-                    &region,
+                    &effective_region,
                     &signed_headers,
                     billing_project.as_deref(),
                     now,
@@ -384,7 +456,7 @@ pub async fn run_signurl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
                     duration_secs,
                     path: path.clone(),
                     generation: u.generation.clone(),
-                    region: Some(region.clone()),
+                    region: Some(effective_region),
                     signed_headers,
                 })
                 .await?

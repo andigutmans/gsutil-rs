@@ -246,6 +246,27 @@ fn format_hmac_metadata(m: &HmacKeyMetadata) -> String {
 }
 
 pub async fn run_hmac(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> {
+    let prefer_xml = ctx
+        .config
+        .get("GSUtil", "prefer_api")
+        .is_some_and(|v| v.eq_ignore_ascii_case("xml"));
+    let hmac_auth_only = ctx
+        .config
+        .get("Credentials", "gs_access_key_id")
+        .is_some_and(|v| !v.trim().is_empty())
+        && ctx
+            .config
+            .get("Credentials", "gs_oauth2_refresh_token")
+            .is_none_or(|v| v.trim().is_empty())
+        && ctx
+            .config
+            .get("Credentials", "gs_service_key_file")
+            .is_none_or(|v| v.trim().is_empty());
+    if prefer_xml || hmac_auth_only {
+        return Err(GsutilError::command(
+            "The \"hmac\" command can only be used with the GCS JSON API.",
+        ));
+    }
     if args.is_empty() {
         return Err(GsutilError::command(
             "hmac requires a subcommand (create|delete|get|list|update).",
@@ -340,6 +361,11 @@ pub async fn run_hmac(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()>
             Ok(())
         }
         "list" => {
+            if !positional.is_empty() {
+                return Err(GsutilError::command(
+                    "hmac list received unexpected arguments.",
+                ));
+            }
             let keys = ctx
                 .api
                 .list_hmac_keys(project, sa_filter.as_deref(), show_deleted)
@@ -360,17 +386,17 @@ pub async fn run_hmac(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()>
             Ok(())
         }
         "update" => {
-            let access_id = positional.first().ok_or_else(|| {
-                GsutilError::command("hmac update requires an Access ID to be specified.")
-            })?;
             let new_state = state.as_deref().ok_or_else(|| {
-                GsutilError::command("A state flag (-s) must be specified for hmac update.")
+                GsutilError::command("A state flag must be supplied for hmac update.")
             })?;
             if new_state != "ACTIVE" && new_state != "INACTIVE" {
                 return Err(GsutilError::command(format!(
                     "The state flag value must be one of ACTIVE, INACTIVE; got \"{new_state}\"."
                 )));
             }
+            let access_id = positional.first().ok_or_else(|| {
+                GsutilError::command("hmac update requires an Access ID to be specified.")
+            })?;
             let updated = ctx
                 .api
                 .update_hmac_key(project, access_id, new_state, etag.as_deref())

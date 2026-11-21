@@ -49,8 +49,8 @@ pub struct MockObject {
     pub content_encoding: Option<String>,
     pub content_language: Option<String>,
     pub custom_time: Option<String>,
-    pub temporary_hold: bool,
-    pub event_based_hold: bool,
+    pub temporary_hold: Option<bool>,
+    pub event_based_hold: Option<bool>,
     pub data: Vec<u8>,
     pub time_created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
@@ -59,6 +59,7 @@ pub struct MockObject {
     pub metadata: BTreeMap<String, String>,
     pub acl: Vec<Value>,
     pub iam_policy: Value,
+    pub customer_encryption: Option<(String, String)>,
 }
 
 impl MockObject {
@@ -73,7 +74,25 @@ impl MockObject {
         base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
     }
 
+    pub fn md5_hex(&self) -> String {
+        let mut hasher = Md5::new();
+        hasher.update(&self.data);
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
     pub fn to_json(&self) -> Value {
+        self.to_json_with_key(None)
+    }
+
+    pub fn to_json_with_key(&self, provided_key_sha256: Option<&str>) -> Value {
+        let include_hashes = match self.customer_encryption {
+            Some((_, ref expected_sha)) => provided_key_sha256 == Some(expected_sha.as_str()),
+            None => true,
+        };
         let mut obj = json!({
             "kind": "storage#object",
             "id": format!("{}/{}/{}", self.bucket, self.name, self.generation),
@@ -88,10 +107,12 @@ impl MockObject {
             "timeStorageClassUpdated": fmt_gcs_ts(self.time_created),
             "storageClass": self.storage_class,
             "size": self.data.len().to_string(),
-            "md5Hash": self.md5_b64(),
-            "crc32c": self.crc32c_b64(),
             "etag": format!("etag-{}-{}", self.generation, self.metageneration),
         });
+        if include_hashes {
+            obj["md5Hash"] = json!(self.md5_b64());
+            obj["crc32c"] = json!(self.crc32c_b64());
+        }
         if let Some(ref v) = self.cache_control {
             obj["cacheControl"] = json!(v);
         }
@@ -107,17 +128,23 @@ impl MockObject {
         if let Some(ref v) = self.custom_time {
             obj["customTime"] = json!(v);
         }
-        if self.temporary_hold {
-            obj["temporaryHold"] = json!(true);
+        if let Some(v) = self.temporary_hold {
+            obj["temporaryHold"] = json!(v);
         }
-        if self.event_based_hold {
-            obj["eventBasedHold"] = json!(true);
+        if let Some(v) = self.event_based_hold {
+            obj["eventBasedHold"] = json!(v);
         }
         if !self.metadata.is_empty() {
             obj["metadata"] = json!(self.metadata);
         }
         if !self.acl.is_empty() {
             obj["acl"] = json!(self.acl);
+        }
+        if let Some((ref alg, ref sha)) = self.customer_encryption {
+            obj["customerEncryption"] = json!({
+                "encryptionAlgorithm": alg,
+                "keySha256": sha,
+            });
         }
         if self.deleted {
             obj["timeDeleted"] = json!(self.updated.to_rfc3339());
@@ -174,6 +201,7 @@ impl MockBucket {
             "kind": "storage#bucket",
             "id": self.name,
             "name": self.name,
+            "projectNumber": "1234567890",
             "location": self.location,
             "locationType": "multi-region",
             "storageClass": self.storage_class,
@@ -211,6 +239,7 @@ pub struct ResumableSession {
     pub metadata: BTreeMap<String, String>,
     pub accumulated: Vec<u8>,
     pub dropped_once: bool,
+    pub customer_encryption: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -273,8 +302,8 @@ impl MockGcsState {
             name.to_string(),
             MockBucket {
                 name: name.to_string(),
-                location: location.to_string(),
-                storage_class: storage_class.to_string(),
+                location: location.to_ascii_uppercase(),
+                storage_class: storage_class.to_ascii_uppercase(),
                 versioning_enabled: false,
                 metageneration: 1,
                 time_created: Utc::now(),
@@ -297,7 +326,10 @@ impl MockGcsState {
                     "resourceId": format!("projects/_/buckets/{name}"),
                     "version": 1,
                     "etag": "CAE=",
-                    "bindings": []
+                    "bindings": [{
+                        "role": "roles/storage.legacyBucketOwner",
+                        "members": ["projectOwner:mock-project-123"]
+                    }]
                 }),
                 notifications: Vec::new(),
             },
@@ -359,8 +391,8 @@ impl MockGcsState {
             content_encoding,
             content_language: None,
             custom_time: None,
-            temporary_hold: false,
-            event_based_hold: false,
+            temporary_hold: None,
+            event_based_hold: None,
             data,
             time_created: now,
             updated: now,
@@ -379,8 +411,12 @@ impl MockGcsState {
                 "resourceId": format!("projects/_/buckets/{bucket}/objects/{name}"),
                 "version": 1,
                 "etag": "CAE=",
-                "bindings": []
+                "bindings": [{
+                    "role": "roles/storage.legacyObjectOwner",
+                    "members": ["projectOwner:mock-project-123"]
+                }]
             }),
+            customer_encryption: None,
         };
         b.objects.push(obj.clone());
         Some(obj)
@@ -436,6 +472,11 @@ impl MockGcsServer {
     /// Start self-signed HTTPS listener on `127.0.0.1:0` so native `/usr/bin/gsutil` v5.38
     /// and Rust `gsutil` can both run true differential tests over TLS.
     pub async fn start_tls() -> std::io::Result<Self> {
+        Self::start_tls_on_port(0).await
+    }
+
+    /// Start self-signed HTTPS listener on `127.0.0.1:<port>` (pass `0` for OS-assigned port).
+    pub async fn start_tls_on_port(port: u16) -> std::io::Result<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         // Generate a self-signed root CA + a leaf server cert signed by that CA
@@ -450,6 +491,7 @@ impl MockGcsServer {
             rcgen::KeyUsagePurpose::KeyCertSign,
             rcgen::KeyUsagePurpose::CrlSign,
         ];
+        ca_params.use_authority_key_identifier_extension = true;
         let ca_key = rcgen::KeyPair::generate()
             .map_err(|e| std::io::Error::other(format!("rcgen ca keygen error: {e}")))?;
         let ca_cert = ca_params
@@ -464,7 +506,12 @@ impl MockGcsServer {
             .distinguished_name
             .push(rcgen::DnType::CommonName, "127.0.0.1");
         leaf_params.is_ca = rcgen::IsCa::NoCa;
+        leaf_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyEncipherment,
+        ];
         leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        leaf_params.use_authority_key_identifier_extension = true;
         let leaf_key = rcgen::KeyPair::generate()
             .map_err(|e| std::io::Error::other(format!("rcgen leaf keygen error: {e}")))?;
         let leaf_cert = leaf_params
@@ -486,7 +533,7 @@ impl MockGcsServer {
             .map_err(|e| std::io::Error::other(format!("rustls ServerConfig error: {e}")))?;
         let acceptor = TlsAcceptor::from(Arc::new(tls_cfg));
 
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listener = TcpListener::bind(("127.0.0.1", port)).await?;
         let addr = listener.local_addr()?;
         let state = Arc::new(Mutex::new(MockGcsState::new()));
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
@@ -786,10 +833,16 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     let resp = route_request(req, &state, addr, is_tls);
 
     let mut head = format!("HTTP/1.1 {} {}\r\n", resp.status, resp.reason);
+    let mut has_content_length = false;
     for (k, v) in &resp.headers {
+        if k.eq_ignore_ascii_case("content-length") {
+            has_content_length = true;
+        }
         head.push_str(&format!("{}: {}\r\n", k, v));
     }
-    head.push_str(&format!("Content-Length: {}\r\n", resp.body.len()));
+    if !has_content_length {
+        head.push_str(&format!("Content-Length: {}\r\n", resp.body.len()));
+    }
     head.push_str("Connection: close\r\n\r\n");
 
     let mut inner = reader.into_inner();
@@ -1020,8 +1073,32 @@ fn route_request(
                 if let Some(b) = st.buckets.get_mut(&name) {
                     if let Some(map) = body_val.as_object() {
                         for (k, v) in map {
-                            if !matches!(k.as_str(), "name" | "location" | "storageClass") {
-                                b.extra_fields.insert(k.clone(), v.clone());
+                            if k == "versioning" {
+                                if let Some(en) = v.get("enabled").and_then(|x| x.as_bool()) {
+                                    b.versioning_enabled = en;
+                                }
+                            } else if !matches!(k.as_str(), "name" | "location" | "storageClass") {
+                                let mut val = v.clone();
+                                if k == "retentionPolicy" {
+                                    if let Some(rp) = val.as_object_mut() {
+                                        if !rp.contains_key("effectiveTime") {
+                                            rp.insert(
+                                                "effectiveTime".into(),
+                                                json!(fmt_gcs_ts(Utc::now())),
+                                            );
+                                        }
+                                    }
+                                } else if k == "autoclass" {
+                                    if let Some(ac) = val.as_object_mut() {
+                                        if !ac.contains_key("toggleTime") {
+                                            ac.insert(
+                                                "toggleTime".into(),
+                                                json!(fmt_gcs_ts(Utc::now())),
+                                            );
+                                        }
+                                    }
+                                }
+                                b.extra_fields.insert(k.clone(), val);
                             }
                         }
                     }
@@ -1119,7 +1196,9 @@ fn handle_projects(
             return match req.method.as_str() {
                 "GET" => match st.hmac_keys.get(&access_id) {
                     Some(m) => HttpResponse::json(200, "OK", m.clone()),
-                    None => HttpResponse::error(404, "Not Found", "HMAC key not found", "notFound"),
+                    None => {
+                        HttpResponse::error(404, "Not Found", "Access ID not found", "notFound")
+                    }
                 },
                 "PUT" => {
                     let body_val: Value =
@@ -1128,7 +1207,7 @@ fn handle_projects(
                         return HttpResponse::error(
                             404,
                             "Not Found",
-                            "HMAC key not found",
+                            "Access ID not found",
                             "notFound",
                         );
                     };
@@ -1150,7 +1229,7 @@ fn handle_projects(
                         st.hmac_keys.remove(&access_id);
                         HttpResponse::empty(204, "No Content")
                     } else {
-                        HttpResponse::error(404, "Not Found", "HMAC key not found", "notFound")
+                        HttpResponse::error(404, "Not Found", "Access ID not found", "notFound")
                     }
                 }
                 _ => HttpResponse::error(
@@ -1245,6 +1324,35 @@ fn handle_bucket_json_routes(
                             "forbidden",
                         );
                     }
+                    let current_period = b
+                        .extra_fields
+                        .get("retentionPolicy")
+                        .and_then(|v| v.get("retentionPeriod"))
+                        .and_then(|v| {
+                            v.as_u64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                        })
+                        .unwrap_or(0);
+                    let new_period = rp.get("retentionPeriod").and_then(|v| {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    });
+                    if let Some(np) = new_period {
+                        if np < current_period {
+                            return HttpResponse::error(
+                                403,
+                                "Forbidden",
+                                "Cannot reduce retention duration of a locked Retention Policy for bucket.",
+                                "forbidden",
+                            );
+                        }
+                    }
+                }
+                if let Some(canned) = query.get("predefinedAcl") {
+                    b.acl = predefined_acl_entries(canned, &bucket, None, false);
+                }
+                if let Some(canned) = query.get("predefinedDefaultObjectAcl") {
+                    b.default_object_acl = predefined_acl_entries(canned, &bucket, None, true);
                 }
                 if let Some(map) = body_val.as_object() {
                     for (k, v) in map {
@@ -1256,7 +1364,19 @@ fn handle_bucket_json_routes(
                             }
                         } else if k == "storageClass" {
                             if let Some(sc) = v.as_str() {
-                                b.storage_class = sc.to_string();
+                                b.storage_class = sc.to_ascii_uppercase();
+                            }
+                        } else if k == "acl" {
+                            if let Some(arr) = v.as_array() {
+                                b.acl = arr.clone();
+                            } else if v.is_null() {
+                                b.acl.clear();
+                            }
+                        } else if k == "defaultObjectAcl" {
+                            if let Some(arr) = v.as_array() {
+                                b.default_object_acl = arr.clone();
+                            } else if v.is_null() {
+                                b.default_object_acl.clear();
                             }
                         } else if v.is_null() {
                             // True JSON PATCH null-tombstone deletion!
@@ -1277,6 +1397,9 @@ fn handle_bucket_json_routes(
                             if k == "retentionPolicy" && entry.get("effectiveTime").is_none() {
                                 entry["effectiveTime"] = json!(fmt_gcs_ts(Utc::now()));
                             }
+                            if k == "autoclass" && entry.get("toggleTime").is_none() {
+                                entry["toggleTime"] = json!(fmt_gcs_ts(Utc::now()));
+                            }
                         } else {
                             b.extra_fields.insert(k.clone(), v.clone());
                         }
@@ -1294,7 +1417,7 @@ fn handle_bucket_json_routes(
                         "The specified bucket does not exist.",
                         "notFound",
                     ),
-                    Some(b) if b.objects.iter().any(|o| !o.deleted) => HttpResponse::error(
+                    Some(b) if !b.objects.is_empty() => HttpResponse::error(
                         409,
                         "Conflict",
                         "The bucket you tried to delete is not empty.",
@@ -1416,8 +1539,29 @@ fn handle_bucket_json_routes(
                 HttpResponse::json(200, "OK", pol)
             }
             "PUT" => {
-                let body_val: Value =
+                let mut body_val: Value =
                     serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}));
+                let current_etag = b
+                    .iam_policy
+                    .get("etag")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if let Some(req_etag) = body_val.get("etag").and_then(|v| v.as_str()) {
+                    if !req_etag.is_empty() && !current_etag.is_empty() && req_etag != current_etag
+                    {
+                        return HttpResponse::error(
+                            412,
+                            "Precondition Failed",
+                            "At least one of the pre-conditions you specified did not hold.",
+                            "conditionNotMet",
+                        );
+                    }
+                }
+                b.metageneration += 1;
+                body_val["etag"] = json!(format!("CAE={}", b.metageneration));
+                if body_val.get("bindings").is_none() {
+                    body_val["bindings"] = json!([]);
+                }
                 b.iam_policy = body_val;
                 HttpResponse::json(200, "OK", b.iam_policy.clone())
             }
@@ -1568,7 +1712,11 @@ fn handle_bucket_json_routes(
                     continue;
                 }
             }
-            all_items.push(obj.to_json());
+            let req_sha = req
+                .headers
+                .get("x-goog-encryption-key-sha256")
+                .map(String::as_str);
+            all_items.push(obj.to_json_with_key(req_sha));
         }
         let end = (offset + max_results).min(all_items.len());
         let page_items = if offset < all_items.len() {
@@ -1596,18 +1744,42 @@ fn handle_bucket_json_routes(
         let Some(b) = st.buckets.get_mut(&bucket) else {
             return HttpResponse::error(404, "Not Found", "No such bucket", "notFound");
         };
-        let Some(obj) = b
-            .objects
-            .iter_mut()
-            .find(|o| o.name == obj_name && !o.deleted)
-        else {
+        let req_gen = query.get("generation").and_then(|g| g.parse::<u64>().ok());
+        let Some(obj) = b.objects.iter_mut().find(|o| {
+            o.name == obj_name
+                && match req_gen {
+                    Some(g) => o.generation == g,
+                    None => !o.deleted,
+                }
+        }) else {
             return HttpResponse::error(404, "Not Found", "No such object", "notFound");
         };
         return match req.method.as_str() {
             "GET" => HttpResponse::json(200, "OK", obj.iam_policy.clone()),
             "PUT" => {
-                let body_val: Value =
+                let mut body_val: Value =
                     serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}));
+                let current_etag = obj
+                    .iam_policy
+                    .get("etag")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if let Some(req_etag) = body_val.get("etag").and_then(|v| v.as_str()) {
+                    if !req_etag.is_empty() && !current_etag.is_empty() && req_etag != current_etag
+                    {
+                        return HttpResponse::error(
+                            412,
+                            "Precondition Failed",
+                            "At least one of the pre-conditions you specified did not hold.",
+                            "conditionNotMet",
+                        );
+                    }
+                }
+                obj.metageneration += 1;
+                body_val["etag"] = json!(format!("CAE={}", obj.metageneration));
+                if body_val.get("bindings").is_none() {
+                    body_val["bindings"] = json!([]);
+                }
                 obj.iam_policy = body_val;
                 HttpResponse::json(200, "OK", obj.iam_policy.clone())
             }
@@ -1635,11 +1807,14 @@ fn handle_bucket_json_routes(
                 "invalid",
             );
         }
-        let Some(obj) = b
-            .objects
-            .iter_mut()
-            .find(|o| o.name == obj_name && !o.deleted)
-        else {
+        let req_gen = query.get("generation").and_then(|g| g.parse::<u64>().ok());
+        let Some(obj) = b.objects.iter_mut().find(|o| {
+            o.name == obj_name
+                && match req_gen {
+                    Some(g) => o.generation == g,
+                    None => !o.deleted,
+                }
+        }) else {
             return HttpResponse::error(404, "Not Found", "No such object", "notFound");
         };
         return match req.method.as_str() {
@@ -1707,18 +1882,52 @@ fn handle_bucket_json_routes(
                     .collect::<BTreeMap<String, String>>()
             });
 
+        let src_gen = query
+            .get("sourceGeneration")
+            .and_then(|g| g.parse::<u64>().ok());
         let mut st = state.lock().expect("lock poisoned");
         let found = st
             .buckets
             .get(&bucket)
-            .and_then(|b| b.objects.iter().find(|o| o.name == src_obj && !o.deleted))
+            .and_then(|b| {
+                b.objects.iter().find(|o| {
+                    o.name == src_obj
+                        && match src_gen {
+                            Some(g) => o.generation == g,
+                            None => !o.deleted,
+                        }
+                })
+            })
             .cloned();
         let Some(src) = found else {
             return HttpResponse::error(404, "Not Found", "No such object", "notFound");
         };
+        if let Some((_, ref expected_sha)) = src.customer_encryption {
+            let provided = req
+                .headers
+                .get("x-goog-copy-source-encryption-key-sha256")
+                .or_else(|| req.headers.get("x-goog-encryption-key-sha256"));
+            if provided.map(String::as_str) != Some(expected_sha.as_str()) {
+                return HttpResponse::error(
+                    400,
+                    "Bad Request",
+                    "The target object is encrypted by a customer-supplied encryption key.",
+                    "customerEncryptionKeyIsIncorrect",
+                );
+            }
+        }
+        let dst_csek = req
+            .headers
+            .get("x-goog-encryption-algorithm")
+            .zip(req.headers.get("x-goog-encryption-key-sha256"))
+            .map(|(alg, sha)| (alg.clone(), sha.clone()));
 
         // Multi-step rewriteToken simulation when maxBytesRewrittenPerCall is set
         if segments[3] == "rewriteTo" && query.contains_key("maxBytesRewrittenPerCall") {
+            let max_step = query
+                .get("maxBytesRewrittenPerCall")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(src.data.len() / 2);
             if let Some(token) = query.get("rewriteToken") {
                 if st.rewrite_sessions.remove(token).is_none() {
                     return HttpResponse::error(
@@ -1728,7 +1937,7 @@ fn handle_bucket_json_routes(
                         "notFound",
                     );
                 }
-            } else {
+            } else if max_step < src.data.len() {
                 let tok = format!("rw-tok-{}", st.next_gen());
                 st.rewrite_sessions.insert(
                     tok.clone(),
@@ -1742,13 +1951,12 @@ fn handle_bucket_json_routes(
                         override_metadata: override_meta,
                     },
                 );
-                let half = src.data.len() / 2;
                 return HttpResponse::json(
                     200,
                     "OK",
                     json!({
                         "kind": "storage#rewriteResponse",
-                        "totalBytesRewritten": half.to_string(),
+                        "totalBytesRewritten": max_step.to_string(),
                         "objectSize": src.data.len().to_string(),
                         "done": false,
                         "rewriteToken": tok,
@@ -1760,7 +1968,7 @@ fn handle_bucket_json_routes(
         let ct = override_ct.unwrap_or(src.content_type);
         let meta = override_meta.unwrap_or(src.metadata);
         let sc = override_sc.or(Some(src.storage_class));
-        let Some(created) = st.put_object_full(
+        let Some(mut created) = st.put_object_full(
             &dst_bucket,
             &dst_obj,
             src.data,
@@ -1776,6 +1984,22 @@ fn handle_bucket_json_routes(
                 "notFound",
             );
         };
+        if let Some(enc) = dst_csek {
+            created.customer_encryption = Some(enc.clone());
+            if let Some(b) = st.buckets.get_mut(&dst_bucket) {
+                if let Some(stored) = b
+                    .objects
+                    .iter_mut()
+                    .find(|o| o.generation == created.generation)
+                {
+                    stored.customer_encryption = Some(enc);
+                }
+            }
+        }
+        let req_sha = req
+            .headers
+            .get("x-goog-encryption-key-sha256")
+            .map(String::as_str);
         if segments[3] == "rewriteTo" {
             return HttpResponse::json(
                 200,
@@ -1785,11 +2009,11 @@ fn handle_bucket_json_routes(
                     "totalBytesRewritten": created.data.len().to_string(),
                     "objectSize": created.data.len().to_string(),
                     "done": true,
-                    "resource": created.to_json(),
+                    "resource": created.to_json_with_key(req_sha),
                 }),
             );
         }
-        return HttpResponse::json(200, "OK", created.to_json());
+        return HttpResponse::json(200, "OK", created.to_json_with_key(req_sha));
     }
 
     HttpResponse::error(
@@ -1853,6 +2077,11 @@ fn handle_upload(
         if !st.buckets.contains_key(bucket) {
             return HttpResponse::error(404, "Not Found", "Not Found", "notFound");
         }
+        let csek = req
+            .headers
+            .get("x-goog-encryption-algorithm")
+            .zip(req.headers.get("x-goog-encryption-key-sha256"))
+            .map(|(alg, sha)| (alg.clone(), sha.clone()));
         let upload_id = format!("sess-{}", st.next_gen());
         st.resumable_sessions.insert(
             upload_id.clone(),
@@ -1864,6 +2093,7 @@ fn handle_upload(
                 metadata: meta,
                 accumulated: Vec::new(),
                 dropped_once: false,
+                customer_encryption: csek,
             },
         );
         let scheme = if is_tls { "https" } else { "http" };
@@ -1970,7 +2200,7 @@ fn handle_upload(
                 .resumable_sessions
                 .remove(upload_id)
                 .expect("checked above");
-            if let Some(obj) = st.put_object_full(
+            if let Some(mut obj) = st.put_object_full(
                 &finished.bucket,
                 &finished.name,
                 finished.accumulated,
@@ -1979,7 +2209,23 @@ fn handle_upload(
                 finished.metadata,
                 None,
             ) {
-                return HttpResponse::json(200, "OK", obj.to_json());
+                if let Some(enc) = finished.customer_encryption {
+                    obj.customer_encryption = Some(enc.clone());
+                    if let Some(b) = st.buckets.get_mut(&finished.bucket) {
+                        if let Some(stored) = b
+                            .objects
+                            .iter_mut()
+                            .find(|o| o.generation == obj.generation)
+                        {
+                            stored.customer_encryption = Some(enc);
+                        }
+                    }
+                }
+                let req_sha = req
+                    .headers
+                    .get("x-goog-encryption-key-sha256")
+                    .map(String::as_str);
+                return HttpResponse::json(200, "OK", obj.to_json_with_key(req_sha));
             }
             return HttpResponse::error(404, "Not Found", "Bucket not found", "notFound");
         }
@@ -2019,8 +2265,32 @@ fn handle_upload(
         }
     }
 
+    let csek = req
+        .headers
+        .get("x-goog-encryption-algorithm")
+        .zip(req.headers.get("x-goog-encryption-key-sha256"))
+        .map(|(alg, sha)| (alg.clone(), sha.clone()));
+
     match st.put_object_full(bucket, &name, payload, &ct, ce, meta, None) {
-        Some(obj) => HttpResponse::json(200, "OK", obj.to_json()),
+        Some(mut obj) => {
+            if let Some(enc) = csek {
+                obj.customer_encryption = Some(enc.clone());
+                if let Some(b) = st.buckets.get_mut(bucket) {
+                    if let Some(stored) = b
+                        .objects
+                        .iter_mut()
+                        .find(|o| o.generation == obj.generation)
+                    {
+                        stored.customer_encryption = Some(enc);
+                    }
+                }
+            }
+            let req_sha = req
+                .headers
+                .get("x-goog-encryption-key-sha256")
+                .map(String::as_str);
+            HttpResponse::json(200, "OK", obj.to_json_with_key(req_sha))
+        }
         None => HttpResponse::error(404, "Not Found", "Bucket not found", "notFound"),
     }
 }
@@ -2141,6 +2411,17 @@ fn handle_object(
             };
 
             if query.get("alt").map(String::as_str) == Some("media") {
+                if let Some((_, ref expected_sha)) = obj.customer_encryption {
+                    let provided = req.headers.get("x-goog-encryption-key-sha256");
+                    if provided.map(String::as_str) != Some(expected_sha.as_str()) {
+                        return HttpResponse::error(
+                            400,
+                            "Bad Request",
+                            "The target object is encrypted by a customer-supplied encryption key.",
+                            "customerEncryptionKeyIsIncorrect",
+                        );
+                    }
+                }
                 // Emulate real GCS transparent gzip decompression when Accept-Encoding: gzip is absent!
                 let is_gzip = obj
                     .content_encoding
@@ -2189,6 +2470,10 @@ fn handle_object(
                 }
                 let mut hdrs = vec![
                     ("Content-Type".into(), obj.content_type.clone()),
+                    ("Date".into(), "Sat, 21 Nov 2026 00:00:00 GMT".into()),
+                    ("Expires".into(), "Sat, 21 Nov 2026 00:00:00 GMT".into()),
+                    ("Cache-Control".into(), "private, max-age=0".into()),
+                    ("ETag".into(), format!("\"{}\"", obj.md5_hex())),
                     ("x-goog-generation".into(), obj.generation.to_string()),
                     (
                         "x-goog-hash".into(),
@@ -2206,7 +2491,11 @@ fn handle_object(
                 };
             }
 
-            HttpResponse::json(200, "OK", obj.to_json())
+            let req_sha = req
+                .headers
+                .get("x-goog-encryption-key-sha256")
+                .map(String::as_str);
+            HttpResponse::json(200, "OK", obj.to_json_with_key(req_sha))
         }
         "PATCH" | "PUT" => {
             let body_val: Value = serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}));
@@ -2276,10 +2565,17 @@ fn handle_object(
                     obj.custom_time = v.as_str().map(String::from);
                 }
                 if let Some(v) = map.get("temporaryHold").and_then(|x| x.as_bool()) {
-                    obj.temporary_hold = v;
+                    obj.temporary_hold = Some(v);
                 }
                 if let Some(v) = map.get("eventBasedHold").and_then(|x| x.as_bool()) {
-                    obj.event_based_hold = v;
+                    obj.event_based_hold = Some(v);
+                }
+                if let Some(acl_val) = map.get("acl") {
+                    if let Some(arr) = acl_val.as_array() {
+                        obj.acl = arr.clone();
+                    } else if acl_val.is_null() {
+                        obj.acl.clear();
+                    }
                 }
                 if let Some(meta_val) = map.get("metadata") {
                     if meta_val.is_null() {
@@ -2296,9 +2592,16 @@ fn handle_object(
                     }
                 }
             }
+            if let Some(canned) = query.get("predefinedAcl") {
+                obj.acl = predefined_acl_entries(canned, bucket, Some(object_name), false);
+            }
             obj.metageneration += 1;
             obj.updated = Utc::now();
-            HttpResponse::json(200, "OK", obj.to_json())
+            let req_sha = req
+                .headers
+                .get("x-goog-encryption-key-sha256")
+                .map(String::as_str);
+            HttpResponse::json(200, "OK", obj.to_json_with_key(req_sha))
         }
         "DELETE" => {
             let mut st = state.lock().expect("lock poisoned");
@@ -2320,7 +2623,9 @@ fn handle_object(
                     "notFound",
                 );
             };
-            if b.objects[idx].temporary_hold || b.objects[idx].event_based_hold {
+            if b.objects[idx].temporary_hold == Some(true)
+                || b.objects[idx].event_based_hold == Some(true)
+            {
                 return HttpResponse::error(
                     403,
                     "Forbidden",
@@ -2390,6 +2695,56 @@ fn handle_xml_s3(
     let obj_opt = parts.next().filter(|s| !s.is_empty()).map(pct_decode);
 
     match (req.method.as_str(), obj_opt) {
+        ("PUT", None) => {
+            let mut st = state.lock().expect("lock poisoned");
+            if query.contains_key("versioning") {
+                if let Some(b) = st.buckets.get_mut(&bucket) {
+                    let body_str = String::from_utf8_lossy(&req.body);
+                    b.versioning_enabled = body_str.contains("Enabled");
+                    b.metageneration += 1;
+                    return HttpResponse::empty(200, "OK");
+                }
+                return HttpResponse::xml(
+                    404,
+                    "Not Found",
+                    "<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist.</Message></Error>".into(),
+                );
+            }
+            let body_str = String::from_utf8_lossy(&req.body);
+            let location = extract_xml_tag(&body_str, "LocationConstraint")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "US".into());
+            let storage_class = extract_xml_tag(&body_str, "StorageClass")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "STANDARD".into());
+            if !st.create_bucket(&bucket, &location, &storage_class) {
+                return HttpResponse::xml(
+                    409,
+                    "Conflict",
+                    "<Error><Code>BucketAlreadyOwnedByYou</Code><Message>Your previous request to create the named bucket succeeded and you already own it.</Message></Error>".into(),
+                );
+            }
+            HttpResponse::empty(200, "OK")
+        }
+        ("DELETE", None) => {
+            let mut st = state.lock().expect("lock poisoned");
+            let Some(b) = st.buckets.get(&bucket) else {
+                return HttpResponse::xml(
+                    404,
+                    "Not Found",
+                    "<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist.</Message></Error>".into(),
+                );
+            };
+            if !b.objects.is_empty() {
+                return HttpResponse::xml(
+                    409,
+                    "Conflict",
+                    "<Error><Code>BucketNotEmpty</Code><Message>The bucket you tried to delete is not empty.</Message></Error>".into(),
+                );
+            }
+            st.buckets.remove(&bucket);
+            HttpResponse::empty(204, "No Content")
+        }
         ("GET", None) => {
             let st = state.lock().expect("lock poisoned");
             let Some(b) = st.buckets.get(&bucket) else {
@@ -2399,34 +2754,83 @@ fn handle_xml_s3(
                     "<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist.</Message></Error>".into(),
                 );
             };
+            if query.contains_key("location") {
+                return HttpResponse::xml(
+                    200,
+                    "OK",
+                    format!(
+                        "<?xml version='1.0' encoding='UTF-8'?><LocationConstraint>{}</LocationConstraint>",
+                        b.location
+                    ),
+                );
+            }
+            if query.contains_key("versioning") {
+                let status = if b.versioning_enabled {
+                    "<Status>Enabled</Status>"
+                } else {
+                    ""
+                };
+                return HttpResponse::xml(
+                    200,
+                    "OK",
+                    format!(
+                        "<?xml version='1.0' encoding='UTF-8'?><VersioningConfiguration>{status}</VersioningConfiguration>"
+                    ),
+                );
+            }
             let prefix = query.get("prefix").map(String::as_str).unwrap_or("");
+            let versions = query.contains_key("versions");
             let mut contents_xml = String::new();
             for o in &b.objects {
-                if !o.deleted && o.name.starts_with(prefix) {
-                    contents_xml.push_str(&format!(
-                        "<Contents><Key>{}</Key><Size>{}</Size><LastModified>{}</LastModified><ETag>\"{}\"</ETag></Contents>",
-                        o.name,
-                        o.data.len(),
-                        o.updated.to_rfc3339(),
-                        o.generation
-                    ));
+                if (versions || !o.deleted) && o.name.starts_with(prefix) {
+                    if versions {
+                        let is_latest = if o.deleted { "false" } else { "true" };
+                        contents_xml.push_str(&format!(
+                            "<Version><Key>{}</Key><Generation>{}</Generation><MetaGeneration>{}</MetaGeneration><IsLatest>{}</IsLatest><Size>{}</Size><LastModified>{}</LastModified><ETag>\"{}\"</ETag></Version>",
+                            o.name,
+                            o.generation,
+                            o.metageneration,
+                            is_latest,
+                            o.data.len(),
+                            fmt_gcs_ts(o.updated),
+                            o.md5_hex()
+                        ));
+                    } else {
+                        contents_xml.push_str(&format!(
+                            "<Contents><Key>{}</Key><Generation>{}</Generation><MetaGeneration>{}</MetaGeneration><Size>{}</Size><LastModified>{}</LastModified><ETag>\"{}\"</ETag></Contents>",
+                            o.name,
+                            o.generation,
+                            o.metageneration,
+                            o.data.len(),
+                            fmt_gcs_ts(o.updated),
+                            o.md5_hex()
+                        ));
+                    }
                 }
             }
-            HttpResponse::xml(
-                200,
-                "OK",
+            let xml_body = if versions {
+                format!(
+                    "<?xml version='1.0' encoding='UTF-8'?><ListVersionsResult><Name>{bucket}</Name><Prefix>{prefix}</Prefix><IsTruncated>false</IsTruncated>{contents_xml}</ListVersionsResult>"
+                )
+            } else {
                 format!(
                     "<?xml version='1.0' encoding='UTF-8'?><ListBucketResult><Name>{bucket}</Name><Prefix>{prefix}</Prefix><IsTruncated>false</IsTruncated>{contents_xml}</ListBucketResult>"
-                ),
-            )
+                )
+            };
+            HttpResponse::xml(200, "OK", xml_body)
         }
         ("GET" | "HEAD", Some(obj_name)) => {
             let st = state.lock().expect("lock poisoned");
-            let Some(o) = st
-                .buckets
-                .get(&bucket)
-                .and_then(|b| b.objects.iter().find(|o| o.name == obj_name && !o.deleted))
-            else {
+            let req_gen = query.get("generation").and_then(|g| g.parse::<u64>().ok());
+            let Some(o) = st.buckets.get(&bucket).and_then(|b| {
+                b.objects.iter().find(|o| {
+                    o.name == obj_name
+                        && match req_gen {
+                            Some(g) => o.generation == g,
+                            None => !o.deleted,
+                        }
+                })
+            }) else {
                 return HttpResponse::xml(
                     404,
                     "Not Found",
@@ -2438,7 +2842,10 @@ fn handle_xml_s3(
                 reason: "OK",
                 headers: vec![
                     ("Content-Type".into(), o.content_type.clone()),
+                    ("Content-Length".into(), o.data.len().to_string()),
+                    ("ETag".into(), format!("\"{}\"", o.md5_hex())),
                     ("x-goog-generation".into(), o.generation.to_string()),
+                    ("x-goog-metageneration".into(), o.metageneration.to_string()),
                     (
                         "x-goog-hash".into(),
                         format!("crc32c={}, md5={}", o.crc32c_b64(), o.md5_b64()),
@@ -2458,8 +2865,50 @@ fn handle_xml_s3(
                 .get("content-type")
                 .cloned()
                 .unwrap_or_else(|| "application/octet-stream".into());
-            match st.put_object(&bucket, &obj_name, req.body.clone(), &ct) {
-                Some(_) => HttpResponse::empty(200, "OK"),
+            let ce = req.headers.get("content-encoding").cloned();
+            let mut meta = BTreeMap::new();
+            for (k, v) in &req.headers {
+                if let Some(mk) = k.strip_prefix("x-goog-meta-") {
+                    meta.insert(mk.to_string(), v.clone());
+                }
+            }
+            let csek = req
+                .headers
+                .get("x-goog-encryption-algorithm")
+                .zip(req.headers.get("x-goog-encryption-key-sha256"))
+                .map(|(alg, sha)| (alg.clone(), sha.clone()));
+            match st.put_object_full(&bucket, &obj_name, req.body.clone(), &ct, ce, meta, None) {
+                Some(mut obj) => {
+                    if let Some(enc) = csek {
+                        obj.customer_encryption = Some(enc.clone());
+                        if let Some(b) = st.buckets.get_mut(&bucket) {
+                            if let Some(stored) = b
+                                .objects
+                                .iter_mut()
+                                .find(|o| o.generation == obj.generation)
+                            {
+                                stored.customer_encryption = Some(enc);
+                            }
+                        }
+                    }
+                    HttpResponse {
+                        status: 200,
+                        reason: "OK",
+                        headers: vec![
+                            ("ETag".into(), format!("\"{}\"", obj.md5_hex())),
+                            ("x-goog-generation".into(), obj.generation.to_string()),
+                            (
+                                "x-goog-metageneration".into(),
+                                obj.metageneration.to_string(),
+                            ),
+                            (
+                                "x-goog-hash".into(),
+                                format!("crc32c={}, md5={}", obj.crc32c_b64(), obj.md5_b64()),
+                            ),
+                        ],
+                        body: Vec::new(),
+                    }
+                }
                 None => HttpResponse::xml(
                     404,
                     "Not Found",
@@ -2470,8 +2919,14 @@ fn handle_xml_s3(
         }
         ("DELETE", Some(obj_name)) => {
             let mut st = state.lock().expect("lock poisoned");
+            let req_gen = query.get("generation").and_then(|g| g.parse::<u64>().ok());
             if let Some(b) = st.buckets.get_mut(&bucket) {
-                b.objects.retain(|o| o.name != obj_name);
+                if let Some(g) = req_gen {
+                    b.objects
+                        .retain(|o| !(o.name == obj_name && o.generation == g));
+                } else {
+                    b.objects.retain(|o| o.name != obj_name);
+                }
                 return HttpResponse::empty(204, "No Content");
             }
             HttpResponse::xml(
@@ -2482,6 +2937,65 @@ fn handle_xml_s3(
         }
         _ => HttpResponse::error(404, "Not Found", "Unhandled route", "notFound"),
     }
+}
+
+fn predefined_acl_entries(
+    canned: &str,
+    bucket: &str,
+    object: Option<&str>,
+    is_defacl: bool,
+) -> Vec<Value> {
+    let kind = if object.is_some() || is_defacl {
+        "storage#objectAccessControl"
+    } else {
+        "storage#bucketAccessControl"
+    };
+    let mk = |entity: &str, role: &str| {
+        let mut entry = json!({
+            "kind": kind,
+            "bucket": bucket,
+            "entity": entity,
+            "role": role,
+        });
+        if let Some(obj) = object {
+            entry["object"] = json!(obj);
+        }
+        entry
+    };
+    let mut entries = if is_defacl && canned.eq_ignore_ascii_case("private") {
+        Vec::new()
+    } else {
+        vec![mk("project-owners-123", "OWNER")]
+    };
+    match canned {
+        "publicRead" | "public-read" => {
+            entries.push(mk("allUsers", "READER"));
+        }
+        "publicReadWrite" | "public-read-write" => {
+            entries.push(mk("allUsers", "WRITER"));
+        }
+        "authenticatedRead" | "authenticated-read" => {
+            entries.push(mk("allAuthenticatedUsers", "READER"));
+        }
+        "projectPrivate" | "project-private" => {
+            entries.push(mk("project-editors-123", "OWNER"));
+            entries.push(mk("project-viewers-123", "READER"));
+        }
+        "bucketOwnerRead" | "bucket-owner-read" => {
+            entries.push(mk("project-owners-123", "READER"));
+        }
+        "bucketOwnerFullControl" | "bucket-owner-full-control" => {}
+        _ => {}
+    }
+    entries
+}
+
+fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml[start..end].trim().to_string())
 }
 
 fn parse_byte_range(header: &str, total_len: usize) -> Option<(usize, usize)> {

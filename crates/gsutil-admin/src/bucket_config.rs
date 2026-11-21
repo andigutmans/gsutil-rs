@@ -11,7 +11,8 @@ use gsutil_core::api::{
     BucketLogging, BucketRetentionPolicy, BucketVersioning, BucketWebsite, Object, Preconditions,
     UniformBucketLevelAccess,
 };
-use gsutil_core::error::{GsutilError, Result};
+use gsutil_core::error::{GsutilError, Result, ServiceError};
+use gsutil_core::url::{urls_are_for_single_provider, StorageUrl};
 
 use crate::{
     bucket_display_no_slash, expand_bucket_urls, expand_cloud_urls, insist_on_or_off,
@@ -31,10 +32,11 @@ pub async fn run_versioning(ctx: &mut AdminContext<'_>, args: &[String]) -> Resu
     }
     match args[0].as_str() {
         "get" => {
+            let fields = ["versioning".to_string()];
             let buckets = expand_bucket_urls(ctx, &args[1..], "versioning").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                let meta = ctx.api.get_bucket(name, None).await?;
+                let meta = ctx.api.get_bucket(name, Some(&fields)).await?;
                 let enabled = meta.versioning.and_then(|v| v.enabled).unwrap_or(false);
                 let state = if enabled { "Enabled" } else { "Suspended" };
                 writeln!(ctx.out, "{}: {state}", bucket_display_no_slash(&b))?;
@@ -49,8 +51,9 @@ pub async fn run_versioning(ctx: &mut AdminContext<'_>, args: &[String]) -> Resu
             }
             let enabled = insist_on_or_off(
                 &args[1],
-                "Argument to \"versioning set\" must be either \"on\" or \"off\".",
+                "Argument to \"versioning set\" must be either <on|off>.",
             )?;
+            let fields = ["versioning".to_string()];
             let buckets = expand_bucket_urls(ctx, &args[2..], "versioning").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
@@ -67,7 +70,7 @@ pub async fn run_versioning(ctx: &mut AdminContext<'_>, args: &[String]) -> Resu
                     ..Default::default()
                 };
                 ctx.api
-                    .patch_bucket(name, &patch, None, None, None, None)
+                    .patch_bucket(name, &patch, None, None, None, Some(&fields))
                     .await?;
             }
             Ok(())
@@ -90,12 +93,21 @@ pub async fn run_cors(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()>
     }
     match args[0].as_str() {
         "get" => {
+            let fields = ["cors".to_string()];
             let buckets = expand_bucket_urls(ctx, &args[1..], "cors").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                let meta = ctx.api.get_bucket(name, None).await?;
+                let meta = ctx.api.get_bucket(name, Some(&fields)).await?;
                 match meta.cors {
-                    Some(cors) if !cors.is_empty() => {
+                    Some(cors)
+                        if !cors.is_empty()
+                            && cors.iter().any(|c| {
+                                c.origin.is_some()
+                                    || c.method.is_some()
+                                    || c.response_header.is_some()
+                                    || c.max_age_seconds.is_some()
+                            }) =>
+                    {
                         let json = serde_json::to_string_pretty(&cors).map_err(|e| {
                             GsutilError::command(format!("Failed to serialize CORS config: {e}"))
                         })?;
@@ -118,8 +130,26 @@ pub async fn run_cors(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()>
                     "cors set requires a JSON file and at least one bucket URL.",
                 ));
             }
+            if !urls_are_for_single_provider(&args[2..])? {
+                return Err(GsutilError::command(
+                    "cors command spanning providers not allowed.",
+                ));
+            }
             let raw_json = read_json_arg(&args[1])?;
-            let cors: Vec<BucketCors> = serde_json::from_str(&raw_json).map_err(|e| {
+            if raw_json.trim_start().starts_with('<') {
+                return Err(GsutilError::command(
+                    "XML CORS data provided; please convert to JSON format.",
+                ));
+            }
+            let val: serde_json::Value = serde_json::from_str(&raw_json).map_err(|e| {
+                GsutilError::command(format!("Invalid CORS JSON in \"{}\": {e}", args[1]))
+            })?;
+            if !val.is_array() {
+                return Err(GsutilError::command(
+                    "CORS configuration should be formatted as a list of JSON objects.",
+                ));
+            }
+            let cors: Vec<BucketCors> = serde_json::from_value(val).map_err(|e| {
                 GsutilError::command(format!("Invalid CORS JSON in \"{}\": {e}", args[1]))
             })?;
             let buckets = expand_bucket_urls(ctx, &args[2..], "cors").await?;
@@ -147,17 +177,23 @@ pub async fn run_cors(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()>
 // ---------------------------------------------------------------------------
 
 pub async fn run_lifecycle(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> {
-    if args.len() < 2 {
+    if args.is_empty() {
         return Err(GsutilError::command(
-            "lifecycle requires a subcommand (get|set) and arguments.",
+            "The lifecycle command requires at least 2 arguments.",
         ));
     }
     match args[0].as_str() {
         "get" => {
+            if args.len() < 2 {
+                return Err(GsutilError::command(
+                    "The lifecycle command requires at least 2 arguments.",
+                ));
+            }
+            let fields = ["lifecycle".to_string()];
             let buckets = expand_bucket_urls(ctx, &args[1..], "lifecycle").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                let meta = ctx.api.get_bucket(name, None).await?;
+                let meta = ctx.api.get_bucket(name, Some(&fields)).await?;
                 match meta.lifecycle {
                     Some(lc) if lc.rule.as_ref().is_some_and(|r| !r.is_empty()) => {
                         let json = serde_json::to_string_pretty(&lc).map_err(|e| {
@@ -179,33 +215,105 @@ pub async fn run_lifecycle(ctx: &mut AdminContext<'_>, args: &[String]) -> Resul
             Ok(())
         }
         "set" => {
-            if args.len() < 3 {
+            if args.len() < 2 {
                 return Err(GsutilError::command(
-                    "lifecycle set requires a JSON file and at least one bucket URL.",
+                    "The lifecycle command requires at least 2 arguments.",
+                ));
+            }
+            if args.len() < 3 || !urls_are_for_single_provider(&args[2..])? {
+                return Err(GsutilError::command(
+                    "lifecycle command spanning providers not allowed.",
                 ));
             }
             let raw_json = read_json_arg(&args[1])?;
+            if raw_json.trim_start().starts_with('<') {
+                return Err(GsutilError::command(
+                    "XML lifecycle data provided; please convert to JSON format.",
+                ));
+            }
             // Accept either `{"lifecycle": {"rule": [...]}}` or `{"rule": [...]}` or `{}`.
             let val: serde_json::Value = serde_json::from_str(&raw_json).map_err(|e| {
                 GsutilError::command(format!("Invalid lifecycle JSON in \"{}\": {e}", args[1]))
             })?;
             let lc_val = val.get("lifecycle").cloned().unwrap_or(val);
+            if let Some(obj) = lc_val.as_object() {
+                for key in obj.keys() {
+                    if key != "rule" {
+                        return Err(GsutilError::command(format!(
+                            "Invalid lifecycle config in \"{}\": unknown field \"{key}\".",
+                            args[1]
+                        )));
+                    }
+                }
+                if let Some(rules) = obj.get("rule").and_then(|r| r.as_array()) {
+                    const VALID_CONDITIONS: &[&str] = &[
+                        "age",
+                        "createdBefore",
+                        "customTimeBefore",
+                        "daysSinceCustomTime",
+                        "daysSinceNoncurrentTime",
+                        "isLive",
+                        "matchesPrefix",
+                        "matchesStorageClass",
+                        "matchesSuffix",
+                        "noncurrentTimeBefore",
+                        "numNewerVersions",
+                    ];
+                    for rule in rules {
+                        let Some(rmap) = rule.as_object() else {
+                            return Err(GsutilError::command(format!(
+                                "Invalid lifecycle rule in \"{}\".",
+                                args[1]
+                            )));
+                        };
+                        if !rmap.contains_key("action") {
+                            return Err(GsutilError::command(format!(
+                                "Invalid lifecycle rule in \"{}\": missing \"action\".",
+                                args[1]
+                            )));
+                        }
+                        if let Some(cond) = rmap.get("condition").and_then(|c| c.as_object()) {
+                            for ck in cond.keys() {
+                                if !VALID_CONDITIONS.contains(&ck.as_str()) {
+                                    return Err(GsutilError::command(format!(
+                                        "Invalid lifecycle condition \"{ck}\" in \"{}\".",
+                                        args[1]
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                return Err(GsutilError::command(format!(
+                    "Invalid lifecycle JSON in \"{}\": expected JSON object.",
+                    args[1]
+                )));
+            }
             let lifecycle: BucketLifecycle = serde_json::from_value(lc_val).map_err(|e| {
                 GsutilError::command(format!("Invalid lifecycle config in \"{}\": {e}", args[1]))
             })?;
+            let is_empty = lifecycle.rule.as_ref().is_none_or(|r| r.is_empty());
             let buckets = expand_bucket_urls(ctx, &args[2..], "lifecycle").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                writeln!(
-                    ctx.err,
+                ctx.info(&format!(
                     "Setting lifecycle configuration on {}...",
                     b.bucket_url_string()
-                )?;
-                let patch = Bucket {
-                    lifecycle: Some(lifecycle.clone()),
-                    ..Default::default()
+                ))?;
+                let patch = if is_empty {
+                    Bucket {
+                        clear_fields: vec!["lifecycle".to_string()],
+                        ..Default::default()
+                    }
+                } else {
+                    Bucket {
+                        lifecycle: Some(lifecycle.clone()),
+                        ..Default::default()
+                    }
                 };
                 ctx.api
+                    .for_provider(b.scheme.as_str())?
                     .patch_bucket(name, &patch, None, None, None, None)
                     .await?;
             }
@@ -229,10 +337,11 @@ pub async fn run_logging(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
     }
     match args[0].as_str() {
         "get" => {
+            let fields = ["logging".to_string()];
             let buckets = expand_bucket_urls(ctx, &args[1..], "logging").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                let meta = ctx.api.get_bucket(name, None).await?;
+                let meta = ctx.api.get_bucket(name, Some(&fields)).await?;
                 match meta.logging {
                     Some(log) if log.log_bucket.is_some() => {
                         let json = serde_json::to_string_pretty(&log).map_err(|e| {
@@ -254,14 +363,20 @@ pub async fn run_logging(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
         "set" => {
             if args.len() < 3 {
                 return Err(GsutilError::command(
-                    "logging set requires on|off and bucket URL(s).",
+                    "The logging command requires at least 3 arguments.",
                 ));
             }
-            let enabled = insist_on_or_off(
-                &args[1],
-                "Argument to \"logging set\" must be either \"on\" or \"off\".",
-            )?;
+            let enabled = match args[1].to_ascii_lowercase().as_str() {
+                "on" => true,
+                "off" => false,
+                other => {
+                    return Err(GsutilError::command(format!(
+                        "Invalid subcommand \"{other}\" for the \"logging set\" command."
+                    )));
+                }
+            };
             let mut log_bucket: Option<String> = None;
+            let mut log_bucket_url_raw: Option<String> = None;
             let mut log_prefix: Option<String> = None;
             let mut url_args = Vec::new();
             let mut i = 2;
@@ -272,12 +387,18 @@ pub async fn run_logging(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
                         let val = args.get(i).ok_or_else(|| {
                             GsutilError::command("Option -b requires a log bucket argument.")
                         })?;
-                        let stripped = val
-                            .strip_prefix("gs://")
-                            .unwrap_or(val)
-                            .trim_end_matches('/')
-                            .to_string();
-                        log_bucket = Some(stripped);
+                        let parsed = StorageUrl::parse(val)?;
+                        match parsed {
+                            StorageUrl::Cloud(c) if c.is_bucket() => {
+                                log_bucket = c.bucket_name;
+                                log_bucket_url_raw = Some(val.clone());
+                            }
+                            _ => {
+                                return Err(GsutilError::command(format!(
+                                    "Log bucket \"{val}\" must specify a bucket URL."
+                                )));
+                            }
+                        }
                     }
                     "-o" => {
                         i += 1;
@@ -292,7 +413,21 @@ pub async fn run_logging(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
             }
             if enabled && log_bucket.is_none() {
                 return Err(GsutilError::command(
-                    "logging set on requires -b <log_bucket>.",
+                    "logging set on requires '-b <log_bucket>'.",
+                ));
+            }
+            if url_args.is_empty() {
+                return Err(GsutilError::command(
+                    "The logging command requires at least 3 arguments.",
+                ));
+            }
+            let mut provider_check = url_args.clone();
+            if let Some(ref lb) = log_bucket_url_raw {
+                provider_check.push(lb.clone());
+            }
+            if !urls_are_for_single_provider(&provider_check)? {
+                return Err(GsutilError::command(
+                    "logging command spanning providers not allowed.",
                 ));
             }
             let buckets = expand_bucket_urls(ctx, &url_args, "logging").await?;
@@ -344,10 +479,11 @@ pub async fn run_web(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
     }
     match args[0].as_str() {
         "get" => {
+            let fields = ["website".to_string()];
             let buckets = expand_bucket_urls(ctx, &args[1..], "web").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                let meta = ctx.api.get_bucket(name, None).await?;
+                let meta = ctx.api.get_bucket(name, Some(&fields)).await?;
                 match meta.website {
                     Some(w) if w.main_page_suffix.is_some() || w.not_found_page.is_some() => {
                         let json = serde_json::to_string_pretty(&w).map_err(|e| {
@@ -439,10 +575,11 @@ pub async fn run_label(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()
     }
     match args[0].as_str() {
         "get" => {
+            let fields = ["labels".to_string()];
             let buckets = expand_bucket_urls(ctx, &args[1..], "label").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                let meta = ctx.api.get_bucket(name, None).await?;
+                let meta = ctx.api.get_bucket(name, Some(&fields)).await?;
                 match meta.labels {
                     Some(labels) if !labels.is_empty() => {
                         let json = serde_json::to_string_pretty(&labels).map_err(|e| {
@@ -464,7 +601,7 @@ pub async fn run_label(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()
         "set" => {
             if args.len() < 3 {
                 return Err(GsutilError::command(
-                    "label set requires a JSON file and at least one bucket URL.",
+                    "The label command requires at least 3 arguments.",
                 ));
             }
             let raw_json = read_json_arg(&args[1])?;
@@ -475,17 +612,29 @@ pub async fn run_label(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()
             let buckets = expand_bucket_urls(ctx, &args[2..], "label").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                writeln!(
-                    ctx.err,
+                let api = ctx.api.for_provider(b.scheme.as_str())?;
+                let existing = api.get_bucket(name, Some(&["labels".to_string()])).await?;
+                let removals: Vec<String> = existing
+                    .labels
+                    .unwrap_or_default()
+                    .keys()
+                    .filter(|k| !labels.contains_key(*k))
+                    .cloned()
+                    .collect();
+                ctx.info(&format!(
                     "Setting label configuration on {}...",
                     b.bucket_url_string()
-                )?;
+                ))?;
                 let patch = Bucket {
-                    labels: Some(labels.clone()),
+                    labels: if labels.is_empty() {
+                        None
+                    } else {
+                        Some(labels.clone())
+                    },
+                    label_removals: removals,
                     ..Default::default()
                 };
-                ctx.api
-                    .patch_bucket(name, &patch, None, None, None, None)
+                api.patch_bucket(name, &patch, None, None, None, None)
                     .await?;
             }
             Ok(())
@@ -503,9 +652,14 @@ pub async fn run_label(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()
                             .ok_or_else(|| GsutilError::command("Option -l requires key:value."))?;
                         let (k, v) = kv.split_once(':').ok_or_else(|| {
                             GsutilError::command(format!(
-                                "Found invalid label change \"{kv}\"; expected key:value."
+                                "Found incorrectly formatted option for \"gsutil label ch\": \"{kv}\". Expected key:value."
                             ))
                         })?;
+                        if k.is_empty() || v.contains(':') {
+                            return Err(GsutilError::command(format!(
+                                "Found incorrectly formatted option for \"gsutil label ch\": \"{kv}\". Expected key:value."
+                            )));
+                        }
                         updates.push((k.to_string(), Some(v.to_string())));
                     }
                     "-d" => {
@@ -513,6 +667,11 @@ pub async fn run_label(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()
                         let k = args.get(i).ok_or_else(|| {
                             GsutilError::command("Option -d requires a label key.")
                         })?;
+                        if k.contains(':') {
+                            return Err(GsutilError::command(format!(
+                                "Found incorrectly formatted option for \"gsutil label ch\": \"{k}\". To delete a label, provide only its key."
+                            )));
+                        }
                         updates.push((k.clone(), None));
                     }
                     other => url_args.push(other.to_string()),
@@ -521,7 +680,7 @@ pub async fn run_label(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()
             }
             if updates.is_empty() {
                 return Err(GsutilError::command(
-                    "Please specify at least one -l or -d flag with label ch.",
+                    "Please specify at least one label change with the -l or -d flags.",
                 ));
             }
             let buckets = expand_bucket_urls(ctx, &url_args, "label").await?;
@@ -581,10 +740,11 @@ pub async fn run_requesterpays(ctx: &mut AdminContext<'_>, args: &[String]) -> R
     }
     match args[0].as_str() {
         "get" => {
+            let fields = ["billing".to_string()];
             let buckets = expand_bucket_urls(ctx, &args[1..], "requesterpays").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                let meta = ctx.api.get_bucket(name, None).await?;
+                let meta = ctx.api.get_bucket(name, Some(&fields)).await?;
                 let enabled = meta.billing.and_then(|b| b.requester_pays).unwrap_or(false);
                 let state = if enabled { "Enabled" } else { "Disabled" };
                 writeln!(ctx.out, "{}: {state}", bucket_display_no_slash(&b))?;
@@ -638,15 +798,28 @@ pub async fn run_defstorageclass(ctx: &mut AdminContext<'_>, args: &[String]) ->
             "defstorageclass requires a subcommand (get|set) and arguments.",
         ));
     }
+    let check_gs_urls = |urls: &[String]| -> Result<()> {
+        for raw in urls {
+            let parsed = StorageUrl::parse(raw)?;
+            if !matches!(parsed, StorageUrl::Cloud(ref c) if c.scheme.as_str() == "gs") {
+                return Err(GsutilError::command(format!(
+                    "\"defstorageclass\" does not support the URL \"{raw}\". Did you mean to use a gs:// URL?"
+                )));
+            }
+        }
+        Ok(())
+    };
+    let fields = ["storageClass".to_string()];
     match args[0].as_str() {
         "get" => {
+            check_gs_urls(&args[1..])?;
             let buckets = expand_bucket_urls(ctx, &args[1..], "defstorageclass").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
                 let meta = ctx
                     .api
                     .for_provider(b.scheme.as_str())?
-                    .get_bucket(name, None)
+                    .get_bucket(name, Some(&fields))
                     .await?;
                 let sc = meta.storage_class.as_deref().unwrap_or("STANDARD");
                 writeln!(ctx.out, "{}: {sc}", bucket_display_no_slash(&b))?;
@@ -656,10 +829,27 @@ pub async fn run_defstorageclass(ctx: &mut AdminContext<'_>, args: &[String]) ->
         "set" => {
             if args.len() < 3 {
                 return Err(GsutilError::command(
-                    "defstorageclass set requires a storage class and bucket URL(s).",
+                    "The defstorageclass command requires at least 3 arguments.",
                 ));
             }
+            check_gs_urls(&args[2..])?;
             let sc = normalize_storage_class(&args[1]);
+            const VALID_STORAGE_CLASSES: &[&str] = &[
+                "STANDARD",
+                "NEARLINE",
+                "COLDLINE",
+                "ARCHIVE",
+                "MULTI_REGIONAL",
+                "REGIONAL",
+                "DURABLE_REDUCED_AVAILABILITY",
+            ];
+            if !VALID_STORAGE_CLASSES.contains(&sc.as_str()) {
+                return Err(GsutilError::Service(ServiceError::bad_request(
+                    "Invalid storage class",
+                    Some(400),
+                    Some(format!("Invalid storage class \"{}\".", args[1])),
+                )));
+            }
             let buckets = expand_bucket_urls(ctx, &args[2..], "defstorageclass").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
@@ -673,7 +863,7 @@ pub async fn run_defstorageclass(ctx: &mut AdminContext<'_>, args: &[String]) ->
                 };
                 ctx.api
                     .for_provider(b.scheme.as_str())?
-                    .patch_bucket(name, &patch, None, None, None, None)
+                    .patch_bucket(name, &patch, None, None, None, Some(&fields))
                     .await?;
             }
             Ok(())
@@ -704,12 +894,13 @@ pub async fn run_ubla(ctx: &mut AdminContext<'_>, args: &[String], legacy_bpo: b
             "{cmd_name} requires a subcommand (get|set) and arguments."
         )));
     }
+    let fields = ["iamConfiguration".to_string()];
     match args[0].as_str() {
         "get" => {
             let buckets = expand_bucket_urls(ctx, &args[1..], cmd_name).await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                let meta = ctx.api.get_bucket(name, None).await?;
+                let meta = ctx.api.get_bucket(name, Some(&fields)).await?;
                 let ubla = meta
                     .iam_configuration
                     .and_then(|c| c.uniform_bucket_level_access.or(c.bucket_policy_only));
@@ -758,13 +949,13 @@ pub async fn run_ubla(ctx: &mut AdminContext<'_>, args: &[String], legacy_bpo: b
                     ..Default::default()
                 };
                 ctx.api
-                    .patch_bucket(name, &patch, None, None, None, None)
+                    .patch_bucket(name, &patch, None, None, None, Some(&fields))
                     .await?;
             }
             Ok(())
         }
         other => Err(GsutilError::command(format!(
-            "{cmd_name} only supports get|set, got \"{other}\""
+            "Invalid subcommand \"{other}\", use get|set instead."
         ))),
     }
 }
@@ -779,12 +970,17 @@ pub async fn run_pap(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
             "pap requires a subcommand (get|set) and arguments.",
         ));
     }
+    let fields = ["iamConfiguration".to_string()];
     match args[0].as_str() {
         "get" => {
             let buckets = expand_bucket_urls(ctx, &args[1..], "pap").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                let meta = ctx.api.get_bucket(name, None).await?;
+                let meta = ctx
+                    .api
+                    .for_provider(b.scheme.as_str())?
+                    .get_bucket(name, Some(&fields))
+                    .await?;
                 let pap = meta
                     .iam_configuration
                     .and_then(|c| c.public_access_prevention)
@@ -802,7 +998,7 @@ pub async fn run_pap(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
             let mode = args[1].as_str();
             if mode != "enforced" && mode != "inherited" {
                 return Err(GsutilError::command(format!(
-                    "Invalid value \"{mode}\" for pap set. Must be \"enforced\" or \"inherited\"."
+                    "{mode} is not a valid value for pap set. Must be \"enforced\" or \"inherited\"."
                 )));
             }
             let buckets = expand_bucket_urls(ctx, &args[2..], "pap").await?;
@@ -821,13 +1017,14 @@ pub async fn run_pap(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
                     ..Default::default()
                 };
                 ctx.api
-                    .patch_bucket(name, &patch, None, None, None, None)
+                    .for_provider(b.scheme.as_str())?
+                    .patch_bucket(name, &patch, None, None, None, Some(&fields))
                     .await?;
             }
             Ok(())
         }
         other => Err(GsutilError::command(format!(
-            "pap only supports get|set, got \"{other}\""
+            "Invalid subcommand \"{other}\" for the pap command."
         ))),
     }
 }
@@ -842,12 +1039,13 @@ pub async fn run_rpo(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
             "rpo requires a subcommand (get|set) and arguments.",
         ));
     }
+    let fields = ["rpo".to_string()];
     match args[0].as_str() {
         "get" => {
             let buckets = expand_bucket_urls(ctx, &args[1..], "rpo").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                let meta = ctx.api.get_bucket(name, None).await?;
+                let meta = ctx.api.get_bucket(name, Some(&fields)).await?;
                 let rpo = meta.rpo.as_deref().unwrap_or("None");
                 writeln!(ctx.out, "{}: {rpo}", bucket_display_no_slash(&b))?;
             }
@@ -899,12 +1097,13 @@ pub async fn run_autoclass(ctx: &mut AdminContext<'_>, args: &[String]) -> Resul
             "autoclass requires a subcommand (get|set) and arguments.",
         ));
     }
+    let fields = ["autoclass".to_string()];
     match args[0].as_str() {
         "get" => {
             let buckets = expand_bucket_urls(ctx, &args[1..], "autoclass").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
-                let meta = ctx.api.get_bucket(name, None).await?;
+                let meta = ctx.api.get_bucket(name, Some(&fields)).await?;
                 let (enabled, toggle_time) = match meta.autoclass {
                     Some(ac) => (
                         ac.enabled.unwrap_or(false),
@@ -1056,9 +1255,23 @@ pub async fn run_retention(ctx: &mut AdminContext<'_>, args: &[String]) -> Resul
             Ok(())
         }
         "clear" => {
+            let fields = ["retentionPolicy".to_string()];
             let buckets = expand_bucket_urls(ctx, &args[1..], "retention").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
+                let api = ctx.api.for_provider(b.scheme.as_str())?;
+                let meta = api.get_bucket(name, Some(&fields)).await?;
+                if meta
+                    .retention_policy
+                    .as_ref()
+                    .and_then(|rp| rp.is_locked)
+                    .unwrap_or(false)
+                {
+                    return Err(GsutilError::command(format!(
+                        "Bucket \"{}\" has a locked Retention Policy which cannot be removed.",
+                        b.bucket_url_string()
+                    )));
+                }
                 ctx.info(&format!(
                     "Clearing Retention Policy on {}...",
                     b.bucket_url_string()
@@ -1067,21 +1280,23 @@ pub async fn run_retention(ctx: &mut AdminContext<'_>, args: &[String]) -> Resul
                     clear_fields: vec!["retentionPolicy".to_string()],
                     ..Default::default()
                 };
-                ctx.api
-                    .for_provider(b.scheme.as_str())?
-                    .patch_bucket(name, &patch, None, None, None, None)
+                api.patch_bucket(name, &patch, None, None, None, Some(&fields))
                     .await?;
             }
             Ok(())
         }
         "get" => {
+            if args[1..].iter().any(|a| a.starts_with('-')) {
+                return Err(GsutilError::command("Incorrect option(s) specified."));
+            }
+            let fields = ["retentionPolicy".to_string()];
             let buckets = expand_bucket_urls(ctx, &args[1..], "retention").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
                 let meta = ctx
                     .api
                     .for_provider(b.scheme.as_str())?
-                    .get_bucket(name, None)
+                    .get_bucket(name, Some(&fields))
                     .await?;
                 writeln!(
                     ctx.out,
@@ -1092,13 +1307,17 @@ pub async fn run_retention(ctx: &mut AdminContext<'_>, args: &[String]) -> Resul
             Ok(())
         }
         "lock" => {
+            if args[1..].iter().any(|a| a.starts_with('-')) {
+                return Err(GsutilError::command("Incorrect option(s) specified."));
+            }
+            let fields = ["retentionPolicy".to_string(), "metageneration".to_string()];
             let buckets = expand_bucket_urls(ctx, &args[1..], "retention").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
                 let meta = ctx
                     .api
                     .for_provider(b.scheme.as_str())?
-                    .get_bucket(name, None)
+                    .get_bucket(name, Some(&fields))
                     .await?;
                 if meta
                     .retention_policy
@@ -1165,7 +1384,7 @@ pub async fn run_retention(ctx: &mut AdminContext<'_>, args: &[String]) -> Resul
                 "release" => false,
                 other => {
                     return Err(GsutilError::command(format!(
-                        "Invalid action \"{other}\" for retention event-default; expected set|release."
+                        "Invalid subcommand \"{other}\" for the \"retention event-default\" command."
                     )));
                 }
             };
@@ -1195,7 +1414,7 @@ pub async fn run_retention(ctx: &mut AdminContext<'_>, args: &[String]) -> Resul
                 "release" => false,
                 other => {
                     return Err(GsutilError::command(format!(
-                        "Invalid action \"{other}\" for retention {}; expected set|release.",
+                        "Invalid subcommand \"{other}\" for the \"retention {}\" command.",
                         args[0]
                     )));
                 }

@@ -1,8 +1,8 @@
 //! `gsutil ls` (`dir`, `list`) command (`-l`, `-L`, `-a`, `-b`, `-d`, `-e`, `-h`, `-p`, `-r`/`-R`).
 
-use gsutil_core::api::{BucketListingRef, CloudApi};
-use gsutil_core::error::{no_urls_matched_target, GsutilError, Result};
-use gsutil_core::url::{contains_wildcard, StorageUrl};
+use gsutil_core::api::{BucketListingRef, CloudApi, CsObjectOrPrefix, ListObjectsOptions};
+use gsutil_core::error::{no_urls_matched_target, GsutilError, Result, ServiceErrorKind};
+use gsutil_core::url::{contains_wildcard, CloudScheme, CloudUrl, StorageUrl};
 
 use crate::context::{insist_ascii, CommandContext};
 use crate::dispatch::{CommandSpec, NO_MAX};
@@ -137,13 +137,58 @@ pub async fn run(ctx: &mut CommandContext, sub_opts: &[OptPair], args: &[String]
             }
         } else if storage_url.is_bucket() && opts.get_bucket_info {
             let fields = bucket_fields_for_style(opts.style);
-            let blrs = iter_buckets(
+            let blrs = match iter_buckets(
                 api.as_ref(),
                 url_str,
                 effective_project.as_deref(),
                 fields.as_deref(),
             )
-            .await?;
+            .await
+            {
+                Ok(b) => b,
+                Err(GsutilError::Service(ref se))
+                    if se.kind == ServiceErrorKind::BadRequest
+                        && opts.style == ListingStyle::LongLong
+                        && (se.reason.contains("Uniform bucket-level access")
+                            || se.reason.contains("legacy ACL")) =>
+                {
+                    let no_acl_fields: Vec<String> = [
+                        "id",
+                        "name",
+                        "location",
+                        "locationType",
+                        "storageClass",
+                        "versioning",
+                        "logging",
+                        "website",
+                        "cors",
+                        "lifecycle",
+                        "billing",
+                        "labels",
+                        "encryption",
+                        "timeCreated",
+                        "updated",
+                        "metageneration",
+                        "iamConfiguration",
+                        "retentionPolicy",
+                        "defaultEventBasedHold",
+                        "autoclass",
+                        "customPlacementConfig",
+                        "rpo",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+                    iter_buckets(
+                        api.as_ref(),
+                        url_str,
+                        effective_project.as_deref(),
+                        Some(&no_acl_fields),
+                    )
+                    .await?
+                }
+                Err(e) => return Err(e),
+            };
             let mut count = 0usize;
             for blr in blrs {
                 if !contains_wildcard(url_str) {
@@ -303,6 +348,97 @@ type LsFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<(u64, u64, u64)>> + 'a>>;
 
 #[allow(clippy::too_many_arguments)]
+fn recurse_prefix_and_print<'a>(
+    ctx: &'a CommandContext,
+    api: &'a dyn CloudApi,
+    scheme: CloudScheme,
+    bucket: String,
+    prefix: String,
+    opts: &'a LsOpts,
+    mut print_initial_newline: bool,
+) -> LsFuture<'a> {
+    Box::pin(async move {
+        let provider_api = api.for_provider(scheme.as_str())?;
+        let list_opts = ListObjectsOptions {
+            prefix: Some(prefix.clone()),
+            delimiter: Some("/".to_string()),
+            all_versions: opts.all_versions,
+            fields: None,
+        };
+        let raw_items = provider_api.list_objects(&bucket, &list_opts).await?;
+        let mut num_dirs = 0u64;
+        let mut num_objs = 0u64;
+        let mut num_bytes = 0u64;
+
+        for item in raw_items {
+            match item {
+                CsObjectOrPrefix::Object(obj) => {
+                    let name = obj.name.clone().unwrap_or_default();
+                    let gen_opt = if opts.all_versions {
+                        obj.generation.clone()
+                    } else {
+                        None
+                    };
+                    let obj_url = StorageUrl::Cloud(CloudUrl {
+                        scheme,
+                        bucket_name: Some(bucket.clone()),
+                        object_name: Some(name),
+                        generation: gen_opt,
+                    });
+                    let blr = BucketListingRef::Object {
+                        url: obj_url,
+                        metadata: Some(obj),
+                    };
+                    let (o, b) = print_object(ctx, &blr, opts)?;
+                    num_objs += o;
+                    num_bytes += b;
+                }
+                CsObjectOrPrefix::Prefix(sub_prefix) => {
+                    if sub_prefix == prefix {
+                        continue;
+                    }
+                    let pref_url = StorageUrl::Cloud(CloudUrl {
+                        scheme,
+                        bucket_name: Some(bucket.clone()),
+                        object_name: Some(sub_prefix.clone()),
+                        generation: None,
+                    });
+                    let blr = BucketListingRef::Prefix {
+                        url: pref_url.clone(),
+                        prefix: sub_prefix.clone(),
+                    };
+                    if opts.recursive {
+                        if print_initial_newline {
+                            ctx.println("")?;
+                        } else {
+                            print_initial_newline = true;
+                        }
+                        ctx.println(&format!("{}:", pref_url.url_string()))?;
+                        let (nd, no, nb) = recurse_prefix_and_print(
+                            ctx,
+                            api,
+                            scheme,
+                            bucket.clone(),
+                            sub_prefix,
+                            opts,
+                            true,
+                        )
+                        .await?;
+                        num_dirs += nd;
+                        num_objs += no;
+                        num_bytes += nb;
+                    } else {
+                        print_prefix(ctx, &blr, opts.style)?;
+                        num_dirs += 1;
+                    }
+                }
+            }
+        }
+        Ok((num_dirs, num_objs, num_bytes))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn recurse_expand_and_print<'a>(
     ctx: &'a CommandContext,
     api: &'a dyn CloudApi,
@@ -324,21 +460,29 @@ fn recurse_expand_and_print<'a>(
                     num_objs += o;
                     num_bytes += b;
                 }
-                BucketListingRef::Prefix { .. } => {
+                BucketListingRef::Prefix { url, prefix } => {
                     if opts.recursive {
                         if print_initial_newline {
                             ctx.println("")?;
                         } else {
                             print_initial_newline = true;
                         }
-                        ctx.println(&format!("{}:", blr.url().url_string()))?;
-                        let sub_pat = blr.url().create_prefix_url(Some("*"));
-                        let (nd, no, nb) =
-                            recurse_expand_and_print(ctx, api, sub_pat, project_id, opts, true)
-                                .await?;
-                        num_dirs += nd;
-                        num_objs += no;
-                        num_bytes += nb;
+                        ctx.println(&format!("{}:", url.url_string()))?;
+                        if let Some(cloud) = url.as_cloud() {
+                            let (nd, no, nb) = recurse_prefix_and_print(
+                                ctx,
+                                api,
+                                cloud.scheme,
+                                cloud.bucket_name.clone().unwrap_or_default(),
+                                prefix.clone(),
+                                opts,
+                                true,
+                            )
+                            .await?;
+                            num_dirs += nd;
+                            num_objs += no;
+                            num_bytes += nb;
+                        }
                     } else {
                         print_prefix(ctx, blr, opts.style)?;
                         num_dirs += 1;
@@ -392,18 +536,27 @@ async fn list_url(
                     total_bytes += b;
                     print_newline = true;
                 }
-                BucketListingRef::Prefix { .. } => {
+                BucketListingRef::Prefix { url, prefix } => {
                     if print_newline {
                         ctx.println("")?;
                     } else {
                         print_newline = true;
                     }
-                    ctx.println(&format!("{}:", blr.url().url_string()))?;
-                    let sub_pat = blr.url().create_prefix_url(Some("*"));
-                    let (_, no, nb) =
-                        recurse_expand_and_print(ctx, api, sub_pat, project_id, opts, true).await?;
-                    total_objs += no;
-                    total_bytes += nb;
+                    ctx.println(&format!("{}:", url.url_string()))?;
+                    if let Some(cloud) = url.as_cloud() {
+                        let (_, no, nb) = recurse_prefix_and_print(
+                            ctx,
+                            api,
+                            cloud.scheme,
+                            cloud.bucket_name.clone().unwrap_or_default(),
+                            prefix.clone(),
+                            opts,
+                            true,
+                        )
+                        .await?;
+                        total_objs += no;
+                        total_bytes += nb;
+                    }
                 }
                 BucketListingRef::Bucket { .. } => {}
             }
@@ -447,14 +600,29 @@ async fn list_url(
     }
 
     for subdir in subdirs {
-        let pattern = subdir.create_prefix_url(Some("*"));
-        if items.len() > 1 {
-            ctx.println(&format!("{}:", subdir.url_string()))?;
+        let subdir_url_str = subdir.url_string();
+        if contains_wildcard(&subdir_url_str) {
+            return Err(GsutilError::command(format!(
+                "Cloud folder {subdir_url_str} contains a wildcard; gsutil does not currently support objects with wildcards in their name."
+            )));
         }
-        let (_, no, nb) =
-            recurse_expand_and_print(ctx, api, pattern, project_id, opts, true).await?;
-        total_objs += no;
-        total_bytes += nb;
+        if items.len() > 1 {
+            ctx.println(&format!("{subdir_url_str}:"))?;
+        }
+        if let Some(cloud) = subdir.as_cloud() {
+            let (_, no, nb) = recurse_prefix_and_print(
+                ctx,
+                api,
+                cloud.scheme,
+                cloud.bucket_name.clone().unwrap_or_default(),
+                cloud.object_name.clone().unwrap_or_default(),
+                opts,
+                true,
+            )
+            .await?;
+            total_objs += no;
+            total_bytes += nb;
+        }
     }
 
     Ok((true, total_objs, total_bytes))

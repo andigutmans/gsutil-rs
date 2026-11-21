@@ -160,6 +160,23 @@ pub async fn iter_objects(
     all_versions: bool,
     fields: Option<&[String]>,
 ) -> Result<Vec<BucketListingRef>> {
+    // Match Python WildcardIterator.IterObjects: for a non-wildcard bucket URL
+    // (e.g. `gs://nonexistent`), verify bucket existence so GCS returns
+    // BucketNotFoundException / NotFoundException instead of silently returning empty.
+    if let Ok(url) = StorageUrl::parse(url_str) {
+        if let Some(cloud) = url.as_cloud() {
+            if cloud.is_bucket() {
+                let bucket_pat = cloud.bucket_name.as_deref().unwrap_or("");
+                if !contains_wildcard(bucket_pat) {
+                    let provider_api = api.for_provider(cloud.scheme.as_str())?;
+                    provider_api
+                        .get_bucket(bucket_pat, Some(&["id".to_string()]))
+                        .await?;
+                    return Ok(Vec::new());
+                }
+            }
+        }
+    }
     let all = iter_all(api, url_str, project_id, all_versions, fields).await?;
     Ok(all.into_iter().filter(|r| r.is_object()).collect())
 }

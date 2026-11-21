@@ -1010,13 +1010,13 @@ async fn test_bucket_config_commands() {
     )
     .await
     .unwrap();
-    run_cmd(&api, "retention", &["clear", "gs://test-bkt"])
+    // Clearing a locked retention policy must fail!
+    let clear_err = run_cmd(&api, "retention", &["clear", "gs://test-bkt"])
         .await
-        .unwrap();
-    let (out, _) = run_cmd(&api, "retention", &["get", "gs://test-bkt"])
-        .await
-        .unwrap();
-    assert!(out.contains("has no Retention Policy."));
+        .unwrap_err();
+    assert!(clear_err
+        .to_string()
+        .contains("has a locked Retention Policy which cannot be removed"));
 }
 
 #[tokio::test]

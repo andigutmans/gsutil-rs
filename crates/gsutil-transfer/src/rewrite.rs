@@ -43,6 +43,8 @@ pub struct RewriteConfig {
     pub continue_on_error: bool,
     /// `-m`: parallel rewrite execution.
     pub parallel_operations: bool,
+    /// Suppress informational progress lines (`-q`).
+    pub quiet: bool,
     pub preconditions: Option<Preconditions>,
     pub max_bytes_per_call: Option<u64>,
 }
@@ -235,6 +237,27 @@ pub async fn run_rewrite(
         ));
     }
 
+    if cfg.parallel_operations && !cfg.quiet {
+        let force = boto.get_bool("GSUtil", "task_estimation_force", false);
+        let threshold = boto.get_u64("GSUtil", "task_estimation_threshold", 50_000) as usize;
+        if force || (threshold > 0 && targets.len() >= threshold) {
+            let mut total_size = 0u64;
+            for (b, o) in &targets {
+                if let Ok(m) = api
+                    .get_object_metadata(b, o, None, Some(&["size".to_string()]))
+                    .await
+                {
+                    total_size += m.size_bytes();
+                }
+            }
+            eprintln!(
+                "Estimated work for this command: objects: {}, total size: {}",
+                targets.len(),
+                total_size
+            );
+        }
+    }
+
     let desired_sc = cfg.storage_class.as_deref().map(normalize_storage_class);
     let par_cfg = ParallelConfig::from_boto(
         boto,
@@ -311,7 +334,27 @@ async fn rewrite_single_object(
     };
 
     if !sc_needs_change && !enc_needs_change {
+        if !cfg.quiet {
+            eprintln!("Skipping gs://{bucket}/{object_name}");
+        }
         return Ok(SingleRewriteOutcome::Skipped);
+    }
+
+    if !cfg.quiet {
+        if enc_needs_change {
+            let was_encrypted =
+                src_meta.customer_encryption.is_some() || src_meta.kms_key_name.is_some();
+            let will_encrypt = cfg.encryption_key.is_some();
+            let verb = match (was_encrypted, will_encrypt) {
+                (true, true) => "Rotating",
+                (false, true) => "Encrypting",
+                (true, false) => "Decrypting",
+                (false, false) => "Rewriting",
+            };
+            eprintln!("{verb} gs://{bucket}/{object_name}...");
+        } else {
+            eprintln!("Rewriting gs://{bucket}/{object_name}...");
+        }
     }
 
     let mut dst_meta = src_meta.clone();

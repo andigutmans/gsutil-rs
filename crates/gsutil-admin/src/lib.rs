@@ -61,6 +61,27 @@ impl<'a> AdminContext<'a> {
         Ok(())
     }
 
+    /// Emit Python gsutil's `-m` seek-ahead estimation line when `-m` is active
+    /// and `task_estimation_force` is true or `count >= task_estimation_threshold`.
+    pub(crate) fn maybe_report_seek_ahead(&mut self, count: usize) -> Result<()> {
+        if !self.parallel_operations || count == 0 {
+            return Ok(());
+        }
+        let force = self
+            .config
+            .get_bool("GSUtil", "task_estimation_force", false);
+        let threshold =
+            self.config
+                .get_u64("GSUtil", "task_estimation_threshold", 50_000) as usize;
+        if threshold > 0 && (force || count >= threshold) {
+            writeln!(
+                self.err,
+                "Estimated work for this command: objects: {count}"
+            )?;
+        }
+        Ok(())
+    }
+
     /// Prompt the user for `[y|N]` confirmation (default `false`).
     pub fn confirm(&mut self, question: &str) -> Result<bool> {
         if let Some(cb) = self.confirm_fn {
@@ -172,9 +193,14 @@ pub(crate) async fn expand_bucket_urls(
         let url = StorageUrl::parse(raw)?;
         let cloud = match url {
             StorageUrl::Cloud(c) if c.is_bucket() => c,
+            StorageUrl::Cloud(c) if c.is_provider() => {
+                return Err(GsutilError::command(format!(
+                    "The {cmd_name} command does not support provider-only URLs: {raw}"
+                )));
+            }
             _ => {
                 return Err(GsutilError::command(format!(
-                    "The {cmd_name} command requires bucket URLs (e.g. gs://bucket), got: {raw}"
+                    "The {cmd_name} command must specify a bucket URL (e.g. gs://bucket), got: {raw}"
                 )));
             }
         };
@@ -346,8 +372,15 @@ pub(crate) fn read_json_arg(path: &str) -> Result<String> {
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
         Ok(buf)
     } else {
-        std::fs::read_to_string(path)
-            .map_err(|e| GsutilError::command(format!("Could not read file \"{path}\": {e}")))
+        std::fs::read_to_string(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                GsutilError::command(format!(
+                    "Could not find the file \"{path}\". No such file or directory"
+                ))
+            } else {
+                GsutilError::command(format!("Could not read file \"{path}\": {e}"))
+            }
+        })
     }
 }
 

@@ -298,6 +298,23 @@ pub async fn run(ctx: &mut CommandContext, sub_opts: &[OptPair], args: &[String]
         }
     }
 
+    if ctx.global.parallel_operations && !ctx.global.quiet && !work_items.is_empty() {
+        let force_est = ctx
+            .config
+            .get_bool("GSUtil", "task_estimation_force", false);
+        let threshold = ctx
+            .config
+            .get("GSUtil", "task_estimation_threshold")
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(50_000);
+        if force_est || (threshold > 0 && (work_items.len() as i64) >= threshold) {
+            ctx.error(&format!(
+                "Estimated work for this command: objects: {}",
+                work_items.len()
+            ));
+        }
+    }
+
     let concurrency = if ctx.global.parallel_operations {
         ctx.config.parallel_thread_count().max(1)
     } else {

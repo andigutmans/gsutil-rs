@@ -300,7 +300,7 @@ pub fn format_bucket_info_long_long(url_str: &str, bucket: &Bucket) -> String {
         if let Some(ref locs) = cpc.data_locations {
             let formatted = locs
                 .iter()
-                .map(|l| format!("'{l}'"))
+                .map(|l| format!("'{}'", l.to_ascii_uppercase()))
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!("\tPlacement locations:\t\t[{formatted}]\n"));
@@ -315,9 +315,8 @@ pub fn format_bucket_info_long_long(url_str: &str, bucket: &Bucket) -> String {
     if bucket.retention_policy.is_some() {
         out.push_str("\tRetention Policy:\t\tPresent\n");
     }
-    if let Some(debh) = bucket.default_event_based_hold {
-        let s = if debh { "True" } else { "False" };
-        out.push_str(&format!("\tDefault Event-Based Hold:\t{s}\n"));
+    if bucket.default_event_based_hold == Some(true) {
+        out.push_str("\tDefault Event-Based Hold:\tTrue\n");
     }
     out.push_str(&format!("\tLabels:\t\t\t\t{labels}\n"));
     out.push_str(&format!("\tDefault KMS key:\t\t{default_kms_key}\n"));

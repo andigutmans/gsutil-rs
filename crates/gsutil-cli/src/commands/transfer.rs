@@ -287,6 +287,7 @@ fn build_copy_config(
 ) -> Result<CopyConfig> {
     let mut cfg = CopyConfig {
         parallel_operations: ctx.global.parallel_operations,
+        quiet: ctx.global.quiet,
         headers: ctx.global.headers.clone(),
         preconditions: Some(ctx.preconditions_from_headers()?),
         encryption_key: crate::encryption::configured_encryption_key(&ctx.config)?,
@@ -296,6 +297,11 @@ fn build_copy_config(
         ui: Some(UIController::new(ctx.global.quiet)),
         ..Default::default()
     };
+
+    let mut saw_z_lower = false;
+    let mut saw_z_upper = false;
+    let mut saw_j_lower = false;
+    let mut saw_j_upper = false;
 
     for (o, a) in sub_opts {
         match o.as_str() {
@@ -310,14 +316,17 @@ fn build_copy_config(
             "-P" => cfg.preserve_posix = true,
             "-r" | "-R" => cfg.recursive = true,
             "-s" => cfg.storage_class = Some(a.clone()),
-            "-t" if !a.is_empty() => {
-                // Content-type header override if supplied via -t.
-                cfg.headers.insert("content-type".to_string(), a.clone());
+            "-t" => {
+                // Deprecated no-op flag in gsutil cp/mv (matches gslib/commands/cp.py).
             }
             "-U" => cfg.skip_unsupported = true,
             "-v" => cfg.print_created_version = true,
-            "-Z" => cfg.gzip_mode = GzipMode::All,
+            "-Z" => {
+                saw_z_upper = true;
+                cfg.gzip_mode = GzipMode::All;
+            }
             "-z" => {
+                saw_z_lower = true;
                 let exts: Vec<String> = a
                     .split(',')
                     .map(|s| s.trim().to_string())
@@ -325,8 +334,12 @@ fn build_copy_config(
                     .collect();
                 cfg.gzip_mode = GzipMode::Extensions(exts);
             }
-            "-J" => cfg.gzip_transport = GzipMode::All,
+            "-J" => {
+                saw_j_upper = true;
+                cfg.gzip_transport = GzipMode::All;
+            }
             "-j" => {
+                saw_j_lower = true;
                 let exts: Vec<String> = a
                     .split(',')
                     .map(|s| s.trim().to_string())
@@ -336,6 +349,17 @@ fn build_copy_config(
             }
             _ => {}
         }
+    }
+
+    if saw_z_lower && saw_z_upper {
+        return Err(GsutilError::command(
+            "Specifying both the -z and -Z options together is invalid.",
+        ));
+    }
+    if saw_j_lower && saw_j_upper {
+        return Err(GsutilError::command(
+            "Specifying both the -j and -J options together is invalid.",
+        ));
     }
 
     if cfg.read_stdin_urls {
@@ -400,6 +424,7 @@ pub async fn run_rsync_cmd(
         src_url: args[0].clone(),
         dst_url: args[1].clone(),
         parallel_operations: ctx.global.parallel_operations,
+        quiet: ctx.global.quiet,
         ui: Some(UIController::new(ctx.global.quiet)),
         ..Default::default()
     };
@@ -468,7 +493,7 @@ pub async fn run_compose_cmd(
 ) -> Result<i32> {
     if args.len() < 2 {
         return Err(GsutilError::command(
-            "\"compose\" requires at least one source object and a destination object.",
+            "\"compose\" requires at least 1 component object.",
         ));
     }
     let cfg = ComposeConfig {
@@ -490,6 +515,7 @@ pub async fn run_rewrite_cmd(
 ) -> Result<i32> {
     let mut cfg = RewriteConfig {
         parallel_operations: ctx.global.parallel_operations,
+        quiet: ctx.global.quiet,
         preconditions: Some(ctx.preconditions_from_headers()?),
         encryption_key: crate::encryption::configured_encryption_key(&ctx.config)?,
         decryption_key: crate::encryption::primary_decryption_key(&ctx.config)?,

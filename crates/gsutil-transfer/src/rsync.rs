@@ -72,6 +72,8 @@ pub struct RsyncConfig {
     pub parallel_operations: bool,
     /// Override for external merge-sort chunk size (defaults to `GSUtil:rsync_buffer_lines`).
     pub buffer_lines: Option<usize>,
+    /// Suppress informational progress lines (`-q`).
+    pub quiet: bool,
     /// Optional interactive TTY progress controller (`UIController`).
     pub ui: Option<Arc<UIController>>,
 }
@@ -184,8 +186,28 @@ pub async fn run_rsync(
         })
         .max(1);
 
-    let src_entries = list_tree(api.as_ref(), &src_root, cfg, exclude_re.as_ref()).await?;
-    let dst_entries = list_tree(api.as_ref(), &dst_root, cfg, exclude_re.as_ref()).await?;
+    if !cfg.quiet {
+        eprintln!("Building synchronization state...");
+    }
+
+    let src_entries = match list_tree(api.as_ref(), &src_root, cfg, exclude_re.as_ref()).await {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!("{err}");
+            return Err(GsutilError::command(
+                "Caught non-retryable exception - aborting rsync",
+            ));
+        }
+    };
+    let dst_entries = match list_tree(api.as_ref(), &dst_root, cfg, exclude_re.as_ref()).await {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!("{err}");
+            return Err(GsutilError::command(
+                "Caught non-retryable exception - aborting rsync",
+            ));
+        }
+    };
 
     // External merge-sort both listings to temp files.
     let sorted_src_file = batch_sort_entries(src_entries.into_iter(), buffer_lines)?;
@@ -198,20 +220,42 @@ pub async fn run_rsync(
         cfg,
     )?;
 
+    if !cfg.quiet {
+        eprintln!("Starting synchronization...");
+    }
+
     let mut summary = RsyncSummary {
         planned_actions: actions.clone(),
         ..Default::default()
     };
 
-    if cfg.dry_run || actions.is_empty() {
+    if cfg.dry_run {
+        if !cfg.quiet {
+            for act in &actions {
+                match act {
+                    DiffAction::Copy {
+                        src_url, dst_url, ..
+                    } => eprintln!("Would copy {src_url} to {dst_url}"),
+                    DiffAction::Remove { dst_url, .. } => eprintln!("Would remove {dst_url}"),
+                    DiffAction::PosixSrcToDst { dst_url, .. } => {
+                        eprintln!("Would set POSIX attributes on {dst_url}")
+                    }
+                }
+            }
+        }
+        return Ok(summary);
+    }
+
+    if actions.is_empty() {
         return Ok(summary);
     }
 
     let copy_cfg = Arc::new(CopyConfig {
         preserve_acl: cfg.preserve_acl,
         preserve_posix: cfg.preserve_posix,
+        preserve_mtime: true,
         canned_acl: cfg.canned_acl.clone(),
-        gzip_mode: if cfg.gzip_all {
+        gzip_transport: if cfg.gzip_all {
             GzipMode::All
         } else {
             match &cfg.gzip_extensions {
@@ -221,6 +265,7 @@ pub async fn run_rsync(
         },
         continue_on_error: cfg.continue_on_error,
         parallel_operations: cfg.parallel_operations,
+        quiet: cfg.quiet,
         ui: cfg.ui.clone(),
         ..Default::default()
     });
@@ -269,12 +314,16 @@ pub async fn run_rsync(
     summary.failed += copy_batch.failed;
 
     // 2. Removals (-d)
+    let quiet_remove = cfg.quiet;
     let remove_batch = run_parallel(remove_actions, &par_cfg, {
         let api = Arc::clone(&api);
         move |act| {
             let api = Arc::clone(&api);
             async move {
                 if let DiffAction::Remove { dst_url, .. } = act {
+                    if !quiet_remove {
+                        eprintln!("Removing {dst_url}...");
+                    }
                     let d = StorageUrl::parse(&dst_url)?;
                     match d {
                         StorageUrl::Cloud(c) => {
@@ -340,7 +389,7 @@ pub async fn run_rsync(
 
     if summary.failed > 0 {
         return Err(GsutilError::command(format!(
-            "{} file(s)/object(s) could not be synchronized.",
+            "{} files/objects could not be copied/removed.",
             summary.failed
         )));
     }
@@ -786,6 +835,14 @@ async fn list_cloud_tree(
             }
         }
 
+        if let Some(ref custom_meta) = obj.metadata {
+            if let Some(raw_mtime) = custom_meta.get(crate::posix::MTIME_ATTR) {
+                let parsed = raw_mtime.trim().parse::<i64>().ok();
+                if parsed.is_none_or(|v| v < 0) {
+                    eprintln!("WARNING: {full_url} has an invalid mtime in its metadata");
+                }
+            }
+        }
         let posix = obj
             .metadata
             .as_ref()

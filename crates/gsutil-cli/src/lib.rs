@@ -193,9 +193,25 @@ pub async fn run_cli_with_api(raw_argv: &[String], api: Option<Arc<dyn CloudApi>
         let _ = run_named_command(&mut ctx, "ver", &["-l".to_string()]).await;
         let config_paths = ctx.config.friendly_config_file_paths();
         let redacted = ctx.config.redacted_debug_items();
+        let paths_py = config_paths
+            .iter()
+            .map(|p| format!("'{}'", p.replace('\\', "\\\\").replace('\'', "\\'")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let config_py = redacted
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    "('{}', '{}')",
+                    k.replace('\\', "\\\\").replace('\'', "\\'"),
+                    v.replace('\\', "\\\\").replace('\'', "\\'")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         let _ = writeln!(io::stderr(), "Command being run: {}", raw_argv.join(" "));
-        let _ = writeln!(io::stderr(), "config_file_list: {config_paths:?}");
-        let _ = writeln!(io::stderr(), "config: {redacted:?}");
+        let _ = writeln!(io::stderr(), "config_file_list: [{paths_py}]");
+        let _ = writeln!(io::stderr(), "config: [{config_py}]");
     }
 
     if !ctx.config.https_validate_certificates() {

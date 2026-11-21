@@ -1,9 +1,11 @@
 //! CLI runner for the `gsutil-parity` differential compatibility & benchmark suite.
 
 use gsutil_parity::cases::{run_live_gcs_suite, run_mock_gcs_suite, run_offline_suite};
+use gsutil_parity::mock_gcs::MockGcsServer;
 use gsutil_parity::runner::GsutilRunner;
 use gsutil_parity::scorecard::ParityScorecard;
 use gsutil_parity::stage1_gates::run_stage1_gates;
+use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -13,6 +15,7 @@ enum Mode {
     Live,
     Stage1,
     All,
+    ServeMockTls { port: u16, ca_out: Option<PathBuf> },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -24,6 +27,9 @@ enum Format {
 
 fn parse_args() -> (Mode, Format, Option<String>, Option<PathBuf>, GsutilRunner) {
     let mut mode = Mode::Offline;
+    let mut serve_mock_tls = false;
+    let mut serve_port: u16 = 0;
+    let mut serve_ca_out: Option<PathBuf> = None;
     let mut format = Format::Markdown;
     let mut filter: Option<String> = None;
     let mut out_dir: Option<PathBuf> = None;
@@ -32,6 +38,20 @@ fn parse_args() -> (Mode, Format, Option<String>, Option<PathBuf>, GsutilRunner)
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--serve-mock-tls" => {
+                serve_mock_tls = true;
+            }
+            "--port" => {
+                if let Some(p) = args.next() {
+                    serve_port = p.parse().unwrap_or_else(|_| {
+                        eprintln!("Invalid --port: {p}");
+                        std::process::exit(2);
+                    });
+                }
+            }
+            "--ca-out" => {
+                serve_ca_out = args.next().map(PathBuf::from);
+            }
             "--mode" => {
                 if let Some(m) = args.next() {
                     mode = match m.as_str() {
@@ -96,12 +116,59 @@ fn parse_args() -> (Mode, Format, Option<String>, Option<PathBuf>, GsutilRunner)
         }
     }
 
+    if serve_mock_tls {
+        mode = Mode::ServeMockTls {
+            port: serve_port,
+            ca_out: serve_ca_out,
+        };
+    }
+
     (mode, format, filter, out_dir, runner)
 }
 
 #[tokio::main]
 async fn main() {
     let (mode, format, filter, out_dir, runner) = parse_args();
+    if let Mode::ServeMockTls { port, ca_out } = mode {
+        let server = MockGcsServer::start_tls_on_port(port)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to start TLS mock GCS server on port {port}: {e}");
+                std::process::exit(1);
+            });
+        if let Some(ca_path) = ca_out {
+            if let Some(parent) = ca_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
+            if let Some(ref pem) = server.ca_cert_pem {
+                std::fs::write(&ca_path, pem).unwrap_or_else(|e| {
+                    eprintln!("Failed to write CA PEM to {}: {e}", ca_path.display());
+                    std::process::exit(1);
+                });
+            }
+        }
+        println!("READY {}", server.base_url());
+        let _ = std::io::stdout().flush();
+
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        drop(server);
+        return;
+    }
+
     let mut all_results = Vec::new();
 
     match mode {
@@ -133,6 +200,7 @@ async fn main() {
                 }
             }
         }
+        Mode::ServeMockTls { .. } => unreachable!(),
     }
 
     let scorecard = ParityScorecard::from_results(all_results);

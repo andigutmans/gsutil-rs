@@ -1296,3 +1296,239 @@ async fn test_upload_object_streaming_chunked_async_read() {
         .unwrap();
     assert_eq!(obj.generation.as_deref(), Some("909"));
 }
+
+#[tokio::test]
+async fn test_csek_auto_decryption_in_get_object_metadata_and_list_objects() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
+    let server = MockServer::start().await;
+    let raw_key = [0x42u8; 32];
+    let key_b64 = STANDARD.encode(raw_key);
+    let key_sha256_b64 = STANDARD.encode(Sha256::digest(raw_key));
+
+    // Initial GET without CSEK header returns customerEncryption without hashes.
+    Mock::given(method("GET"))
+        .and(path("/storage/v1/b/csek-bkt/o/secret.bin"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "bucket": "csek-bkt",
+            "name": "secret.bin",
+            "size": "16",
+            "customerEncryption": {
+                "encryptionAlgorithm": "AES256",
+                "keySha256": key_sha256_b64
+            }
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    // Follow-up GET with CSEK headers returns decrypted crc32c & md5Hash.
+    Mock::given(method("GET"))
+        .and(path("/storage/v1/b/csek-bkt/o/secret.bin"))
+        .and(header("x-goog-encryption-algorithm", "AES256"))
+        .and(header("x-goog-encryption-key", key_b64.as_str()))
+        .and(header(
+            "x-goog-encryption-key-sha256",
+            key_sha256_b64.as_str(),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "bucket": "csek-bkt",
+            "name": "secret.bin",
+            "size": "16",
+            "crc32c": "mnG7TA==",
+            "md5Hash": "XUFAKrxLKna5cZ2REBfFkg==",
+            "customerEncryption": {
+                "encryptionAlgorithm": "AES256",
+                "keySha256": key_sha256_b64
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cfg = GcsJsonClientConfig::for_mock_server(server.uri());
+    cfg.csek_keys = vec![(key_b64, key_sha256_b64)];
+    let client = GcsJsonClient::new(
+        cfg,
+        Arc::new(StaticTokenProvider {
+            token: "csek-tok".to_string(),
+        }),
+    )
+    .unwrap();
+
+    let obj = client
+        .get_object_metadata("csek-bkt", "secret.bin", None, None)
+        .await
+        .unwrap();
+    assert_eq!(obj.crc32c.as_deref(), Some("mnG7TA=="));
+    assert_eq!(obj.md5_hash.as_deref(), Some("XUFAKrxLKna5cZ2REBfFkg=="));
+}
+
+#[tokio::test]
+async fn test_csek_fallback_download_and_rewrite_key_rotation() {
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+
+    let server = MockServer::start().await;
+    let key1_bytes = [0x11u8; 32];
+    let key1_b64 = BASE64_STANDARD.encode(key1_bytes);
+    let key1_sha = BASE64_STANDARD.encode(Sha256::digest(key1_bytes));
+
+    let key2_bytes = [0x22u8; 32];
+    let key2_b64 = BASE64_STANDARD.encode(key2_bytes);
+    let key2_sha = BASE64_STANDARD.encode(Sha256::digest(key2_bytes));
+
+    // Download attempt with wrong primary key (key2) gets 400 CSEK error.
+    Mock::given(method("GET"))
+        .and(path("/storage/v1/b/csek-bkt/o/rot.bin"))
+        .and(query_param("alt", "media"))
+        .and(header("x-goog-encryption-key-sha256", key2_sha.as_str()))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": {
+                "code": 400,
+                "message": "The target object is encrypted by a customer-supplied encryption key."
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Metadata lookup reveals key1_sha.
+    Mock::given(method("GET"))
+        .and(path("/storage/v1/b/csek-bkt/o/rot.bin"))
+        .and(query_param("fields", "customerEncryption"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "bucket": "csek-bkt",
+            "name": "rot.bin",
+            "customerEncryption": {
+                "encryptionAlgorithm": "AES256",
+                "keySha256": key1_sha
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    // Retry download with resolved key1 succeeds.
+    Mock::given(method("GET"))
+        .and(path("/storage/v1/b/csek-bkt/o/rot.bin"))
+        .and(query_param("alt", "media"))
+        .and(header("x-goog-encryption-key-sha256", key1_sha.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes("secret-data"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Rewrite with key1 as source and key2 as destination succeeds on first try when
+    // src_obj_metadata carries customerEncryption.keySha256 = key1_sha.
+    Mock::given(method("POST"))
+        .and(path(
+            "/storage/v1/b/csek-bkt/o/rot.bin/rewriteTo/b/csek-bkt/o/rot.bin",
+        ))
+        .and(header(
+            "x-goog-copy-source-encryption-key-sha256",
+            key1_sha.as_str(),
+        ))
+        .and(header("x-goog-encryption-key-sha256", key2_sha.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "done": true,
+            "resource": {
+                "bucket": "csek-bkt",
+                "name": "rot.bin",
+                "generation": "2",
+                "customerEncryption": {
+                    "encryptionAlgorithm": "AES256",
+                    "keySha256": key2_sha
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cfg = GcsJsonClientConfig::for_mock_server(server.uri());
+    cfg.csek_keys = vec![
+        (key2_b64.clone(), key2_sha.clone()),
+        (key1_b64.clone(), key1_sha.clone()),
+    ];
+    let client = GcsJsonClient::new(
+        cfg,
+        Arc::new(StaticTokenProvider {
+            token: "csek-tok".to_string(),
+        }),
+    )
+    .unwrap();
+
+    let key2 = EncryptionKey::Csek {
+        key_b64: key2_b64,
+        key_sha256_b64: key2_sha.clone(),
+    };
+
+    // 1. Download passing mismatched primary key2 automatically falls back to key1.
+    let bytes = client
+        .get_object_media(
+            "csek-bkt",
+            "rot.bin",
+            &DownloadOptions {
+                decryption_key: Some(key2.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"secret-data");
+
+    // 2. Rewrite passing mismatched primary key2 as decryption_key and key2 as encryption_key
+    //    auto-selects key1 for x-goog-copy-source-encryption-key.
+    let src_meta = Object {
+        bucket: Some("csek-bkt".to_string()),
+        name: Some("rot.bin".to_string()),
+        customer_encryption: Some(gsutil_core::api::ObjectCustomerEncryption {
+            encryption_algorithm: Some("AES256".to_string()),
+            key_sha256: Some(key1_sha),
+        }),
+        ..Default::default()
+    };
+    let dst_meta = Object {
+        bucket: Some("csek-bkt".to_string()),
+        name: Some("rot.bin".to_string()),
+        ..Default::default()
+    };
+    let rotated = client
+        .copy_object(
+            &src_meta,
+            &dst_meta,
+            &CopyOptions {
+                encryption_key: Some(key2.clone()),
+                decryption_key: Some(key2),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rotated
+            .customer_encryption
+            .as_ref()
+            .and_then(|c| c.key_sha256.as_deref()),
+        Some(key2_sha.as_str())
+    );
+}
+
+#[test]
+fn test_gs_json_host_ignores_ambient_mtls_but_rejects_explicit_boto_mtls() {
+    let mut cfg = BotoConfig::default();
+    cfg.set("Credentials", "gs_json_host", "127.0.0.1");
+    cfg.set("Credentials", "gs_json_port", "18080");
+    // Without explicit [Credentials] use_client_certificate = True, custom host succeeds
+    // even when the environment sets CLOUDSDK_CONTEXT_AWARE_USE_CLIENT_CERTIFICATE=true.
+    let resolved = GcsJsonClientConfig::from_boto_config(&cfg).unwrap();
+    assert!(resolved.storage_base_url.contains("127.0.0.1:18080"));
+
+    // Explicit [Credentials] use_client_certificate = True + gs_json_host must fail.
+    cfg.set("Credentials", "use_client_certificate", "True");
+    let err = GcsJsonClientConfig::from_boto_config(&cfg).unwrap_err();
+    assert!(err.to_string().contains("use_client_certificate"));
+}

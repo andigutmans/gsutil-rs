@@ -124,6 +124,8 @@ pub struct CopyConfig {
     pub continue_on_error: bool,
     pub preserve_acl: bool,
     pub preserve_posix: bool,
+    /// Preserve file mtime (`goog-reserved-file-mtime`) without full `-P` POSIX attrs (used by `rsync`).
+    pub preserve_mtime: bool,
     pub canned_acl: Option<String>,
     pub storage_class: Option<String>,
     /// `-z <exts>` / `-Z`: gzip-compress and store with `Content-Encoding: gzip`.
@@ -144,6 +146,8 @@ pub struct CopyConfig {
     pub encryption_key: Option<EncryptionKey>,
     pub decryption_key: Option<EncryptionKey>,
     pub preconditions: Option<Preconditions>,
+    /// Suppress informational progress lines (`-q`).
+    pub quiet: bool,
     /// Optional interactive TTY progress controller (`UIController`).
     pub ui: Option<Arc<UIController>>,
 }
@@ -282,6 +286,12 @@ pub async fn run_copy(
     boto: &BotoConfig,
     cfg: &CopyConfig,
 ) -> Result<CopySummary> {
+    if cfg.gzip_mode != GzipMode::None && cfg.gzip_transport != GzipMode::None {
+        return Err(GsutilError::command(
+            "Specifying both the -j/-J and -z/-Z options together is invalid.",
+        ));
+    }
+
     let mut src_url_strs = cfg.src_urls.clone();
     if cfg.read_stdin_urls {
         let stdin = std::io::stdin();
@@ -294,6 +304,12 @@ pub async fn run_copy(
     }
 
     let dst_base = StorageUrl::parse(&cfg.dst_url)?;
+    if cfg.storage_class.is_some() && dst_base.is_file_url() {
+        return Err(GsutilError::command(format!(
+            "Cannot specify storage class for a non-cloud destination: {}",
+            cfg.dst_url
+        )));
+    }
     let manifest = match &cfg.manifest_path {
         Some(p) => Some(Arc::new(ManifestWriter::open(p)?)),
         None => None,
@@ -303,6 +319,11 @@ pub async fn run_copy(
     if pairs.is_empty() {
         return Err(GsutilError::command_informational(
             gsutil_core::error::NO_URLS_MATCHED_GENERIC,
+        ));
+    }
+    if dst_base.is_fifo() && pairs.len() > 1 {
+        return Err(GsutilError::command(
+            "Cannot copy multiple files/objects to a single FIFO.",
         ));
     }
 
@@ -641,6 +662,9 @@ pub async fn copy_single_pair(
     manifest: Option<&ManifestWriter>,
 ) -> Result<CopyItemResult> {
     let start_ts = Utc::now().to_rfc3339();
+    if !cfg.quiet && !src_url.is_stream() {
+        eprintln!("Copying {}...", src_url);
+    }
     let res = match (src_url, dst_url) {
         (StorageUrl::File(f), StorageUrl::Cloud(_)) if f.is_stream => {
             copy_async_stream_to_cloud(api.as_ref(), boto, cfg, tokio::io::stdin(), dst_url).await
@@ -656,6 +680,36 @@ pub async fn copy_single_pair(
         }
         (StorageUrl::Cloud(_), StorageUrl::Cloud(_)) => {
             copy_cloud_to_cloud(api.as_ref(), boto, cfg, src_url, dst_url).await
+        }
+        (StorageUrl::File(src_f), StorageUrl::File(dst_f)) if dst_f.is_stream => {
+            let mut src_file = File::open(&src_f.object_name)?;
+            let mut stdout = std::io::stdout();
+            let bytes = std::io::copy(&mut src_file, &mut stdout)?;
+            stdout.flush()?;
+            Ok(CopyItemResult {
+                src_url: src_url.url_string(),
+                dst_url: dst_url.url_string(),
+                bytes_transferred: bytes,
+                created_url: None,
+                skipped: false,
+            })
+        }
+        (StorageUrl::File(src_f), StorageUrl::File(dst_f)) if src_f.is_stream => {
+            let mut stdin = std::io::stdin();
+            let mut dst_file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&dst_f.object_name)?;
+            let bytes = std::io::copy(&mut stdin, &mut dst_file)?;
+            dst_file.flush()?;
+            Ok(CopyItemResult {
+                src_url: src_url.url_string(),
+                dst_url: dst_url.url_string(),
+                bytes_transferred: bytes,
+                created_url: None,
+                skipped: false,
+            })
         }
         (StorageUrl::File(_), StorageUrl::File(_)) => copy_local_to_local(cfg, src_url, dst_url),
     };
@@ -679,7 +733,17 @@ pub async fn copy_single_pair(
                 );
             }
             // For `mv` (-M), delete the source ONLY if copy succeeded and was not skipped.
+            if item.skipped && !cfg.quiet {
+                eprintln!("Skipping existing item: {}", item.dst_url);
+            } else if cfg.print_created_version && !cfg.quiet {
+                if let Some(ref created) = item.created_url {
+                    eprintln!("Created: {created}");
+                }
+            }
             if cfg.delete_source_after_copy && !item.skipped {
+                if !cfg.quiet {
+                    eprintln!("Removing {}...", src_url);
+                }
                 delete_source_after_copy(api.as_ref(), src_url).await?;
             }
             Ok(item)
@@ -742,10 +806,32 @@ async fn copy_local_to_cloud(
         .object_name()
         .ok_or_else(|| GsutilError::command("Destination cloud URL missing object name."))?;
 
+    let dst_api = api.for_provider(dst_url.scheme())?;
+    if cfg.no_clobber
+        && dst_api
+            .get_object_metadata(bucket, object_name, None, Some(&["name".to_string()]))
+            .await
+            .is_ok()
+    {
+        return Ok(CopyItemResult {
+            src_url: src_url.url_string(),
+            dst_url: dst_url.url_string(),
+            bytes_transferred: 0,
+            created_url: None,
+            skipped: true,
+        });
+    }
+
     let file_meta = fs::metadata(src_path)?;
     let file_size = file_meta.len();
     let posix_attrs = if cfg.preserve_posix {
         Some(read_local_posix_attributes(src_path)?)
+    } else if cfg.preserve_mtime {
+        let local = read_local_posix_attributes(src_path)?;
+        Some(crate::posix::PosixAttributes {
+            mtime: local.mtime,
+            ..Default::default()
+        })
     } else {
         None
     };
@@ -754,6 +840,9 @@ async fn copy_local_to_cloud(
     let should_gzip_storage = cfg.gzip_mode.should_compress(&src_path_str);
     let should_gzip_transport =
         !should_gzip_storage && cfg.gzip_transport.should_compress(&src_path_str);
+    if should_gzip_transport && !cfg.quiet {
+        eprintln!("Using compressed transport encoding for {src_url}.");
+    }
     let pc_threshold = boto.parallel_composite_upload_threshold();
     let use_parallel_composite = !should_gzip_storage
         && !should_gzip_transport
@@ -972,8 +1061,27 @@ async fn upload_parallel_composite(
     )?;
 
     let desired_enc_sha = encryption_key_sha256(cfg.encryption_key.as_ref());
-    let existing_tracker = read_parallel_upload_tracker(&tracker_path)
-        .filter(|t| t.encryption_key_sha256.as_deref() == desired_enc_sha);
+    let raw_existing_tracker = read_parallel_upload_tracker(&tracker_path);
+    let existing_tracker = match raw_existing_tracker {
+        Some(prev) if prev.encryption_key_sha256.as_deref() == desired_enc_sha => Some(prev),
+        Some(prev) => {
+            if !cfg.quiet {
+                eprintln!(
+                    "Parallel upload tracker file does not match current encryption key. \
+                     Deleting old components and restarting upload"
+                );
+            }
+            let cleanup_api = api.for_provider(dst_url.scheme())?;
+            for c in &prev.components {
+                let _ = cleanup_api
+                    .delete_object(bucket, &c.object_name, c.generation.as_deref(), None)
+                    .await;
+            }
+            delete_tracker_file(&tracker_path);
+            None
+        }
+        None => None,
+    };
 
     // Reuse random_prefix from matching tracker if resuming an interrupted composite upload.
     let random_prefix = if let Some(ref prev) = existing_tracker {
@@ -1033,6 +1141,13 @@ async fn upload_parallel_composite(
         }
         offset += len;
         idx += 1;
+    }
+
+    if !reused_parts.is_empty() && !cfg.quiet {
+        eprintln!(
+            "Found {} existing temporary components to reuse.",
+            reused_parts.len()
+        );
     }
 
     let par_cfg = ParallelConfig {
@@ -1219,6 +1334,13 @@ async fn copy_cloud_to_local(
     let dst_path_str = dst_url.object_name().unwrap_or("");
     let dst_path = Path::new(dst_path_str);
 
+    // Copying a cloud object into an existing FIFO: stream directly into the FIFO
+    // instead of writing to `_.gstmp` + `rename` (which would replace/break the FIFO).
+    if dst_url.is_fifo() {
+        let fifo_writer = OpenOptions::new().write(true).open(dst_path)?;
+        return copy_cloud_to_stream(api.as_ref(), boto, cfg, src_url, fifo_writer).await;
+    }
+
     if cfg.no_clobber && dst_path.exists() {
         return Ok(CopyItemResult {
             src_url: src_url.url_string(),
@@ -1239,6 +1361,10 @@ async fn copy_cloud_to_local(
     let src_meta = src_api
         .get_object_metadata(bucket, object_name, src_url.generation(), None)
         .await?;
+
+    if cfg.delete_source_after_copy && !cfg.quiet {
+        maybe_warn_early_deletion(src_url, &src_meta);
+    }
     let obj_size = src_meta.size_bytes();
     let gzip_encoded = is_gzip_encoded(&src_meta);
 
@@ -1290,6 +1416,19 @@ async fn copy_cloud_to_local(
             let attrs = deserialize_posix_from_metadata(custom_meta);
             if !attrs.is_empty() {
                 apply_posix_to_local_file(dst_path, &attrs)?;
+            }
+        }
+    } else if cfg.preserve_mtime {
+        if let Some(ref custom_meta) = src_meta.metadata {
+            let attrs = deserialize_posix_from_metadata(custom_meta);
+            if attrs.mtime.is_some() {
+                apply_posix_to_local_file(
+                    dst_path,
+                    &crate::posix::PosixAttributes {
+                        mtime: attrs.mtime,
+                        ..Default::default()
+                    },
+                )?;
             }
         }
     }
@@ -1727,6 +1866,10 @@ async fn copy_cloud_to_cloud(
         .get_object_metadata(src_bucket, src_obj, src_url.generation(), None)
         .await?;
 
+    if cfg.delete_source_after_copy && !cfg.quiet {
+        maybe_warn_early_deletion(src_url, &src_meta);
+    }
+
     let cross_provider = src_url.scheme() != dst_url.scheme();
     if cfg.daisy_chain || cross_provider {
         return copy_cloud_daisy_chain(
@@ -1757,6 +1900,21 @@ async fn copy_cloud_to_cloud(
     };
 
     let dst_api = api.for_provider(dst_url.scheme())?;
+    if cfg.no_clobber
+        && dst_api
+            .get_object_metadata(dst_bucket, dst_obj, None, Some(&["name".to_string()]))
+            .await
+            .is_ok()
+    {
+        return Ok(CopyItemResult {
+            src_url: src_url.url_string(),
+            dst_url: dst_url.url_string(),
+            bytes_transferred: 0,
+            created_url: None,
+            skipped: true,
+        });
+    }
+
     let copied = match dst_api.copy_object(&src_meta, &dst_meta, &copy_opts).await {
         Ok(obj) => obj,
         Err(GsutilError::Service(se))
@@ -1944,6 +2102,21 @@ fn copy_local_to_local(
     let dst_path_str = dst_url.object_name().unwrap_or("");
     let dst_path = Path::new(dst_path_str);
 
+    // Copying a local file into an existing FIFO: open FIFO for writing directly.
+    if dst_url.is_fifo() {
+        let mut src_f = File::open(src_path)?;
+        let mut dst_f = OpenOptions::new().write(true).open(dst_path)?;
+        let bytes = std::io::copy(&mut src_f, &mut dst_f)?;
+        dst_f.flush()?;
+        return Ok(CopyItemResult {
+            src_url: src_url.url_string(),
+            dst_url: dst_url.url_string(),
+            bytes_transferred: bytes,
+            created_url: None,
+            skipped: false,
+        });
+    }
+
     if cfg.no_clobber && dst_path.exists() {
         return Ok(CopyItemResult {
             src_url: src_url.url_string(),
@@ -1967,6 +2140,17 @@ fn copy_local_to_local(
     if cfg.preserve_posix {
         let attrs = read_local_posix_attributes(src_path)?;
         apply_posix_to_local_file(dst_path, &attrs)?;
+    } else if cfg.preserve_mtime {
+        let attrs = read_local_posix_attributes(src_path)?;
+        if attrs.mtime.is_some() {
+            apply_posix_to_local_file(
+                dst_path,
+                &crate::posix::PosixAttributes {
+                    mtime: attrs.mtime,
+                    ..Default::default()
+                },
+            )?;
+        }
     }
 
     Ok(CopyItemResult {
@@ -2149,6 +2333,9 @@ where
             Err(e) => return Err(e.into()),
         };
         if sym_meta.file_type().is_symlink() && (exclude_symlinks || skip_unsupported) {
+            if exclude_symlinks {
+                eprintln!("Skipping symbolic link {}...", path.display());
+            }
             continue;
         }
         // Follow symlinks by default (matching Python gsutil cp -r).
@@ -2224,7 +2411,8 @@ async fn expand_cloud_source(
                 if skip_unsupported && u.is_cloud_subdir_placeholder(Some(obj.size_bytes())) {
                     continue;
                 }
-                results.push((u, name.to_string()));
+                // `cp -r gs://b1 gs://b2` or `cp -r gs://b1 /dir` nests under `<bucket>/<name>`.
+                results.push((u, format!("{bucket}/{name}")));
             }
         }
         return Ok(results);
@@ -2234,6 +2422,12 @@ async fn expand_cloud_source(
     if contains_wildcard(obj_name) {
         let filter = build_bucket_filter_strings(obj_name);
         let matcher = WildcardMatcher::compile(obj_name)?;
+        // Static directory prefix before the first wildcard component (e.g. "a/b/" for "a/b/*").
+        let static_prefix_dir = filter
+            .prefix
+            .as_deref()
+            .and_then(|p| p.rfind('/').map(|i| p[..=i].to_string()))
+            .unwrap_or_default();
         let listed = src_api
             .list_objects(
                 bucket,
@@ -2258,7 +2452,13 @@ async fn expand_cloud_source(
                 if skip_unsupported && u.is_cloud_subdir_placeholder(Some(obj.size_bytes())) {
                     continue;
                 }
-                let rel = name.rsplit('/').next().unwrap_or(name).to_string();
+                let rel = if recursive {
+                    name.strip_prefix(&static_prefix_dir)
+                        .unwrap_or(name)
+                        .to_string()
+                } else {
+                    name.rsplit('/').next().unwrap_or(name).to_string()
+                };
                 results.push((u, rel));
             }
         }
@@ -2368,7 +2568,43 @@ fn build_upload_metadata(
         }
     }
     apply_custom_headers(&mut meta, &cfg.headers);
+    if meta.content_type.is_none() {
+        meta.content_type = Some(infer_content_type(object_name).to_string());
+    } else if meta.content_type.as_deref() == Some("") {
+        meta.content_type = Some("application/octet-stream".to_string());
+    }
     meta
+}
+
+fn infer_content_type(path: &str) -> &'static str {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "txt" | "log" | "md" => "text/plain",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" | "mjs" => "application/javascript",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "csv" => "text/csv",
+        "gif" => "image/gif",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "tar" => "application/x-tar",
+        "gz" => "application/gzip",
+        "mp3" => "audio/mpeg",
+        "mp4" => "video/mp4",
+        "py" => "text/x-python",
+        _ => "application/octet-stream",
+    }
 }
 
 fn apply_custom_headers(meta: &mut Object, headers: &BTreeMap<String, String>) {
@@ -2414,6 +2650,36 @@ fn is_gzip_encoded(obj: &Object) -> bool {
     obj.content_encoding
         .as_deref()
         .is_some_and(|e| e.eq_ignore_ascii_case("gzip"))
+}
+
+fn maybe_warn_early_deletion(src_url: &StorageUrl, src_meta: &Object) {
+    let sc = src_meta
+        .storage_class
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let min_days: Option<i64> = match sc.as_str() {
+        "nearline" => Some(30),
+        "coldline" => Some(90),
+        "archive" => Some(365),
+        _ => None,
+    };
+    let Some(days) = min_days else { return };
+    let created_secs = src_meta
+        .time_created
+        .as_deref()
+        .and_then(crate::posix::parse_rfc3339_to_epoch_secs);
+    let too_young = match created_secs {
+        Some(ts) => (Utc::now().timestamp() - ts) < days * 86_400,
+        None => true,
+    };
+    if too_young {
+        eprintln!(
+            "Warning: moving {sc} object {src_url} may incur an early deletion charge, \
+             because the original object is less than {days} days old according to the \
+             local system time."
+        );
+    }
 }
 
 #[cfg(test)]

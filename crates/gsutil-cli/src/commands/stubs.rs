@@ -120,7 +120,7 @@ stub_spec!(CP,
     aliases: &["copy"],
     summary: "Copy files and objects",
     synopsis: "\n  gsutil cp [OPTION]... src_url dst_url\n  gsutil cp [OPTION]... src_url... dst_url\n  gsutil cp [OPTION]... -I dst_url\n",
-    sub_args: "a:AcDeILj:JmnnpPrRs:St:Uvz:Z", min: 1, max: NO_MAX, file_ok: true, prov_ok: false,
+    sub_args: "a:AcDeIL:MNnpPrRs:tUvz:Zj:J", min: 1, max: NO_MAX, file_ok: true, prov_ok: false,
     subcommands: &[], has_sub: false
 );
 
@@ -231,7 +231,7 @@ stub_spec!(MV,
     aliases: &["move", "ren", "rename"],
     summary: "Move/rename objects",
     synopsis: "\n  gsutil mv [-p] src_url dst_url\n  gsutil mv [-p] src_url... dst_url\n  gsutil mv [-p] -I dst_url\n",
-    sub_args: "a:AcDeILj:JmnnpPrRs:St:Uvz:Z", min: 1, max: NO_MAX, file_ok: true, prov_ok: false,
+    sub_args: "a:AcDeIL:MNnpPrRs:tUvz:Zj:J", min: 1, max: NO_MAX, file_ok: true, prov_ok: false,
     subcommands: &[], has_sub: false
 );
 
