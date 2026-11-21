@@ -2306,33 +2306,139 @@ fn expand_local_source(
     exclude_symlinks: bool,
 ) -> Result<Vec<(PathBuf, String)>> {
     if contains_wildcard(raw_path) {
-        // Split into static base dir + wildcard pattern.
-        let path = Path::new(raw_path);
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let base_dir = if parent.as_os_str().is_empty() {
-            Path::new(".")
+        // Compute longest static (non-wildcard) directory prefix as base_dir.
+        let mut static_parts = Vec::new();
+        for comp in Path::new(raw_path).components() {
+            let s = comp.as_os_str().to_string_lossy();
+            if contains_wildcard(&s) {
+                break;
+            }
+            static_parts.push(comp);
+        }
+        let base_dir: PathBuf = if static_parts.is_empty() {
+            PathBuf::from(".")
         } else {
-            parent
+            static_parts.into_iter().collect()
         };
+        let has_double_star = raw_path.contains("**");
         let matcher = WildcardMatcher::compile(raw_path)?;
         let mut results = Vec::new();
         let mut visited = HashSet::new();
-        walk_local_dir(
-            base_dir,
-            true,
+
+        // Match Python gsutil wildcard expansion semantics:
+        // - If a wildcard directly matches a FILE (e.g. `/*.txt`, `/**/*.dat`),
+        //   it is treated as a top-level file source (flattened to `file_name()`).
+        // - If a wildcard directly matches a DIRECTORY (e.g. `/*`, `/sub*`) and `-r`
+        //   is set, recurse into that directory preserving `<dir_name>/<rel_path>`.
+        #[allow(clippy::too_many_arguments)]
+        fn walk_wildcard_local(
+            dir: &Path,
+            matcher: &WildcardMatcher,
+            recursive: bool,
+            has_double_star: bool,
+            skip_unsupported: bool,
+            exclude_symlinks: bool,
+            visited: &mut HashSet<PathBuf>,
+            results: &mut Vec<(PathBuf, String)>,
+        ) -> Result<()> {
+            let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let sym_meta = match fs::symlink_metadata(&path) {
+                    Ok(m) => m,
+                    Err(_) if skip_unsupported => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                if sym_meta.file_type().is_symlink() && (exclude_symlinks || skip_unsupported) {
+                    if exclude_symlinks {
+                        eprintln!("Skipping symbolic link {}...", path.display());
+                    }
+                    continue;
+                }
+                let meta = match fs::metadata(&path) {
+                    Ok(m) => m,
+                    Err(_) if skip_unsupported || exclude_symlinks => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                let p_str = path.to_string_lossy();
+                let matched = matcher.is_match(&p_str);
+                if meta.is_dir() {
+                    if matched && !has_double_star {
+                        if recursive {
+                            let dir_name = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            if let Ok(canon) = fs::canonicalize(&path) {
+                                if !visited.insert(canon) {
+                                    continue;
+                                }
+                            }
+                            walk_local_dir(
+                                &path,
+                                true,
+                                skip_unsupported,
+                                exclude_symlinks,
+                                visited,
+                                &mut |file_path| {
+                                    if let Ok(rel) = file_path.strip_prefix(&path) {
+                                        let rel_unix = rel.to_string_lossy().replace('\\', "/");
+                                        let rel_with_root = if dir_name.is_empty() {
+                                            rel_unix
+                                        } else {
+                                            format!("{dir_name}/{rel_unix}")
+                                        };
+                                        results.push((file_path.to_path_buf(), rel_with_root));
+                                    }
+                                },
+                            )?;
+                        }
+                        // Without `-r`, matching a directory is omitted (just like Python gsutil).
+                    } else if has_double_star {
+                        if let Ok(canon) = fs::canonicalize(&path) {
+                            if !visited.insert(canon) {
+                                continue;
+                            }
+                        }
+                        walk_wildcard_local(
+                            &path,
+                            matcher,
+                            recursive,
+                            has_double_star,
+                            skip_unsupported,
+                            exclude_symlinks,
+                            visited,
+                            results,
+                        )?;
+                    }
+                } else if meta.is_file() {
+                    if matched {
+                        let fname = path
+                            .file_name()
+                            .map(|f| f.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        results.push((path, fname));
+                    }
+                } else if !skip_unsupported {
+                    return Err(GsutilError::command(format!(
+                        "Unsupported file type: {}",
+                        path.display()
+                    )));
+                }
+            }
+            Ok(())
+        }
+
+        walk_wildcard_local(
+            &base_dir,
+            &matcher,
+            recursive,
+            has_double_star,
             skip_unsupported,
             exclude_symlinks,
             &mut visited,
-            &mut |p| {
-                let p_str = p.to_string_lossy();
-                if matcher.is_match(&p_str) {
-                    let fname = p
-                        .file_name()
-                        .map(|f| f.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    results.push((p.to_path_buf(), fname));
-                }
-            },
+            &mut results,
         )?;
         return Ok(results);
     }
@@ -3427,5 +3533,52 @@ mod tests {
             ui.format_final_summary(),
             "Operation completed over 1 objects/512 B."
         );
+    }
+
+    #[test]
+    fn test_expand_local_wildcard_recursive_preserves_hierarchy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_txt = dir.path().join("root.txt");
+        let nested_a = dir.path().join("l0_00/l1_00/obj_000.dat");
+        let nested_b = dir.path().join("l0_01/l1_00/obj_000.dat");
+        fs::create_dir_all(nested_a.parent().unwrap()).unwrap();
+        fs::create_dir_all(nested_b.parent().unwrap()).unwrap();
+        fs::write(&root_txt, b"r").unwrap();
+        fs::write(&nested_a, b"a").unwrap();
+        fs::write(&nested_b, b"b").unwrap();
+
+        // `*` with `-r`: files at top level flatten to basename, matched dirs preserve hierarchy.
+        let pattern = format!("{}/*", dir.path().display());
+        let keys: Vec<String> = expand_local_source(&pattern, true, false, false)
+            .unwrap()
+            .into_iter()
+            .map(|(_, k)| k)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "l0_00/l1_00/obj_000.dat",
+                "l0_01/l1_00/obj_000.dat",
+                "root.txt"
+            ]
+        );
+
+        // `**/*.dat` with `-r`: directly matched files flatten to basename (matching Python gsutil).
+        let dstar = format!("{}/**/*.dat", dir.path().display());
+        let dstar_keys: Vec<String> = expand_local_source(&dstar, true, false, false)
+            .unwrap()
+            .into_iter()
+            .map(|(_, k)| k)
+            .collect();
+        assert_eq!(dstar_keys, vec!["obj_000.dat", "obj_000.dat"]);
+
+        // `*.txt` without `-r`: only top-level file matched.
+        let non_rec = format!("{}/*.txt", dir.path().display());
+        let non_rec_keys: Vec<String> = expand_local_source(&non_rec, false, false, false)
+            .unwrap()
+            .into_iter()
+            .map(|(_, k)| k)
+            .collect();
+        assert_eq!(non_rec_keys, vec!["root.txt"]);
     }
 }

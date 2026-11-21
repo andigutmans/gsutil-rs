@@ -1744,28 +1744,52 @@ impl CloudApi for GcsJsonClient {
             });
         }
 
-        // Bounded chunk size (default 8 MiB, aligned to 256 KiB) for constant memory.
-        let chunk_size =
-            effective_streaming_chunk_size(options.chunk_size, self.config.resumable_chunk_size);
+        // Use configured resumable chunk size (default 100 MiB, aligned to 256 KiB).
+        // Each chunk is streamed in 256 KiB blocks so memory stays constant (~1-2 MiB)
+        // regardless of chunk size while minimizing HTTP roundtrips.
+        let chunk_size = effective_file_resumable_chunk_size(
+            options.chunk_size,
+            self.config.resumable_chunk_size,
+        );
 
-        let mut file = tokio::fs::File::open(file_path).await?;
         let mut retries_without_progress: u32 = 0;
 
         while offset < length {
-            file.seek(SeekFrom::Start(start_offset + offset)).await?;
-            let to_read = (chunk_size as u64).min(length - offset) as usize;
-            let mut buf = vec![0u8; to_read];
-            read_exact_async(&mut file, &mut buf).await?;
-            let chunk = Bytes::from(buf);
+            let to_read = (chunk_size as u64).min(length - offset);
+            let mut stream_file = tokio::fs::File::open(file_path).await?;
+            stream_file
+                .seek(SeekFrom::Start(start_offset + offset))
+                .await?;
+            let body_stream =
+                futures::stream::try_unfold((stream_file, to_read), |(mut f, rem)| async move {
+                    if rem == 0 {
+                        return Ok::<_, std::io::Error>(None);
+                    }
+                    let n = (rem as usize).min(256 * 1024);
+                    let mut buf = vec![0u8; n];
+                    let got = f.read(&mut buf).await?;
+                    if got == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "unexpected EOF while streaming upload chunk",
+                        ));
+                    }
+                    buf.truncate(got);
+                    Ok(Some((Bytes::from(buf), (f, rem - got as u64))))
+                });
+            let body = reqwest::Body::wrap_stream(body_stream);
 
-            let end_inclusive = offset + to_read as u64 - 1;
+            let end_inclusive = offset + to_read - 1;
             let content_range = format!("bytes {offset}-{end_inclusive}/{length}");
             let mut hdrs = chunk_headers_base.clone();
             if let Ok(val) = HeaderValue::from_str(&content_range) {
                 hdrs.insert(HeaderName::from_static("content-range"), val);
             }
+            if let Ok(val) = HeaderValue::from_str(&to_read.to_string()) {
+                hdrs.insert(CONTENT_LENGTH, val);
+            }
 
-            let send_res = self.send_resumable_put(&session_uri, chunk, &hdrs).await;
+            let send_res = self.send_resumable_put(&session_uri, body, &hdrs).await;
 
             match send_res {
                 Ok(ResumablePutOutcome::Complete(obj)) => {
@@ -1775,7 +1799,7 @@ impl CloudApi for GcsJsonClient {
                     return Ok(*obj);
                 }
                 Ok(ResumablePutOutcome::Continue(next_off)) => {
-                    let advanced = next_off.unwrap_or(offset + to_read as u64);
+                    let advanced = next_off.unwrap_or(offset + to_read);
                     if advanced > offset {
                         retries_without_progress = 0;
                     }
@@ -2882,7 +2906,7 @@ impl GcsJsonClient {
     async fn send_resumable_put(
         &self,
         session_uri: &str,
-        chunk: Bytes,
+        chunk: impl Into<reqwest::Body>,
         headers: &HeaderMap,
     ) -> std::result::Result<ResumablePutOutcome, ResumablePutError> {
         let req = self
@@ -3001,7 +3025,7 @@ enum ResumablePutError {
     Fatal(GsutilError),
 }
 
-/// Default bounded chunk size for streaming/file resumable uploads (8 MiB = 32 * 256 KiB).
+/// Default bounded chunk size for non-seekable streaming resumable uploads (8 MiB = 32 * 256 KiB).
 const DEFAULT_STREAMING_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 fn effective_streaming_chunk_size(override_size: Option<usize>, config_size: usize) -> usize {
@@ -3018,21 +3042,21 @@ fn effective_streaming_chunk_size(override_size: Option<usize>, config_size: usi
     }
 }
 
-async fn read_exact_async<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    mut buf: &mut [u8],
-) -> std::io::Result<()> {
-    while !buf.is_empty() {
-        let n = reader.read(buf).await?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "unexpected EOF while reading upload chunk",
-            ));
-        }
-        buf = &mut buf[n..];
+/// Chunk size for seekable file resumable uploads: uses the configured chunk size
+/// (default 100 MiB, matching Python gsutil) because the body is streamed in 256 KiB
+/// blocks directly from disk with constant memory.
+fn effective_file_resumable_chunk_size(override_size: Option<usize>, config_size: usize) -> usize {
+    let quantum = RESUMABLE_CHUNK_QUANTUM as usize;
+    let raw = match override_size {
+        Some(s) if s > 0 => s,
+        _ => config_size.max(quantum),
+    };
+    let rem = raw % quantum;
+    if rem == 0 {
+        raw.max(quantum)
+    } else {
+        raw + (quantum - rem)
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

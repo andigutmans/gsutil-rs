@@ -190,7 +190,11 @@ pub async fn run_rsync(
         eprintln!("Building synchronization state...");
     }
 
-    let src_entries = match list_tree(api.as_ref(), &src_root, cfg, exclude_re.as_ref()).await {
+    let (src_res, dst_res) = tokio::join!(
+        list_tree(api.as_ref(), &src_root, cfg, exclude_re.as_ref()),
+        list_tree(api.as_ref(), &dst_root, cfg, exclude_re.as_ref()),
+    );
+    let src_entries = match src_res {
         Ok(entries) => entries,
         Err(err) => {
             eprintln!("{err}");
@@ -199,7 +203,7 @@ pub async fn run_rsync(
             ));
         }
     };
-    let dst_entries = match list_tree(api.as_ref(), &dst_root, cfg, exclude_re.as_ref()).await {
+    let dst_entries = match dst_res {
         Ok(entries) => entries,
         Err(err) => {
             eprintln!("{err}");
@@ -670,8 +674,11 @@ fn compare_matching_entries(
 }
 
 fn entries_have_matching_checksum(src: &RsyncEntry, dst: &RsyncEntry) -> Result<bool> {
-    let (s_crc, s_md5) = resolve_entry_hashes(src)?;
-    let (d_crc, d_md5) = resolve_entry_hashes(dst)?;
+    // Prefer hardware-accelerated CRC32C when either side already has it (e.g. all GCS objects),
+    // avoiding unnecessary software MD5 computation on local files.
+    let need_md5 = src.crc32c.is_none() && dst.crc32c.is_none();
+    let (s_crc, s_md5) = resolve_entry_hashes(src, !need_md5 || src.crc32c.is_some(), need_md5)?;
+    let (d_crc, d_md5) = resolve_entry_hashes(dst, !need_md5 || dst.crc32c.is_some(), need_md5)?;
 
     if let (Some(sc), Some(dc)) = (s_crc.as_deref(), d_crc.as_deref()) {
         return Ok(sc == dc);
@@ -683,14 +690,18 @@ fn entries_have_matching_checksum(src: &RsyncEntry, dst: &RsyncEntry) -> Result<
     Ok(src.size == dst.size)
 }
 
-fn resolve_entry_hashes(entry: &RsyncEntry) -> Result<(Option<String>, Option<String>)> {
+fn resolve_entry_hashes(
+    entry: &RsyncEntry,
+    compute_crc32c: bool,
+    compute_md5: bool,
+) -> Result<(Option<String>, Option<String>)> {
     if entry.crc32c.is_some() || entry.md5.is_some() {
         return Ok((entry.crc32c.clone(), entry.md5.clone()));
     }
     let parsed = StorageUrl::parse(&entry.full_url)?;
     if let StorageUrl::File(f) = parsed {
         let mut file = File::open(&f.object_name)?;
-        let hashes = hash_reader(&mut file, true, true)?;
+        let hashes = hash_reader(&mut file, compute_crc32c, compute_md5)?;
         return Ok((hashes.crc32c_base64(), hashes.md5_base64()));
     }
     Ok((None, None))
