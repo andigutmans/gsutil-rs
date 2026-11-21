@@ -453,7 +453,7 @@ pub async fn run_rsync_cmd(
             "-r" | "-R" => cfg.recursive = true,
             "-u" => cfg.skip_old_files = true,
             "-U" => cfg.skip_unsupported = true,
-            "-x" => {
+            "-x" | "-y" => {
                 if a.is_empty() {
                     return Err(GsutilError::command("Invalid blank exclude filter"));
                 }

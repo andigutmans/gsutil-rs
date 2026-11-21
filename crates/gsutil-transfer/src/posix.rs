@@ -129,18 +129,13 @@ pub fn deserialize_posix_from_metadata(metadata: &BTreeMap<String, String>) -> P
     }
 }
 
-/// Apply POSIX attributes (mode, mtime/atime) to a local file.
+/// Apply POSIX attributes (mtime/atime, then mode) to a local file.
 ///
+/// Timestamps are applied BEFORE `set_permissions` so read-only modes (e.g. `0o444`)
+/// do not prevent opening the file handle to update `mtime`/`atime`.
 /// UID/GID changes require elevated privileges on Unix and are skipped if not permitted.
 pub fn apply_posix_to_local_file(path: &Path, attrs: &PosixAttributes) -> Result<()> {
-    #[cfg(unix)]
-    if let Some(mode) = attrs.mode {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(mode & 0o777);
-        std::fs::set_permissions(path, perms)?;
-    }
-
-    // Apply mtime / atime using std::fs::File::set_times (stabilized in Rust 1.75).
+    // Apply mtime / atime first using std::fs::File::set_times (stabilized in Rust 1.75).
     if attrs.mtime.is_some() || attrs.atime.is_some() {
         let mut times = std::fs::FileTimes::new();
         if let Some(mtime) = attrs.mtime {
@@ -158,6 +153,13 @@ pub fn apply_posix_to_local_file(path: &Path, attrs: &PosixAttributes) -> Result
         if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
             let _ = file.set_times(times);
         }
+    }
+
+    #[cfg(unix)]
+    if let Some(mode) = attrs.mode {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(mode & 0o777);
+        std::fs::set_permissions(path, perms)?;
     }
 
     Ok(())

@@ -31,6 +31,7 @@ import tempfile
 import time
 import traceback
 import unittest
+import urllib.parse
 import urllib.request
 
 GSUTIL_DIR = '/usr/lib/google-cloud-sdk/platform/gsutil'
@@ -166,10 +167,33 @@ def _start_mock_backend(parity_bin, project_id):
   return {'port': port, 'tmpdir': tmpdir, 'boto': boto_path}, cleanup
 
 
+def _mint_gcloud_token(token_file):
+  now = time.time()
+  if token_file and os.path.exists(token_file):
+    try:
+      with open(token_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+      if data.get('token') and (now - data.get('fetched_at', 0)) < 2400:
+        return data['token']
+    except Exception:
+      pass
+  tok = subprocess.check_output(
+      ['gcloud', 'auth', 'print-access-token'], text=True, timeout=30
+  ).strip()
+  if token_file:
+    tmp = f'{token_file}.{os.getpid()}.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+      json.dump({'token': tok, 'fetched_at': now}, f)
+    os.replace(tmp, token_file)
+  return tok
+
+
 def _start_live_backend(project_id):
   tmpdir = tempfile.mkdtemp(prefix='gsutil-rs-upstream-live-')
   state_dir = os.path.join(tmpdir, 'state')
   os.makedirs(state_dir, exist_ok=True)
+  token_file = os.path.join(tmpdir, 'live_token.json')
+  _mint_gcloud_token(token_file)
 
   proxy_proc = None
   ecp_bin = '/usr/bin/ecp_http_proxy'
@@ -210,8 +234,6 @@ def _start_live_backend(project_id):
   boto_path = os.path.join(tmpdir, 'live.boto')
   with open(boto_path, 'w', encoding='utf-8') as f:
     f.write(
-        '[Credentials]\n'
-        'use_client_certificate = True\n'
         '[GSUtil]\n'
         'prefer_api = json\n'
         'use_gcloud_storage = False\n'
@@ -219,21 +241,11 @@ def _start_live_backend(project_id):
         f'state_dir = {state_dir}\n'
     )
 
-  # Include gcloud's legacy credentials .boto in BOTO_PATH so Python's
-  # setUp/tearDown (boto/GcsJsonApi) authenticates cleanly against live GCS.
-  boto_files = []
-  legacy_root = os.path.expanduser('~/.config/gcloud/legacy_credentials')
-  if os.path.isdir(legacy_root):
-    for acct in sorted(os.listdir(legacy_root)):
-      cand = os.path.join(legacy_root, acct, '.boto')
-      if os.path.isfile(cand):
-        boto_files.append(cand)
-        break
-  boto_files.append(boto_path)
-  os.environ.pop('BOTO_CONFIG', None)
-  os.environ['BOTO_PATH'] = ':'.join(boto_files)
+  os.environ.pop('BOTO_PATH', None)
+  os.environ['BOTO_CONFIG'] = boto_path
+  os.environ['GSUTIL_LIVE_TOKEN_FILE'] = token_file
   os.environ['CLOUDSDK_CORE_PROJECT'] = project_id
-  os.environ['GSUTIL_NO_BANNER'] = 'true'
+  os.environ.pop('GSUTIL_NO_BANNER', None)
   os.environ['LC_ALL'] = 'C.UTF-8'
   os.environ['TZ'] = 'UTC'
 
@@ -246,7 +258,114 @@ def _start_live_backend(project_id):
         proxy_proc.kill()
     shutil.rmtree(tmpdir, ignore_errors=True)
 
-  return {'proxy_port': proxy_port, 'tmpdir': tmpdir, 'boto': boto_path}, cleanup
+  return {
+      'proxy_port': proxy_port,
+      'tmpdir': tmpdir,
+      'boto': boto_path,
+      'token_file': token_file,
+  }, cleanup
+
+
+def _install_live_ecp_transport_patches():
+  """Route Python test harness HTTP clients (httplib2 + boto GSConnection) via local ecp_http_proxy."""
+  ecp_port_str = os.environ.get('GSUTIL_ECP_PROXY_PORT', '').strip()
+  if not ecp_port_str:
+    return
+  ecp_port = int(ecp_port_str)
+  token_file = os.environ.get('GSUTIL_LIVE_TOKEN_FILE', '')
+
+  import httplib2
+  import boto.gs.connection
+  import boto.s3.connection
+
+  orig_httplib2_request = httplib2.Http.request
+  mtls_re = re.compile(
+      r'^(storage|www|cloudkms|pubsub|iamcredentials)(\.mtls)?\.googleapis\.com(?::\d+)?$'
+  )
+
+  def _ecp_httplib2_request(
+      self,
+      uri,
+      method='GET',
+      body=None,
+      headers=None,
+      redirections=httplib2.DEFAULT_MAX_REDIRECTS,
+      connection_type=None,
+  ):
+    parsed = urllib.parse.urlsplit(uri)
+    m = mtls_re.match(parsed.netloc.lower())
+    if m:
+      svc = m.group(1)
+      mtls_host = 'storage.mtls.googleapis.com' if svc == 'www' else f'{svc}.mtls.googleapis.com'
+      q_pairs = [
+          (k, v)
+          for k, v in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+          if k != 'key'
+      ]
+      new_query = urllib.parse.urlencode(q_pairs)
+      new_uri = urllib.parse.urlunsplit((
+          'http',
+          f'127.0.0.1:{ecp_port}',
+          parsed.path,
+          new_query,
+          parsed.fragment,
+      ))
+      new_headers = {}
+      if headers:
+        for k, v in headers.items():
+          ks = k.decode('latin-1') if isinstance(k, bytes) else str(k)
+          if ks.lower() in ('authorization', 'host', 'x-goog-ecpproxy-target-host'):
+            continue
+          vs = v.decode('latin-1') if isinstance(v, bytes) else str(v)
+          new_headers[ks] = vs
+      tok = _mint_gcloud_token(token_file)
+      new_headers['Authorization'] = f'Bearer {tok}'
+      new_headers['x-goog-ecpproxy-target-host'] = mtls_host
+      return orig_httplib2_request(
+          self,
+          new_uri,
+          method=method,
+          body=body,
+          headers=new_headers,
+          redirections=redirections,
+          connection_type=None,
+      )
+    return orig_httplib2_request(
+        self,
+        uri,
+        method=method,
+        body=body,
+        headers=headers,
+        redirections=redirections,
+        connection_type=connection_type,
+    )
+
+  httplib2.Http.request = _ecp_httplib2_request
+
+  orig_gs_init = boto.gs.connection.GSConnection.__init__
+  orig_gs_make_request = boto.gs.connection.GSConnection.make_request
+
+  def _ecp_gs_init(self, *args, **kwargs):
+    kwargs['is_secure'] = False
+    kwargs['host'] = '127.0.0.1'
+    kwargs['port'] = ecp_port
+    kwargs['calling_format'] = boto.s3.connection.OrdinaryCallingFormat()
+    orig_gs_init(self, *args, **kwargs)
+
+  def _ecp_gs_make_request(self, method, bucket='', key='', headers=None, *args, **kwargs):
+    new_headers = dict(headers) if headers else {}
+    for k in list(new_headers.keys()):
+      if k.lower() in ('authorization', 'x-goog-ecpproxy-target-host'):
+        del new_headers[k]
+    tok = _mint_gcloud_token(token_file)
+    new_headers['Authorization'] = f'Bearer {tok}'
+    new_headers['x-goog-ecpproxy-target-host'] = 'storage.mtls.googleapis.com'
+    return orig_gs_make_request(
+        self, method, bucket=bucket, key=key, headers=new_headers, *args, **kwargs
+    )
+
+  boto.gs.connection.GSConnection.__init__ = _ecp_gs_init
+  boto.gs.connection.GSConnection.make_request = _ecp_gs_make_request
 
 
 def _install_gslib_and_monkeypatch(
@@ -266,6 +385,9 @@ def _install_gslib_and_monkeypatch(
   from gslib.project_id import PopulateProjectId
   import gslib.tests.testcase.integration_testcase as integration_testcase
   import gslib.tests.util as test_util
+
+  if not is_mock:
+    _install_live_ecp_transport_patches()
 
   test_util.RUN_INTEGRATION_TESTS = True
   test_util.RUN_UNIT_TESTS = False

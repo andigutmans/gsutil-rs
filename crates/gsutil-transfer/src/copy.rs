@@ -303,6 +303,12 @@ pub async fn run_copy(
         return Err(GsutilError::command("cp requires at least one source URL."));
     }
 
+    if src_url_strs.len() > 1 && src_url_strs.iter().any(|s| s == "-" || s == "file://-") {
+        return Err(GsutilError::command(
+            "Multiple URL strings are not supported with streaming",
+        ));
+    }
+
     let dst_base = StorageUrl::parse(&cfg.dst_url)?;
     if cfg.storage_class.is_some() && dst_base.is_file_url() {
         return Err(GsutilError::command(format!(
@@ -315,7 +321,14 @@ pub async fn run_copy(
         None => None,
     };
 
-    let pairs = expand_copy_pairs(api.as_ref(), &src_url_strs, &dst_base, cfg).await?;
+    let pairs = expand_copy_pairs(
+        api.as_ref(),
+        &src_url_strs,
+        &dst_base,
+        cfg,
+        manifest.as_deref(),
+    )
+    .await?;
     if pairs.is_empty() {
         return Err(GsutilError::command_informational(
             gsutil_core::error::NO_URLS_MATCHED_GENERIC,
@@ -661,13 +674,21 @@ pub async fn copy_single_pair(
     dst_url: &StorageUrl,
     manifest: Option<&ManifestWriter>,
 ) -> Result<CopyItemResult> {
-    let start_ts = Utc::now().to_rfc3339();
-    if !cfg.quiet && !src_url.is_stream() {
-        eprintln!("Copying {}...", src_url);
+    let start_ts = Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
+    if !cfg.quiet {
+        if src_url.is_stream() {
+            eprintln!("Copying from <STDIN>...");
+        } else {
+            eprintln!("Copying {}...", src_url);
+        }
     }
     let res = match (src_url, dst_url) {
         (StorageUrl::File(f), StorageUrl::Cloud(_)) if f.is_stream => {
             copy_async_stream_to_cloud(api.as_ref(), boto, cfg, tokio::io::stdin(), dst_url).await
+        }
+        (StorageUrl::File(f), StorageUrl::Cloud(_)) if f.is_fifo => {
+            let fifo_file = tokio::fs::File::open(&f.object_name).await?;
+            copy_async_stream_to_cloud(api.as_ref(), boto, cfg, fifo_file, dst_url).await
         }
         (StorageUrl::Cloud(_), StorageUrl::File(f)) if f.is_stream => {
             copy_cloud_to_stream(api.as_ref(), boto, cfg, src_url, std::io::stdout()).await
@@ -714,7 +735,7 @@ pub async fn copy_single_pair(
         (StorageUrl::File(_), StorageUrl::File(_)) => copy_local_to_local(cfg, src_url, dst_url),
     };
 
-    let end_ts = Utc::now().to_rfc3339();
+    let end_ts = Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
     match res {
         Ok(item) => {
             if let Some(m) = manifest {
@@ -1491,6 +1512,13 @@ async fn download_single(
             }
         }
 
+        if start_byte == obj_size && !cfg.quiet {
+            eprintln!(
+                "Download already complete for file://{dst}, skipping download but will run integrity checks.",
+                dst = temp_path.display()
+            );
+        }
+
         if start_byte < obj_size {
             let mut stream = src_api
                 .get_object_media_stream(
@@ -1503,7 +1531,7 @@ async fn download_single(
                         compressed_encoding: false,
                         strategy,
                         decryption_key: cfg.decryption_key.clone(),
-                        progress_callback: progress_cb,
+                        progress_callback: progress_cb.clone(),
                     },
                 )
                 .await?;
@@ -1521,7 +1549,7 @@ async fn download_single(
         }
 
         let check_mode = CheckHashesMode::from_config(boto);
-        if let Err(err) = validate_hashes(
+        if validate_hashes(
             check_mode,
             &dst_url.url_string(),
             &src_url.url_string(),
@@ -1529,12 +1557,15 @@ async fn download_single(
             Some(&md5.finalize_base64()),
             src_meta.crc32c.as_deref(),
             src_meta.md5_hash.as_deref(),
-        ) {
-            let _ = fs::remove_file(temp_path);
-            return Err(err);
+        )
+        .is_ok()
+        {
+            let final_len = fs::metadata(temp_path)?.len();
+            return Ok(final_len);
         }
-        let final_len = fs::metadata(temp_path)?.len();
-        return Ok(final_len);
+        // Existing partial/complete temp file failed hash check: delete and restart fresh below.
+        let _ = fs::remove_file(temp_path);
+        delete_download_tracker_files(boto, dst_url, "JSON");
     }
 
     // Fresh streaming download (constant O(1) RAM for both plain and gzip-encoded objects).
@@ -2171,6 +2202,7 @@ async fn expand_copy_pairs(
     src_url_strs: &[String],
     dst_base: &StorageUrl,
     cfg: &CopyConfig,
+    manifest: Option<&ManifestWriter>,
 ) -> Result<Vec<(StorageUrl, StorageUrl)>> {
     let multi_src_arg = src_url_strs.len() > 1 || src_url_strs.iter().any(|s| contains_wildcard(s));
 
@@ -2213,6 +2245,32 @@ async fn expand_copy_pairs(
                 let treat_dst_as_container =
                     dst_is_container || multi_src_arg || src_is_prefix || expanded.len() > 1;
                 for (c_url, rel_path) in expanded {
+                    if dst_base.is_file_url() && has_parent_dir_traversal(&rel_path) {
+                        let msg = format!(
+                            "Skipping copy of source URL {c_url} because it would be copied \
+                             outside the expected destination directory: {}.",
+                            dst_base.object_name().unwrap_or("")
+                        );
+                        if !cfg.quiet {
+                            eprintln!("{msg}");
+                        }
+                        if let Some(m) = manifest {
+                            let ts = Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
+                            m.record(
+                                &c_url.url_string(),
+                                "",
+                                &ts,
+                                &ts,
+                                "",
+                                "",
+                                0,
+                                0,
+                                "skip",
+                                &msg,
+                            );
+                        }
+                        continue;
+                    }
                     let d_url =
                         resolve_destination_url(dst_base, &rel_path, treat_dst_as_container)?;
                     pairs.push((c_url, d_url));
@@ -2222,6 +2280,23 @@ async fn expand_copy_pairs(
     }
 
     Ok(pairs)
+}
+
+fn has_parent_dir_traversal(rel_path: &str) -> bool {
+    let mut depth: i32 = 0;
+    for comp in Path::new(rel_path).components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return true;
+                }
+            }
+            std::path::Component::Normal(_) => depth += 1,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn expand_local_source(

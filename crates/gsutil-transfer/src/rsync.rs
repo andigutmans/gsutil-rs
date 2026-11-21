@@ -209,6 +209,19 @@ pub async fn run_rsync(
         }
     };
 
+    // Validate POSIX permission access before syncing cloud -> local with `-P`.
+    if cfg.preserve_posix && src_root.is_cloud_url() && dst_root.is_file_url() {
+        for entry in &src_entries {
+            if let Some(mode) = entry.mode {
+                if (mode & 0o400) == 0 {
+                    return Err(GsutilError::command(
+                        "This sync will orphan file(s), please fix their permissions before trying again.",
+                    ));
+                }
+            }
+        }
+    }
+
     // External merge-sort both listings to temp files.
     let sorted_src_file = batch_sort_entries(src_entries.into_iter(), buffer_lines)?;
     let sorted_dst_file = batch_sort_entries(dst_entries.into_iter(), buffer_lines)?;
@@ -248,6 +261,25 @@ pub async fn run_rsync(
 
     if actions.is_empty() {
         return Ok(summary);
+    }
+
+    if cfg.parallel_operations && !cfg.quiet {
+        let force = boto.get_bool("GSUtil", "task_estimation_force", false);
+        let threshold = boto.get_u64("GSUtil", "task_estimation_threshold", 50_000) as usize;
+        if force || (threshold > 0 && actions.len() >= threshold) {
+            let total_size: u64 = actions
+                .iter()
+                .map(|a| match a {
+                    DiffAction::Copy { size, .. } => *size,
+                    _ => 0,
+                })
+                .sum();
+            eprintln!(
+                "Estimated work for this command: objects: {}, total size: {}",
+                actions.len(),
+                total_size
+            );
+        }
     }
 
     let copy_cfg = Arc::new(CopyConfig {
@@ -351,12 +383,16 @@ pub async fn run_rsync(
     summary.failed += remove_batch.failed;
 
     // 3. POSIX metadata-only updates (-P)
+    let quiet_posix = cfg.quiet;
     let posix_batch = run_parallel(posix_actions, &par_cfg, {
         let api = Arc::clone(&api);
         move |act| {
             let api = Arc::clone(&api);
             async move {
                 if let DiffAction::PosixSrcToDst { dst_url, posix, .. } = act {
+                    if !quiet_posix {
+                        eprintln!("Copying POSIX attributes from src to dst for {dst_url}...");
+                    }
                     let d = StorageUrl::parse(&dst_url)?;
                     match d {
                         StorageUrl::File(f) => {
@@ -838,10 +874,29 @@ async fn list_cloud_tree(
         if let Some(ref custom_meta) = obj.metadata {
             if let Some(raw_mtime) = custom_meta.get(crate::posix::MTIME_ATTR) {
                 let parsed = raw_mtime.trim().parse::<i64>().ok();
-                if parsed.is_none_or(|v| v < 0) {
-                    eprintln!("WARNING: {full_url} has an invalid mtime in its metadata");
+                match parsed {
+                    None => eprintln!("WARNING: {full_url} has an invalid mtime in its metadata"),
+                    Some(v) if v < 0 => {
+                        eprintln!("WARNING: {full_url} has an invalid mtime in its metadata")
+                    }
+                    Some(v) if v > chrono::Utc::now().timestamp() + 86_400 => {
+                        eprintln!(
+                            "WARNING: {full_url} has an mtime more than 1 day from current system time"
+                        );
+                    }
+                    _ => {}
                 }
             }
+        }
+        if obj
+            .content_encoding
+            .as_deref()
+            .is_some_and(|e| e.eq_ignore_ascii_case("gzip"))
+            && !cfg.quiet
+        {
+            eprintln!(
+                "WARNING: {full_url} has a compressed content-encoding, so it may be re-downloaded."
+            );
         }
         let posix = obj
             .metadata

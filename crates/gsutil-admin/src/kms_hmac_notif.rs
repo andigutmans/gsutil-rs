@@ -75,6 +75,7 @@ pub async fn run_kms(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
                     "Cannot specify both -d and -k for kms encryption.",
                 ));
             }
+            let enc_fields = ["encryption".to_string()];
             let buckets = expand_bucket_urls(ctx, &url_args, "kms").await?;
             for b in buckets {
                 let name = b.bucket_name.as_deref().unwrap_or("");
@@ -90,7 +91,7 @@ pub async fn run_kms(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
                     };
                     ctx.api
                         .for_provider(b.scheme.as_str())?
-                        .patch_bucket(name, &patch, None, None, None, None)
+                        .patch_bucket(name, &patch, None, None, None, Some(&enc_fields))
                         .await?;
                 } else if let Some(ref key) = kms_key {
                     writeln!(
@@ -105,10 +106,10 @@ pub async fn run_kms(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
                         ..Default::default()
                     };
                     ctx.api
-                        .patch_bucket(name, &patch, None, None, None, None)
+                        .patch_bucket(name, &patch, None, None, None, Some(&enc_fields))
                         .await?;
                 } else {
-                    let meta = ctx.api.get_bucket(name, None).await?;
+                    let meta = ctx.api.get_bucket(name, Some(&enc_fields)).await?;
                     match meta.encryption.and_then(|e| e.default_kms_key_name) {
                         Some(key) if !key.is_empty() => {
                             writeln!(
@@ -497,14 +498,71 @@ pub async fn run_notification(ctx: &mut AdminContext<'_>, args: &[String]) -> Re
             let buckets = expand_bucket_urls(ctx, &url_args, "notification").await?;
             let b = &buckets[0];
             let bname = b.bucket_name.as_deref().unwrap_or("");
-            let proj = ctx.effective_project_id().unwrap_or("default");
+            let bucket_project_number = ctx
+                .api
+                .get_bucket(bname, Some(&["projectNumber".to_string()]))
+                .await
+                .ok()
+                .and_then(|m| m.project_number)
+                .filter(|s| !s.trim().is_empty());
+            let topic_project = topic.as_deref().and_then(|t| {
+                let trimmed = t.strip_prefix("//pubsub.googleapis.com/").unwrap_or(t);
+                let mut parts = trimmed.split('/');
+                if parts.next() == Some("projects") {
+                    parts
+                        .next()
+                        .filter(|p| !p.is_empty())
+                        .map(ToString::to_string)
+                } else {
+                    None
+                }
+            });
+            let effective_proj = ctx
+                .effective_project_id()
+                .map(ToString::to_string)
+                .filter(|s| !s.trim().is_empty());
+            let sa_project = bucket_project_number
+                .clone()
+                .or_else(|| topic_project.clone())
+                .or_else(|| effective_proj.clone());
             let pubsub_topic = match topic {
-                Some(t) if t.starts_with("projects/") => t,
-                Some(t) => format!("projects/{proj}/topics/{t}"),
-                None => format!("projects/{proj}/topics/{bname}"),
+                Some(t) => {
+                    let trimmed = t.strip_prefix("//pubsub.googleapis.com/").unwrap_or(&t);
+                    if trimmed.starts_with("projects/") {
+                        trimmed.to_string()
+                    } else {
+                        let proj = effective_proj
+                            .as_deref()
+                            .or(bucket_project_number.as_deref())
+                            .ok_or_else(|| {
+                                GsutilError::project_id(
+                                    "No project ID configured for notification create. \
+                                     Pass a full topic path (projects/<project>/topics/<topic>) or configure default_project_id.",
+                                )
+                            })?;
+                        format!("projects/{proj}/topics/{trimmed}")
+                    }
+                }
+                None => {
+                    let proj = effective_proj
+                        .as_deref()
+                        .or(bucket_project_number.as_deref())
+                        .ok_or_else(|| {
+                            GsutilError::project_id(
+                                "No project ID configured for notification create. \
+                                 Pass -t projects/<project>/topics/<topic> or configure default_project_id.",
+                            )
+                        })?;
+                    format!("projects/{proj}/topics/{bname}")
+                }
             };
             if !skip_topic_setup {
                 if let Some(pubsub_api) = ctx.pubsub_api {
+                    let proj = sa_project.as_deref().ok_or_else(|| {
+                        GsutilError::project_id(
+                            "Could not determine project ID for notification topic authorization.",
+                        )
+                    })?;
                     pubsub_api.create_topic(&pubsub_topic).await?;
                     let sa = ctx.api.get_project_service_account(proj).await?;
                     if let Some(email) = sa.email_address.as_deref() {

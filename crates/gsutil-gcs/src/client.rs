@@ -2045,9 +2045,21 @@ impl CloudApi for GcsJsonClient {
         );
 
         let mut dst_meta = dst_obj_metadata.clone();
-        if let Some(EncryptionKey::Cmek { kms_key_name }) = &options.encryption_key {
-            dst_meta.kms_key_name = Some(kms_key_name.clone());
-        }
+        // Clear read-only encryption fields copied from source metadata; destination
+        // encryption is governed exclusively by `options.encryption_key`.
+        dst_meta.customer_encryption = None;
+        dst_meta.kms_key_name = match &options.encryption_key {
+            Some(EncryptionKey::Cmek { kms_key_name }) => {
+                // GCS rejects versioned `.../cryptoKeyVersions/N` on rewrite requests;
+                // strip any trailing version segment to pass the bare CryptoKey resource.
+                let bare = kms_key_name
+                    .split("/cryptoKeyVersions/")
+                    .next()
+                    .unwrap_or(kms_key_name.as_str());
+                Some(bare.to_string())
+            }
+            _ => None,
+        };
 
         // Resolve the best source decryption key: if `src_obj_metadata.customer_encryption`
         // specifies a SHA256 hash, prefer the matching key from `.boto` `csek_keys` (or the

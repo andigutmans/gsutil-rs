@@ -761,7 +761,181 @@ pub fn run_live_gcs_suite(
         CompareRule::Normalized,
         CompareRule::Ignore,
     );
-    let _ = (&topo.pubsub_topic, &topo.kms_key);
+    // 6b. Real Cloud KMS / CMEK lifecycle (authorize, bucket default key, CMEK cp/stat/rewrite)
+    if matches_filter(filter, "live_kms_authorize", "live_gcs", "kms") {
+        let opts = RunOptions::new(["kms", "authorize", "-p", &topo.project, "-k", &topo.kms_key]);
+        results.push(runner.run_rust_contract(
+            "live_kms_authorize",
+            "live_gcs",
+            "kms",
+            &opts,
+            0,
+            "",
+            &CompareRule::Ignore,
+            "",
+            &CompareRule::Ignore,
+            &ctx,
+        ));
+    }
+    if matches_filter(filter, "live_kms_encryption_lifecycle", "live_gcs", "kms") {
+        let set_opts = RunOptions::new(["kms", "encryption", "-k", &topo.kms_key, &ret_uri]);
+        results.push(runner.run_rust_contract(
+            "live_kms_encryption_set",
+            "live_gcs",
+            "kms",
+            &set_opts,
+            0,
+            "",
+            &CompareRule::Ignore,
+            "",
+            &CompareRule::Ignore,
+            &ctx,
+        ));
+        let get_opts = RunOptions::new(["kms", "encryption", &ret_uri]);
+        results.push(runner.run_rust_contract(
+            "live_kms_encryption_get",
+            "live_gcs",
+            "kms",
+            &get_opts,
+            0,
+            &topo.kms_key,
+            &CompareRule::ContainsAll(vec![topo.kms_key.clone()]),
+            "",
+            &CompareRule::Ignore,
+            &ctx,
+        ));
+        let clr_opts = RunOptions::new(["kms", "encryption", "-d", &ret_uri]);
+        results.push(runner.run_rust_contract(
+            "live_kms_encryption_clear",
+            "live_gcs",
+            "kms",
+            &clr_opts,
+            0,
+            "",
+            &CompareRule::Ignore,
+            "",
+            &CompareRule::Ignore,
+            &ctx,
+        ));
+    }
+    if matches_filter(filter, "live_cmek_cp_stat_rewrite", "live_gcs", "cp") {
+        let cmek_obj = format!("{rs_base}/cmek.bin");
+        let cmek_dl = tmp.path().join("cmek_dl.bin");
+        let up_opts = RunOptions::new([
+            "-o",
+            &format!("GSUtil:encryption_key={}", topo.kms_key),
+            "cp",
+            f_text1.to_str().unwrap(),
+            &cmek_obj,
+        ]);
+        results.push(runner.run_rust_contract(
+            "live_cmek_cp_upload",
+            "live_gcs",
+            "cp",
+            &up_opts,
+            0,
+            "",
+            &CompareRule::Ignore,
+            "",
+            &CompareRule::Ignore,
+            &ctx,
+        ));
+        let st_opts = RunOptions::new(["stat", &cmek_obj]);
+        let expected_stat = format!("KMS key: {}", topo.kms_key);
+        results.push(runner.run_rust_contract(
+            "live_cmek_stat",
+            "live_gcs",
+            "stat",
+            &st_opts,
+            0,
+            &expected_stat,
+            &CompareRule::ContainsAll(vec!["KMS key:".into(), topo.kms_key.clone()]),
+            "",
+            &CompareRule::Ignore,
+            &ctx,
+        ));
+        let dl_opts = RunOptions::new(["cp", &cmek_obj, cmek_dl.to_str().unwrap()]);
+        results.push(runner.run_rust_contract(
+            "live_cmek_cp_download",
+            "live_gcs",
+            "cp",
+            &dl_opts,
+            0,
+            "",
+            &CompareRule::Ignore,
+            "",
+            &CompareRule::Ignore,
+            &ctx,
+        ));
+        let rw_opts = RunOptions::new(["rewrite", "-k", &cmek_obj]);
+        results.push(runner.run_rust_contract(
+            "live_cmek_rewrite_decrypt",
+            "live_gcs",
+            "rewrite",
+            &rw_opts,
+            0,
+            "",
+            &CompareRule::Ignore,
+            "",
+            &CompareRule::Ignore,
+            &ctx,
+        ));
+    }
+    // 6c. Real Pub/Sub Notification create / list / delete lifecycle
+    if matches_filter(
+        filter,
+        "live_notification_lifecycle",
+        "live_gcs",
+        "notification",
+    ) {
+        let cr_opts = RunOptions::new([
+            "notification",
+            "create",
+            "-t",
+            &topo.pubsub_topic,
+            "-f",
+            "json",
+            &ret_uri,
+        ]);
+        results.push(runner.run_rust_contract(
+            "live_notification_create",
+            "live_gcs",
+            "notification",
+            &cr_opts,
+            0,
+            "",
+            &CompareRule::Ignore,
+            "",
+            &CompareRule::Ignore,
+            &ctx,
+        ));
+        let ls_opts = RunOptions::new(["notification", "list", &ret_uri]);
+        results.push(runner.run_rust_contract(
+            "live_notification_list_after_create",
+            "live_gcs",
+            "notification",
+            &ls_opts,
+            0,
+            &topo.pubsub_topic,
+            &CompareRule::ContainsAll(vec![topo.pubsub_topic.clone()]),
+            "",
+            &CompareRule::Ignore,
+            &ctx,
+        ));
+        let del_opts = RunOptions::new(["notification", "delete", &ret_uri]);
+        results.push(runner.run_rust_contract(
+            "live_notification_delete",
+            "live_gcs",
+            "notification",
+            &del_opts,
+            0,
+            "",
+            &CompareRule::Ignore,
+            "",
+            &CompareRule::Ignore,
+            &ctx,
+        ));
+    }
 
     // -------------------------------------------------------------------------
     // 7. Cleanup all per-run prefixes (`py-*`, `rs-*`, `-gz`, `-comp`)

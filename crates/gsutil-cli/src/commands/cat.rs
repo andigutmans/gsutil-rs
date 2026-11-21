@@ -122,7 +122,25 @@ pub async fn run(ctx: &mut CommandContext, sub_opts: &[OptPair], args: &[String]
 
     for url_str in args {
         let mut did_some_work = false;
-        let items = iter_objects(api.as_ref(), url_str, project_id.as_deref(), false, None).await?;
+        let parsed = StorageUrl::parse(url_str)?;
+        let items = if parsed.is_object() && !gsutil_core::url::contains_wildcard(url_str) {
+            let bucket = parsed.bucket_name().unwrap_or("");
+            let obj_name = parsed.object_name().unwrap_or("");
+            let provider_api = api.for_provider(parsed.scheme())?;
+            match provider_api
+                .get_object_metadata(bucket, obj_name, parsed.generation(), None)
+                .await
+            {
+                Ok(meta) => vec![BucketListingRef::Object {
+                    url: parsed,
+                    metadata: Some(Box::new(meta)),
+                }],
+                Err(e) if e.is_not_found() => Vec::new(),
+                Err(e) => return Err(e),
+            }
+        } else {
+            iter_objects(api.as_ref(), url_str, project_id.as_deref(), false, None).await?
+        };
 
         for blr in items {
             if let BucketListingRef::Object {

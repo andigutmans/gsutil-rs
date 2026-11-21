@@ -1532,3 +1532,58 @@ fn test_gs_json_host_ignores_ambient_mtls_but_rejects_explicit_boto_mtls() {
     let err = GcsJsonClientConfig::from_boto_config(&cfg).unwrap_err();
     assert!(err.to_string().contains("use_client_certificate"));
 }
+
+#[tokio::test]
+async fn test_copy_object_clears_stale_versioned_kms_key_on_decrypt() {
+    let server = MockServer::start().await;
+
+    // When options.encryption_key is None, destinationKmsKeyName must NOT be sent and
+    // stale versioned kmsKeyName from cloned source metadata must be stripped from body.
+    Mock::given(method("POST"))
+        .and(path(
+            "/storage/v1/b/kms-bkt/o/obj.txt/rewriteTo/b/kms-bkt/o/obj.txt",
+        ))
+        .respond_with(|req: &wiremock::Request| {
+            let has_dst_kms = req
+                .url
+                .query_pairs()
+                .any(|(k, _)| k == "destinationKmsKeyName");
+            assert!(
+                !has_dst_kms,
+                "destinationKmsKeyName must not be sent when decrypting to Google-managed"
+            );
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            assert!(
+                body.get("kmsKeyName").is_none(),
+                "stale kmsKeyName must be cleared from rewrite body: {body}"
+            );
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "done": true,
+                "resource": {
+                    "bucket": "kms-bkt",
+                    "name": "obj.txt",
+                    "generation": "2"
+                }
+            }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server);
+    let src_meta = Object {
+        bucket: Some("kms-bkt".to_string()),
+        name: Some("obj.txt".to_string()),
+        kms_key_name: Some(
+            "projects/p/locations/us/keyRings/kr/cryptoKeys/k/cryptoKeyVersions/1".to_string(),
+        ),
+        ..Default::default()
+    };
+    let dst_meta = src_meta.clone();
+
+    let res = client
+        .copy_object(&src_meta, &dst_meta, &CopyOptions::default())
+        .await
+        .unwrap();
+    assert!(res.kms_key_name.is_none());
+}
