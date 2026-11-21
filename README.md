@@ -32,27 +32,9 @@ A high-performance Rust rewrite of Google Cloud Storage's [`gsutil`](https://git
 
 ---
 
-## Performance (`target/release/gsutil` vs. Python `gsutil` v5.38)
+## Enterprise-Scale Live GCS Benchmarks (`target/release/gsutil` vs. Python `gsutil` v5.38)
 
-Measured on Linux `x86_64` via `gsutil-bench --suite all --iterations 3` and `gsutil-parity --mode stage1`:
-
-| Category | Workload | Python Median | Rust Median | Speedup | Python RSS | Rust RSS |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Cold start | `version` | 2,254.7 ms | 5.4 ms | **419.4×** | 74.9 MiB | 5.8 MiB |
-| Cold start | `help` | 2,045.3 ms | 5.2 ms | **392.7×** | 74.1 MiB | 5.7 MiB |
-| Hashing | `hash` (10 MiB) | 2,087.1 ms | 34.1 ms | **61.2×** | 73.9 MiB | 13.1 MiB |
-| Local | `cp` (10 MiB) | 2,158.9 ms | 15.6 ms | **138.7×** | 74.2 MiB | 13.1 MiB |
-| Local | `rsync -r -d` (50×64 KiB) | 2,596.1 ms | 8.2 ms | **315.6×** | 73.9 MiB | 13.2 MiB |
-| Live GCS | `ls` | 5,450.0 ms | 126.2 ms | **43.2×** | 93.0 MiB | 13.5 MiB |
-| Live GCS | `cp` upload (5 MiB) | 5,534.2 ms | 342.0 ms | **16.2×** | 124.2 MiB | 18.9 MiB |
-| Live GCS | `cp` download (5 MiB) | 4,953.1 ms | 172.8 ms | **28.7×** | 94.9 MiB | 21.0 MiB |
-| Live GCS | `-m cp` upload (10×64 KiB) | 11,529.7 ms | 534.7 ms | **21.6×** | 94.3 MiB | 13.5 MiB |
-| Live GCS | `-m cp` download (10×64 KiB) | 12,289.2 ms | 291.7 ms | **42.1×** | 94.3 MiB | 13.5 MiB |
-| Live GCS (200 MiB) | Streaming upload / download | — | 3.11 s / 1.00 s | — | — | **27.9 / 18.0 MiB** |
-
-### Enterprise-Scale Live GCS Benchmarks (250,000 Objects & 100 GiB Single Object)
-
-Measured in-region on a GCE `n2-standard-8` VM (`us-central1-a`, PD-SSD) against a `us-central1` GCS bucket (`target/release/gsutil` vs. Python `gsutil` v5.38):
+Measured in-region on a GCE `n2-standard-8` VM (`us-central1-a`, PD-SSD) against a `us-central1` GCS bucket:
 
 | Workload | Scale | Python `gsutil` v5.38 | Rust `gsutil-rs` | Speedup | Python RSS | Rust RSS |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
