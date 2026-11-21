@@ -11,6 +11,7 @@ pub mod posix;
 pub mod rewrite;
 pub mod rsync;
 pub mod tracker;
+pub mod ui;
 
 #[cfg(test)]
 pub(crate) mod mock_api;

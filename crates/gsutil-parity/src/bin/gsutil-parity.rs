@@ -3,6 +3,7 @@
 use gsutil_parity::cases::{run_live_gcs_suite, run_mock_gcs_suite, run_offline_suite};
 use gsutil_parity::runner::GsutilRunner;
 use gsutil_parity::scorecard::ParityScorecard;
+use gsutil_parity::stage1_gates::run_stage1_gates;
 use std::path::PathBuf;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -10,6 +11,7 @@ enum Mode {
     Offline,
     Mock,
     Live,
+    Stage1,
     All,
 }
 
@@ -36,9 +38,12 @@ fn parse_args() -> (Mode, Format, Option<String>, Option<PathBuf>, GsutilRunner)
                         "offline" => Mode::Offline,
                         "mock" => Mode::Mock,
                         "live" => Mode::Live,
+                        "stage1" => Mode::Stage1,
                         "all" => Mode::All,
                         other => {
-                            eprintln!("Unknown --mode: {other} (expected offline|mock|live|all)");
+                            eprintln!(
+                                "Unknown --mode: {other} (expected offline|mock|live|stage1|all)"
+                            );
                             std::process::exit(2);
                         }
                     };
@@ -112,6 +117,12 @@ async fn main() {
                 std::process::exit(2);
             });
             all_results.extend(run_live_gcs_suite(&runner, &bucket, filter.as_deref()));
+        }
+        Mode::Stage1 => {
+            let bucket = std::env::var("GSUTIL_TEST_BUCKET")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
+            all_results.extend(run_stage1_gates(&runner, bucket.as_deref()).await);
         }
         Mode::All => {
             all_results.extend(run_offline_suite(&runner, filter.as_deref()));

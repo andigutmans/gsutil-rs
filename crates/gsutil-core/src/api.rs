@@ -4,13 +4,27 @@
 //! in Python gsutil v5.38.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 
 use crate::error::Result;
 use crate::url::StorageUrl;
+
+/// Boxed async stream of byte chunks for constant-memory media downloads.
+pub type ByteStream = Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>;
+
+/// Callback invoked periodically during transfers with `(bytes_transferred, total_bytes)`.
+pub type ProgressCallback = Arc<dyn Fn(u64, Option<u64>) + Send + Sync>;
+
+/// Callback invoked immediately when GCS returns a resumable upload session `Location` URI.
+pub type SessionUriCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // Preconditions & Encryption
@@ -728,7 +742,7 @@ pub struct ListObjectsOptions {
     pub fields: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct DownloadOptions {
     pub generation: Option<String>,
     pub start_byte: Option<i64>,
@@ -736,15 +750,57 @@ pub struct DownloadOptions {
     pub compressed_encoding: bool,
     pub strategy: DownloadStrategy,
     pub decryption_key: Option<EncryptionKey>,
+    pub progress_callback: Option<ProgressCallback>,
 }
 
-#[derive(Debug, Clone, Default)]
+impl fmt::Debug for DownloadOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DownloadOptions")
+            .field("generation", &self.generation)
+            .field("start_byte", &self.start_byte)
+            .field("end_byte", &self.end_byte)
+            .field("compressed_encoding", &self.compressed_encoding)
+            .field("strategy", &self.strategy)
+            .field("decryption_key", &self.decryption_key.is_some())
+            .field("progress_callback", &self.progress_callback.is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone, Default)]
 pub struct UploadOptions {
     pub canned_acl: Option<String>,
     pub preconditions: Option<Preconditions>,
     pub encryption_key: Option<EncryptionKey>,
     pub fields: Option<Vec<String>>,
     pub gzip_encoded: bool,
+    /// Existing GCS resumable upload session URI to resume via `Content-Range: bytes */<total>`.
+    pub resumable_session_uri: Option<String>,
+    /// Invoked immediately when GCS returns a new resumable upload `Location` URI.
+    pub session_uri_callback: Option<SessionUriCallback>,
+    /// Invoked periodically with `(bytes_transferred, total_bytes)`.
+    pub progress_callback: Option<ProgressCallback>,
+    /// Total byte length of the upload (if known).
+    pub total_size: Option<u64>,
+    /// Resumable upload chunk size in bytes (must be a multiple of 256 KiB).
+    pub chunk_size: Option<usize>,
+}
+
+impl fmt::Debug for UploadOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UploadOptions")
+            .field("canned_acl", &self.canned_acl)
+            .field("preconditions", &self.preconditions)
+            .field("encryption_key", &self.encryption_key.is_some())
+            .field("fields", &self.fields)
+            .field("gzip_encoded", &self.gzip_encoded)
+            .field("resumable_session_uri", &self.resumable_session_uri)
+            .field("session_uri_callback", &self.session_uri_callback.is_some())
+            .field("progress_callback", &self.progress_callback.is_some())
+            .field("total_size", &self.total_size)
+            .field("chunk_size", &self.chunk_size)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -893,6 +949,24 @@ pub trait CloudApi: Send + Sync {
         options: &DownloadOptions,
     ) -> Result<Bytes>;
 
+    /// Stream object media chunks without buffering the full object in memory.
+    /// Real HTTP clients override this to stream directly from `reqwest::Response::bytes_stream()`.
+    async fn get_object_media_stream(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        options: &DownloadOptions,
+    ) -> Result<ByteStream> {
+        let data = self
+            .get_object_media(bucket_name, object_name, options)
+            .await?;
+        let len = data.len() as u64;
+        if let Some(ref cb) = options.progress_callback {
+            cb(len, Some(len));
+        }
+        Ok(Box::pin(futures::stream::once(async move { Ok(data) })))
+    }
+
     async fn upload_object(
         &self,
         data: Bytes,
@@ -906,6 +980,41 @@ pub trait CloudApi: Send + Sync {
         object_metadata: &Object,
         options: &UploadOptions,
     ) -> Result<Object>;
+
+    /// Upload a file slice `[start_offset..start_offset + length]` from disk using chunked
+    /// resumable upload with constant memory and real GCS `308` resume offset recovery.
+    /// Real HTTP clients override this to stream chunks directly from `file_path`.
+    async fn upload_object_resumable_file(
+        &self,
+        file_path: &Path,
+        start_offset: u64,
+        length: u64,
+        object_metadata: &Object,
+        options: &UploadOptions,
+    ) -> Result<Object> {
+        let mut file = tokio::fs::File::open(file_path).await?;
+        if start_offset > 0 {
+            file.seek(std::io::SeekFrom::Start(start_offset)).await?;
+        }
+        let mut buf = Vec::with_capacity(length.min(16 * 1024 * 1024) as usize);
+        file.take(length).read_to_end(&mut buf).await?;
+        self.upload_object_resumable(Bytes::from(buf), object_metadata, options)
+            .await
+    }
+
+    /// Upload an object from a streaming `AsyncRead` (for stdin `-`, gzip streams, and
+    /// cloud-to-cloud daisy-chain `-D`) using constant-memory chunked resumable upload.
+    async fn upload_object_streaming(
+        &self,
+        mut reader: Box<dyn AsyncRead + Send + Unpin>,
+        object_metadata: &Object,
+        options: &UploadOptions,
+    ) -> Result<Object> {
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await?;
+        self.upload_object_resumable(Bytes::from(buf), object_metadata, options)
+            .await
+    }
 
     async fn copy_object(
         &self,

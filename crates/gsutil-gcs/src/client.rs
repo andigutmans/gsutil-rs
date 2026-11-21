@@ -4,19 +4,23 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::env;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
+use futures::StreamExt;
 use gsutil_auth::adc::is_mtls_enabled;
+use gsutil_auth::resolver::format_proxy_url;
 use gsutil_auth::TokenProvider;
 use gsutil_core::api::{
-    Bucket, Channel, CloudApi, ComposeSourceObject, CopyOptions, CreateNotificationOptions,
-    CsObjectOrPrefix, DownloadOptions, DownloadStrategy, EncryptionKey, HmacKeyCreateResponse,
-    HmacKeyMetadata, IamPolicy, ListObjectsOptions, Notification, Object, Preconditions,
-    ServiceAccount, SignUrlOptions, UploadOptions,
+    Bucket, ByteStream, Channel, CloudApi, ComposeSourceObject, CopyOptions,
+    CreateNotificationOptions, CsObjectOrPrefix, DownloadOptions, DownloadStrategy, EncryptionKey,
+    HmacKeyCreateResponse, HmacKeyMetadata, IamPolicy, ListObjectsOptions, Notification, Object,
+    Preconditions, ServiceAccount, SignUrlOptions, UploadOptions,
 };
 use gsutil_core::config::{BotoConfig, RESUMABLE_CHUNK_QUANTUM};
 use gsutil_core::error::{GsutilError, Result, ServiceError, ServiceErrorKind};
@@ -24,6 +28,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE, RANGE, U
 use reqwest::{Client, Method, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tracing::debug;
 
 use crate::ecp::{EcpProxy, ECP_TARGET_HOST_HEADER};
@@ -1062,6 +1067,101 @@ impl CloudApi for GcsJsonClient {
         }
     }
 
+    async fn get_object_media_stream(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        options: &DownloadOptions,
+    ) -> Result<ByteStream> {
+        let url = format!(
+            "{}/b/{}/o/{}",
+            self.config.storage_base_url,
+            encode_path_segment(bucket_name),
+            encode_path_segment(object_name)
+        );
+        let mut query = vec![("alt".to_string(), "media".to_string())];
+        if let Some(ref gen) = options.generation {
+            query.push(("generation".to_string(), gen.clone()));
+        }
+        add_user_project(&mut query, self.effective_user_project());
+
+        let mut extra = HeaderMap::new();
+        if let Some(range_hdr) = format_range_header(options.start_byte, options.end_byte) {
+            if let Ok(val) = HeaderValue::from_str(&range_hdr) {
+                extra.insert(RANGE, val);
+            }
+        }
+        if options.compressed_encoding {
+            extra.insert(
+                HeaderName::from_static("accept-encoding"),
+                HeaderValue::from_static("gzip"),
+            );
+        }
+        apply_encryption_headers(&mut extra, options.decryption_key.as_ref());
+
+        let ctx = ErrorContext::object(bucket_name, object_name, options.generation.as_deref());
+
+        let do_open = || async {
+            let req = self
+                .prepare_request_with_client(
+                    &self.media_http,
+                    Method::GET,
+                    &url,
+                    &query,
+                    Some(&extra),
+                )
+                .await?;
+            let resp = req.send().await.map_err(reqwest_to_service_error)?;
+            let status = resp.status().as_u16();
+            if self.config.debug_level >= 2 {
+                log_wire_response(status, resp.headers());
+            }
+            if (200..300).contains(&status) {
+                Ok(resp)
+            } else {
+                let www_auth = resp
+                    .headers()
+                    .get("www-authenticate")
+                    .and_then(|v| v.to_str().ok())
+                    .map(ToString::to_string);
+                let text = resp.text().await.unwrap_or_default();
+                Err(translate_http_error(
+                    status,
+                    &text,
+                    www_auth.as_deref(),
+                    &ctx,
+                ))
+            }
+        };
+
+        let resp = match options.strategy {
+            DownloadStrategy::Resumable => {
+                self.config
+                    .retry_policy
+                    .execute(do_open, is_retryable_gsutil_error)
+                    .await?
+            }
+            DownloadStrategy::OneShot => do_open().await?,
+        };
+
+        let total_hint = resp.content_length();
+        let progress_cb = options.progress_callback.clone();
+        let bytes_seen = Arc::new(AtomicU64::new(0));
+
+        let stream = resp.bytes_stream().map(move |item| {
+            item.inspect(|chunk| {
+                let total = bytes_seen.fetch_add(chunk.len() as u64, Ordering::Relaxed)
+                    + chunk.len() as u64;
+                if let Some(ref cb) = progress_cb {
+                    cb(total, total_hint);
+                }
+            })
+            .map_err(std::io::Error::other)
+        });
+
+        Ok(Box::pin(stream))
+    }
+
     async fn upload_object(
         &self,
         data: Bytes,
@@ -1403,6 +1503,380 @@ impl CloudApi for GcsJsonClient {
             None,
             None,
         )))
+    }
+
+    async fn upload_object_resumable_file(
+        &self,
+        file_path: &Path,
+        start_offset: u64,
+        length: u64,
+        object_metadata: &Object,
+        options: &UploadOptions,
+    ) -> Result<Object> {
+        let bucket_name = object_metadata.bucket.as_deref().ok_or_else(|| {
+            GsutilError::argument("Object metadata must specify bucket for resumable upload.")
+        })?;
+        let object_name = object_metadata.name.as_deref().ok_or_else(|| {
+            GsutilError::argument("Object metadata must specify name for resumable upload.")
+        })?;
+
+        let content_type = object_metadata
+            .content_type
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_CONTENT_TYPE);
+
+        let mut chunk_headers_base = HeaderMap::new();
+        if let Ok(ct_val) = HeaderValue::from_str(content_type) {
+            chunk_headers_base.insert(CONTENT_TYPE, ct_val);
+        }
+        if options.gzip_encoded {
+            chunk_headers_base.insert(
+                HeaderName::from_static("content-encoding"),
+                HeaderValue::from_static("gzip"),
+            );
+        }
+        apply_encryption_headers(&mut chunk_headers_base, options.encryption_key.as_ref());
+
+        // Step 1: Attempt to resume an existing session if provided, otherwise initiate a new one.
+        let mut resumed: Option<(String, u64)> = None;
+        if let Some(ref existing_uri) = options.resumable_session_uri {
+            let effective_uri = self.rewrite_for_ecp(existing_uri);
+            match self
+                .query_resumable_upload_status(&effective_uri, Some(length), &chunk_headers_base)
+                .await?
+            {
+                ResumableQueryStatus::Complete(obj) => {
+                    if let Some(ref cb) = options.progress_callback {
+                        cb(length, Some(length));
+                    }
+                    return Ok(*obj);
+                }
+                ResumableQueryStatus::Incomplete(committed_offset) => {
+                    debug!(
+                        "Resuming GCS upload session for gs://{bucket_name}/{object_name} at byte {committed_offset}/{length}"
+                    );
+                    resumed = Some((effective_uri, committed_offset));
+                }
+                ResumableQueryStatus::Expired => {
+                    debug!(
+                        "Existing upload session expired for gs://{bucket_name}/{object_name}; starting new session"
+                    );
+                }
+            }
+        }
+
+        let (session_uri, mut offset) = match resumed {
+            Some((uri, off)) => (uri, off),
+            None => {
+                let raw_uri = self
+                    .initiate_resumable_upload(
+                        bucket_name,
+                        object_name,
+                        object_metadata,
+                        options,
+                        Some(length),
+                    )
+                    .await?;
+                if let Some(ref cb) = options.session_uri_callback {
+                    cb(&raw_uri);
+                }
+                (self.rewrite_for_ecp(&raw_uri), 0u64)
+            }
+        };
+
+        // Handle 0-byte upload cleanly.
+        if length == 0 {
+            let mut hdrs = chunk_headers_base.clone();
+            hdrs.insert(
+                HeaderName::from_static("content-range"),
+                HeaderValue::from_static("bytes */0"),
+            );
+            let resp_text = self
+                .upload_resumable_chunk(&session_uri, Bytes::new(), &hdrs)
+                .await?;
+            if let Some(ref cb) = options.progress_callback {
+                cb(0, Some(0));
+            }
+            return serde_json::from_str(&resp_text).map_err(|e| {
+                GsutilError::Service(ServiceError::service(
+                    format!("Failed to parse resumable upload response: {e}"),
+                    None,
+                    None,
+                ))
+            });
+        }
+
+        // Bounded chunk size (default 8 MiB, aligned to 256 KiB) for constant memory.
+        let chunk_size =
+            effective_streaming_chunk_size(options.chunk_size, self.config.resumable_chunk_size);
+
+        let mut file = tokio::fs::File::open(file_path).await?;
+        let mut retries_without_progress: u32 = 0;
+
+        while offset < length {
+            file.seek(SeekFrom::Start(start_offset + offset)).await?;
+            let to_read = (chunk_size as u64).min(length - offset) as usize;
+            let mut buf = vec![0u8; to_read];
+            read_exact_async(&mut file, &mut buf).await?;
+            let chunk = Bytes::from(buf);
+
+            let end_inclusive = offset + to_read as u64 - 1;
+            let content_range = format!("bytes {offset}-{end_inclusive}/{length}");
+            let mut hdrs = chunk_headers_base.clone();
+            if let Ok(val) = HeaderValue::from_str(&content_range) {
+                hdrs.insert(HeaderName::from_static("content-range"), val);
+            }
+
+            let send_res = self.send_resumable_put(&session_uri, chunk, &hdrs).await;
+
+            match send_res {
+                Ok(ResumablePutOutcome::Complete(obj)) => {
+                    if let Some(ref cb) = options.progress_callback {
+                        cb(length, Some(length));
+                    }
+                    return Ok(*obj);
+                }
+                Ok(ResumablePutOutcome::Continue(next_off)) => {
+                    let advanced = next_off.unwrap_or(offset + to_read as u64);
+                    if advanced > offset {
+                        retries_without_progress = 0;
+                    }
+                    offset = advanced;
+                    if let Some(ref cb) = options.progress_callback {
+                        cb(offset, Some(length));
+                    }
+                }
+                Err(ResumablePutError::Retryable {
+                    err,
+                    retry_after_secs,
+                }) => {
+                    retries_without_progress += 1;
+                    if retries_without_progress > self.config.retry_policy.max_retries {
+                        return Err(err);
+                    }
+                    let delay = match retry_after_secs {
+                        Some(secs) => Duration::from_secs(secs.min(60)),
+                        None => self
+                            .config
+                            .retry_policy
+                            .delay_for_attempt(retries_without_progress),
+                    };
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    // Re-query GCS to discover exact committed offset.
+                    match self
+                        .query_resumable_upload_status(
+                            &session_uri,
+                            Some(length),
+                            &chunk_headers_base,
+                        )
+                        .await
+                    {
+                        Ok(ResumableQueryStatus::Complete(obj)) => {
+                            if let Some(ref cb) = options.progress_callback {
+                                cb(length, Some(length));
+                            }
+                            return Ok(*obj);
+                        }
+                        Ok(ResumableQueryStatus::Incomplete(server_off)) => {
+                            if server_off > offset {
+                                retries_without_progress = 0;
+                            }
+                            offset = server_off;
+                        }
+                        Ok(ResumableQueryStatus::Expired) => {
+                            return Err(GsutilError::Service(
+                                ServiceError::resumable_upload_start_over(
+                                    "Resumable upload session expired during retry.",
+                                    Some(410),
+                                    None,
+                                ),
+                            ));
+                        }
+                        Err(_) => {
+                            // Keep current offset and retry on next iteration.
+                        }
+                    }
+                }
+                Err(ResumablePutError::Fatal(err)) => return Err(err),
+            }
+        }
+
+        Err(GsutilError::Service(ServiceError::resumable_upload_abort(
+            "Resumable file upload ended without completion response from server.",
+            None,
+            None,
+        )))
+    }
+
+    async fn upload_object_streaming(
+        &self,
+        mut reader: Box<dyn AsyncRead + Send + Unpin>,
+        object_metadata: &Object,
+        options: &UploadOptions,
+    ) -> Result<Object> {
+        let bucket_name = object_metadata.bucket.as_deref().ok_or_else(|| {
+            GsutilError::argument("Object metadata must specify bucket for streaming upload.")
+        })?;
+        let object_name = object_metadata.name.as_deref().ok_or_else(|| {
+            GsutilError::argument("Object metadata must specify name for streaming upload.")
+        })?;
+
+        let content_type = object_metadata
+            .content_type
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_CONTENT_TYPE);
+
+        let raw_uri = self
+            .initiate_resumable_upload(
+                bucket_name,
+                object_name,
+                object_metadata,
+                options,
+                options.total_size,
+            )
+            .await?;
+        if let Some(ref cb) = options.session_uri_callback {
+            cb(&raw_uri);
+        }
+        let session_uri = self.rewrite_for_ecp(&raw_uri);
+
+        let mut chunk_headers_base = HeaderMap::new();
+        if let Ok(ct_val) = HeaderValue::from_str(content_type) {
+            chunk_headers_base.insert(CONTENT_TYPE, ct_val);
+        }
+        if options.gzip_encoded {
+            chunk_headers_base.insert(
+                HeaderName::from_static("content-encoding"),
+                HeaderValue::from_static("gzip"),
+            );
+        }
+        apply_encryption_headers(&mut chunk_headers_base, options.encryption_key.as_ref());
+
+        let chunk_size =
+            effective_streaming_chunk_size(options.chunk_size, self.config.resumable_chunk_size);
+
+        let mut offset: u64 = 0;
+        let mut pending_byte: Option<u8> = None;
+
+        loop {
+            // Fill up to `chunk_size` bytes from the reader.
+            let mut buf = Vec::with_capacity(chunk_size.min(1024 * 1024));
+            if let Some(b) = pending_byte.take() {
+                buf.push(b);
+            }
+            while buf.len() < chunk_size {
+                let remaining = chunk_size - buf.len();
+                let mut tmp = vec![0u8; remaining.min(64 * 1024)];
+                let n = reader.read(&mut tmp).await?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+
+            // Probe 1 byte ahead to detect EOF accurately when buf.len() == chunk_size.
+            let is_eof = if buf.len() < chunk_size {
+                true
+            } else {
+                let mut probe = [0u8; 1];
+                let n = reader.read(&mut probe).await?;
+                if n == 0 {
+                    true
+                } else {
+                    pending_byte = Some(probe[0]);
+                    false
+                }
+            };
+
+            if buf.is_empty() && offset == 0 {
+                let mut hdrs = chunk_headers_base.clone();
+                hdrs.insert(
+                    HeaderName::from_static("content-range"),
+                    HeaderValue::from_static("bytes */0"),
+                );
+                let resp_text = self
+                    .upload_resumable_chunk(&session_uri, Bytes::new(), &hdrs)
+                    .await?;
+                if let Some(ref cb) = options.progress_callback {
+                    cb(0, Some(0));
+                }
+                return serde_json::from_str(&resp_text).map_err(|e| {
+                    GsutilError::Service(ServiceError::service(
+                        format!("Failed to parse streaming upload response: {e}"),
+                        None,
+                        None,
+                    ))
+                });
+            }
+
+            let chunk_len = buf.len() as u64;
+            let end_inclusive = offset + chunk_len - 1;
+            let content_range = if is_eof {
+                format!("bytes {offset}-{end_inclusive}/{}", offset + chunk_len)
+            } else {
+                match options.total_size {
+                    Some(total) => format!("bytes {offset}-{end_inclusive}/{total}"),
+                    None => format!("bytes {offset}-{end_inclusive}/*"),
+                }
+            };
+
+            let mut hdrs = chunk_headers_base.clone();
+            if let Ok(val) = HeaderValue::from_str(&content_range) {
+                hdrs.insert(HeaderName::from_static("content-range"), val);
+            }
+            let chunk = Bytes::from(buf);
+
+            let mut attempt = 0u32;
+            loop {
+                match self
+                    .send_resumable_put(&session_uri, chunk.clone(), &hdrs)
+                    .await
+                {
+                    Ok(ResumablePutOutcome::Complete(obj)) => {
+                        if let Some(ref cb) = options.progress_callback {
+                            cb(offset + chunk_len, Some(offset + chunk_len));
+                        }
+                        return Ok(*obj);
+                    }
+                    Ok(ResumablePutOutcome::Continue(_)) => {
+                        offset += chunk_len;
+                        if let Some(ref cb) = options.progress_callback {
+                            cb(offset, options.total_size);
+                        }
+                        break;
+                    }
+                    Err(ResumablePutError::Retryable {
+                        err,
+                        retry_after_secs,
+                    }) => {
+                        attempt += 1;
+                        if attempt > self.config.retry_policy.max_retries {
+                            return Err(err);
+                        }
+                        let delay = match retry_after_secs {
+                            Some(secs) => Duration::from_secs(secs.min(60)),
+                            None => self.config.retry_policy.delay_for_attempt(attempt),
+                        };
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
+                    Err(ResumablePutError::Fatal(err)) => return Err(err),
+                }
+            }
+
+            if is_eof {
+                return Err(GsutilError::Service(ServiceError::resumable_upload_abort(
+                    "Streaming upload reached EOF without completion response from server.",
+                    None,
+                    None,
+                )));
+            }
+        }
     }
 
     async fn copy_object(
@@ -1964,6 +2438,244 @@ impl CloudApi for GcsJsonClient {
 }
 
 impl GcsJsonClient {
+    fn rewrite_for_ecp(&self, uri: &str) -> String {
+        match &self.ecp_proxy {
+            Some(proxy) => proxy.rewrite_gcs_url(uri),
+            None => uri.to_string(),
+        }
+    }
+
+    async fn initiate_resumable_upload(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        object_metadata: &Object,
+        options: &UploadOptions,
+        content_length: Option<u64>,
+    ) -> Result<String> {
+        let init_url = format!(
+            "{}/b/{}/o",
+            self.config.upload_base_url,
+            encode_path_segment(bucket_name)
+        );
+
+        let mut query = vec![("uploadType".to_string(), "resumable".to_string())];
+        add_preconditions(&mut query, options.preconditions.as_ref());
+        if let Some(ref acl) = options.canned_acl {
+            query.push((
+                "predefinedAcl".to_string(),
+                object_canned_acl_to_json(acl)?.to_string(),
+            ));
+        }
+        if let Some(EncryptionKey::Cmek { kms_key_name }) = &options.encryption_key {
+            query.push(("kmsKeyName".to_string(), kms_key_name.clone()));
+        }
+        add_user_project(&mut query, self.effective_user_project());
+        add_fields_param(&mut query, options.fields.as_deref(), false);
+
+        let content_type = object_metadata
+            .content_type
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_CONTENT_TYPE);
+        let mut init_headers = HeaderMap::new();
+        if let Ok(ct_val) = HeaderValue::from_str(content_type) {
+            init_headers.insert(HeaderName::from_static("x-upload-content-type"), ct_val);
+        }
+        if let Some(len) = content_length {
+            if let Ok(len_val) = HeaderValue::from_str(&len.to_string()) {
+                init_headers.insert(HeaderName::from_static("x-upload-content-length"), len_val);
+            }
+        }
+        apply_encryption_headers(&mut init_headers, options.encryption_key.as_ref());
+
+        let meta_val = serde_json::to_value(object_metadata).map_err(|e| {
+            GsutilError::command(format!("Failed to serialize object metadata: {e}"))
+        })?;
+
+        let init_ctx = ErrorContext {
+            provider: "gs",
+            bucket_name: Some(bucket_name),
+            object_name: Some(object_name),
+            generation: None,
+            not_found_override: Some(create_not_found_for_object_write(
+                "gs",
+                bucket_name,
+                None,
+                None,
+                None,
+            )),
+        };
+
+        self.config
+            .retry_policy
+            .execute(
+                || async {
+                    let req = self
+                        .prepare_request(Method::POST, &init_url, &query, Some(&init_headers))
+                        .await?
+                        .json(&meta_val);
+                    let resp = req.send().await.map_err(reqwest_to_service_error)?;
+                    let status = resp.status().as_u16();
+                    if self.config.debug_level >= 2 {
+                        log_wire_response(status, resp.headers());
+                    }
+                    let www_auth = resp
+                        .headers()
+                        .get("www-authenticate")
+                        .and_then(|v| v.to_str().ok())
+                        .map(ToString::to_string);
+                    let location = resp
+                        .headers()
+                        .get("location")
+                        .and_then(|v| v.to_str().ok())
+                        .map(ToString::to_string);
+                    let text = resp.text().await.unwrap_or_default();
+                    if (200..300).contains(&status) {
+                        location.ok_or_else(|| {
+                            GsutilError::Service(ServiceError::resumable_upload_abort(
+                                "Resumable upload initiation response missing Location header.",
+                                Some(status),
+                                None,
+                            ))
+                        })
+                    } else {
+                        Err(translate_http_error(
+                            status,
+                            &text,
+                            www_auth.as_deref(),
+                            &init_ctx,
+                        ))
+                    }
+                },
+                is_retryable_gsutil_error,
+            )
+            .await
+    }
+
+    async fn query_resumable_upload_status(
+        &self,
+        session_uri: &str,
+        total_size: Option<u64>,
+        base_headers: &HeaderMap,
+    ) -> Result<ResumableQueryStatus> {
+        let mut hdrs = base_headers.clone();
+        let range_val = match total_size {
+            Some(total) => format!("bytes */{total}"),
+            None => "bytes */*".to_string(),
+        };
+        if let Ok(v) = HeaderValue::from_str(&range_val) {
+            hdrs.insert(HeaderName::from_static("content-range"), v);
+        }
+
+        let req = self
+            .prepare_request(Method::PUT, session_uri, &[], Some(&hdrs))
+            .await?
+            .body(Bytes::new());
+        let resp = req.send().await.map_err(reqwest_to_service_error)?;
+        let status = resp.status().as_u16();
+        if self.config.debug_level >= 2 {
+            log_wire_response(status, resp.headers());
+        }
+        let range_hdr = resp
+            .headers()
+            .get("range")
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
+        let body_text = resp.text().await.unwrap_or_default();
+
+        if status == 308 {
+            let committed = range_hdr
+                .as_deref()
+                .and_then(parse_resume_range_next_offset)
+                .map(|n| n as u64)
+                .unwrap_or(0);
+            Ok(ResumableQueryStatus::Incomplete(committed))
+        } else if (200..300).contains(&status) {
+            let obj: Object = serde_json::from_str(&body_text).map_err(|e| {
+                GsutilError::Service(ServiceError::service(
+                    format!("Failed to parse finalized resumable upload object: {e}"),
+                    Some(status),
+                    None,
+                ))
+            })?;
+            Ok(ResumableQueryStatus::Complete(Box::new(obj)))
+        } else if status == 404 || status == 410 {
+            Ok(ResumableQueryStatus::Expired)
+        } else {
+            Err(translate_resumable_upload_error(status, &body_text))
+        }
+    }
+
+    async fn send_resumable_put(
+        &self,
+        session_uri: &str,
+        chunk: Bytes,
+        headers: &HeaderMap,
+    ) -> std::result::Result<ResumablePutOutcome, ResumablePutError> {
+        let req = self
+            .prepare_request(Method::PUT, session_uri, &[], Some(headers))
+            .await
+            .map_err(ResumablePutError::Fatal)?
+            .body(chunk);
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let ge = reqwest_to_service_error(e);
+                if is_retryable_gsutil_error(&ge) {
+                    return Err(ResumablePutError::Retryable {
+                        err: ge,
+                        retry_after_secs: None,
+                    });
+                }
+                return Err(ResumablePutError::Fatal(ge));
+            }
+        };
+
+        let status = resp.status().as_u16();
+        if self.config.debug_level >= 2 {
+            log_wire_response(status, resp.headers());
+        }
+        let range_hdr = resp
+            .headers()
+            .get("range")
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
+        let retry_after_secs = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        let body_text = resp.text().await.unwrap_or_default();
+
+        if status == 308 {
+            let next_off = range_hdr
+                .as_deref()
+                .and_then(parse_resume_range_next_offset)
+                .map(|n| n as u64);
+            Ok(ResumablePutOutcome::Continue(next_off))
+        } else if (200..300).contains(&status) {
+            let obj: Object = serde_json::from_str(&body_text).map_err(|e| {
+                ResumablePutError::Fatal(GsutilError::Service(ServiceError::service(
+                    format!("Failed to parse completed resumable upload object: {e}"),
+                    Some(status),
+                    None,
+                )))
+            })?;
+            Ok(ResumablePutOutcome::Complete(Box::new(obj)))
+        } else {
+            let translated = translate_resumable_upload_error(status, &body_text);
+            if status == 429 || status >= 500 || is_retryable_gsutil_error(&translated) {
+                Err(ResumablePutError::Retryable {
+                    err: translated,
+                    retry_after_secs,
+                })
+            } else {
+                Err(ResumablePutError::Fatal(translated))
+            }
+        }
+    }
+
     async fn upload_resumable_chunk(
         &self,
         session_uri: &str,
@@ -1996,6 +2708,59 @@ impl GcsJsonClient {
 enum ResumableChunkOutcome {
     Continue(usize),
     Complete(String),
+}
+
+enum ResumableQueryStatus {
+    Complete(Box<Object>),
+    Incomplete(u64),
+    Expired,
+}
+
+enum ResumablePutOutcome {
+    Complete(Box<Object>),
+    Continue(Option<u64>),
+}
+
+enum ResumablePutError {
+    Retryable {
+        err: GsutilError,
+        retry_after_secs: Option<u64>,
+    },
+    Fatal(GsutilError),
+}
+
+/// Default bounded chunk size for streaming/file resumable uploads (8 MiB = 32 * 256 KiB).
+const DEFAULT_STREAMING_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
+fn effective_streaming_chunk_size(override_size: Option<usize>, config_size: usize) -> usize {
+    let quantum = RESUMABLE_CHUNK_QUANTUM as usize;
+    let raw = match override_size {
+        Some(s) if s > 0 => s,
+        _ => config_size.min(DEFAULT_STREAMING_CHUNK_SIZE),
+    };
+    let rem = raw % quantum;
+    if rem == 0 {
+        raw.max(quantum)
+    } else {
+        raw + (quantum - rem)
+    }
+}
+
+async fn read_exact_async<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    mut buf: &mut [u8],
+) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        let n = reader.read(buf).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "unexpected EOF while reading upload chunk",
+            ));
+        }
+        buf = &mut buf[n..];
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2266,7 +3031,8 @@ fn build_reqwest_client(boto_config: &BotoConfig, no_gzip: bool) -> Result<Clien
     }
 
     if let Some(proxy) = boto_config.resolve_proxy() {
-        let reqwest_proxy = reqwest::Proxy::all(proxy.to_url())
+        let proxy_url = format_proxy_url(&proxy);
+        let reqwest_proxy = reqwest::Proxy::all(&proxy_url)
             .map_err(|e| GsutilError::command(format!("Invalid proxy config: {e}")))?;
         builder = builder.proxy(reqwest_proxy);
     }

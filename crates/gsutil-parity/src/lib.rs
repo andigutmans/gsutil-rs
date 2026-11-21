@@ -14,3 +14,4 @@ pub mod mock_gcs;
 pub mod normalize;
 pub mod runner;
 pub mod scorecard;
+pub mod stage1_gates;

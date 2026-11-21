@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use gsutil_auth::adc::certificate_config_path;
 use gsutil_core::config::BotoConfig;
 use gsutil_core::error::{GsutilError, Result};
+use gsutil_core::signals::{register_cleanup, CleanupGuard};
 use serde::Deserialize;
 use tracing::debug;
 
@@ -39,10 +40,12 @@ struct CertificateConfigLibs {
 
 /// Handle to a shared or auto-spawned `ecp_http_proxy` localhost process.
 ///
-/// When auto-spawned, the child process is terminated cleanly on [`Drop`].
+/// When auto-spawned, the child process is terminated cleanly both on [`Drop`]
+/// and via `gsutil_core::signals` on `SIGINT`/`SIGTERM`.
 pub struct EcpProxy {
     port: u16,
-    child: Option<Mutex<Child>>,
+    child: Option<Arc<Mutex<Option<Child>>>>,
+    _cleanup_guard: Option<CleanupGuard>,
 }
 
 impl std::fmt::Debug for EcpProxy {
@@ -56,11 +59,17 @@ impl std::fmt::Debug for EcpProxy {
 
 impl Drop for EcpProxy {
     fn drop(&mut self) {
-        if let Some(ref child_mutex) = self.child {
-            if let Ok(mut child) = child_mutex.lock() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+        if let Some(ref child_arc) = self.child {
+            kill_child_handle(child_arc);
+        }
+    }
+}
+
+fn kill_child_handle(child_arc: &Mutex<Option<Child>>) {
+    if let Ok(mut guard) = child_arc.lock() {
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
@@ -95,7 +104,11 @@ impl EcpProxy {
                 })?;
                 if port > 0 {
                     debug!("Using existing ECP proxy on 127.0.0.1:{port}");
-                    return Ok(Some(Arc::new(Self { port, child: None })));
+                    return Ok(Some(Arc::new(Self {
+                        port,
+                        child: None,
+                        _cleanup_guard: None,
+                    })));
                 }
             }
         }
@@ -156,9 +169,15 @@ impl EcpProxy {
             }
             if check_readyz(port, &nonce) {
                 debug!("ECP proxy ready on 127.0.0.1:{port}");
+                let child_arc = Arc::new(Mutex::new(Some(child)));
+                let cleanup_arc = Arc::clone(&child_arc);
+                let guard = register_cleanup(move || {
+                    kill_child_handle(&cleanup_arc);
+                });
                 return Ok(Self {
                     port,
-                    child: Some(Mutex::new(child)),
+                    child: Some(child_arc),
+                    _cleanup_guard: Some(guard),
                 });
             }
             std::thread::sleep(Duration::from_millis(25));

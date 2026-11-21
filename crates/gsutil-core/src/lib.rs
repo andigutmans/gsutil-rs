@@ -6,5 +6,6 @@ pub mod api;
 pub mod config;
 pub mod error;
 pub mod hash;
+pub mod signals;
 pub mod url;
 pub mod wildcard;

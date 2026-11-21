@@ -411,3 +411,41 @@ async fn test_gcloud_disk_token_cache_hit_skips_subprocess() {
     let tok2 = gcloud.token().await.unwrap().unwrap();
     assert_eq!(tok2.token, "mock-token-cached-disk-token");
 }
+
+#[test]
+fn test_socks4_and_socks5_proxy_url_formatting() {
+    use gsutil_auth::resolver::format_proxy_url;
+    use gsutil_core::config::{ProxyConfig, ProxyType};
+
+    let s5_rdns = ProxyConfig {
+        proxy_type: ProxyType::Socks5,
+        host: "proxy.local".to_string(),
+        port: 1080,
+        user: Some("u".to_string()),
+        pass: Some("p".to_string()),
+        rdns: true,
+    };
+    assert_eq!(format_proxy_url(&s5_rdns), "socks5h://u:p@proxy.local:1080");
+
+    let s5_no_rdns = ProxyConfig {
+        rdns: false,
+        ..s5_rdns.clone()
+    };
+    assert_eq!(
+        format_proxy_url(&s5_no_rdns),
+        "socks5://u:p@proxy.local:1080"
+    );
+
+    let s4 = ProxyConfig {
+        proxy_type: ProxyType::Socks4,
+        host: "127.0.0.1".to_string(),
+        port: 9050,
+        user: None,
+        pass: None,
+        rdns: false,
+    };
+    assert_eq!(format_proxy_url(&s4), "socks4://127.0.0.1:9050");
+
+    let s4a = ProxyConfig { rdns: true, ..s4 };
+    assert_eq!(format_proxy_url(&s4a), "socks4a://127.0.0.1:9050");
+}

@@ -6,19 +6,23 @@
 //! `_TranslateBotoException` parity.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
+use futures::StreamExt;
+use gsutil_auth::resolver::format_proxy_url;
 use gsutil_auth::{HmacCredentials, TokenProvider};
 use gsutil_core::api::{
-    Bucket, BucketAccessControl, BucketCors, BucketLifecycle, BucketVersioning, Channel, CloudApi,
-    ComposeSourceObject, CopyOptions, CreateNotificationOptions, CsObjectOrPrefix, DownloadOptions,
-    DownloadStrategy, EncryptionKey, HmacKeyCreateResponse, HmacKeyMetadata, IamPolicy,
-    LifecycleAction, LifecycleCondition, LifecycleRule, ListObjectsOptions, Notification, Object,
-    Preconditions, ServiceAccount, SignUrlOptions, UploadOptions,
+    Bucket, BucketAccessControl, BucketCors, BucketLifecycle, BucketVersioning, ByteStream,
+    Channel, CloudApi, ComposeSourceObject, CopyOptions, CreateNotificationOptions,
+    CsObjectOrPrefix, DownloadOptions, DownloadStrategy, EncryptionKey, HmacKeyCreateResponse,
+    HmacKeyMetadata, IamPolicy, LifecycleAction, LifecycleCondition, LifecycleRule,
+    ListObjectsOptions, Notification, Object, Preconditions, ServiceAccount, SignUrlOptions,
+    UploadOptions,
 };
 use gsutil_core::config::BotoConfig;
 use gsutil_core::error::{GsutilError, Result, ServiceError};
@@ -154,6 +158,7 @@ impl XmlApiClient {
         let mut builder = Client::builder()
             .pool_max_idle_per_host(32)
             .tcp_keepalive(Duration::from_secs(60))
+            .no_gzip()
             .danger_accept_invalid_certs(!boto_config.https_validate_certificates());
         if let Some(ca_path) = boto_config.ca_certificates_file() {
             if let Ok(pem) = std::fs::read(ca_path) {
@@ -165,7 +170,8 @@ impl XmlApiClient {
             }
         }
         if let Some(proxy) = boto_config.resolve_proxy() {
-            if let Ok(p) = reqwest::Proxy::all(proxy.to_url()) {
+            let proxy_url = format_proxy_url(&proxy);
+            if let Ok(p) = reqwest::Proxy::all(&proxy_url) {
                 builder = builder.proxy(p);
             }
         }
@@ -947,6 +953,132 @@ impl CloudApi for XmlApiClient {
             .send_xml_request(Method::GET, &uri, &query, Bytes::new(), Some(&extra), &ctx)
             .await?;
         Ok(body)
+    }
+
+    async fn get_object_media_stream(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        options: &DownloadOptions,
+    ) -> Result<ByteStream> {
+        let uri = format!(
+            "/{}/{}",
+            percent_encode_segment(bucket_name),
+            encode_object_path(object_name)
+        );
+        let mut query = Vec::new();
+        if let Some(ref gen) = options.generation {
+            let key = if self.config.provider == "s3" {
+                "versionId"
+            } else {
+                "generation"
+            };
+            query.push((key.to_string(), gen.clone()));
+        }
+        let mut extra = HeaderMap::new();
+        match (options.start_byte, options.end_byte) {
+            (Some(s), Some(e)) if s >= 0 => {
+                if let Ok(v) = HeaderValue::from_str(&format!("bytes={s}-{e}")) {
+                    extra.insert(RANGE, v);
+                }
+            }
+            (Some(s), None) if s > 0 => {
+                if let Ok(v) = HeaderValue::from_str(&format!("bytes={s}-")) {
+                    extra.insert(RANGE, v);
+                }
+            }
+            (None, Some(e)) => {
+                if let Ok(v) = HeaderValue::from_str(&format!("bytes=0-{e}")) {
+                    extra.insert(RANGE, v);
+                }
+            }
+            _ => {}
+        }
+        if options.compressed_encoding {
+            extra.insert(
+                HeaderName::from_static("accept-encoding"),
+                HeaderValue::from_static("gzip"),
+            );
+        }
+
+        let ctx = ErrorContext {
+            provider: &self.config.provider,
+            bucket_name: Some(bucket_name),
+            object_name: Some(object_name),
+            generation: options.generation.as_deref(),
+            not_found_override: None,
+        };
+        let url = format!("{}{}", self.config.endpoint, uri);
+
+        let resp = self
+            .config
+            .retry_policy
+            .execute(
+                || async {
+                    let mut headers = self.base_headers(Some(&extra));
+                    let mut req = self.http.request(Method::GET, &url);
+                    if !query.is_empty() {
+                        req = req.query(&query);
+                    }
+                    if let Some(hmac) = self.credentials.hmac_credentials() {
+                        self.apply_sigv4_headers(
+                            hmac,
+                            &Method::GET,
+                            &uri,
+                            &query,
+                            &mut headers,
+                            &[],
+                        );
+                    } else if let Some(tok) = self.credentials.token().await? {
+                        req = req.bearer_auth(&tok.token);
+                    }
+                    if self.config.debug_level >= 2 {
+                        log_wire_request(&Method::GET, &url, &query, &headers);
+                    }
+                    let resp = req.headers(headers).send().await.map_err(|e| {
+                        if RetryPolicy::is_retryable_reqwest_error(&e) {
+                            GsutilError::Service(ServiceError::retryable(
+                                format!("XML HTTP transport error: {e}"),
+                                None,
+                                None,
+                            ))
+                        } else {
+                            GsutilError::Service(ServiceError::service(
+                                format!("XML HTTP request error: {e}"),
+                                None,
+                                None,
+                            ))
+                        }
+                    })?;
+                    let status = resp.status().as_u16();
+                    if self.config.debug_level >= 2 {
+                        log_wire_response(status, resp.headers());
+                    }
+                    if (200..300).contains(&status) {
+                        Ok(resp)
+                    } else {
+                        let body_str = resp.text().await.unwrap_or_default();
+                        Err(translate_xml_error(status, &body_str, &ctx))
+                    }
+                },
+                |e| matches!(e, GsutilError::Service(se) if se.is_retryable()),
+            )
+            .await?;
+
+        let total_hint = resp.content_length();
+        let progress_cb = options.progress_callback.clone();
+        let bytes_seen = Arc::new(AtomicU64::new(0));
+        let stream = resp.bytes_stream().map(move |item| {
+            item.inspect(|chunk| {
+                let total = bytes_seen.fetch_add(chunk.len() as u64, Ordering::Relaxed)
+                    + chunk.len() as u64;
+                if let Some(ref cb) = progress_cb {
+                    cb(total, total_hint);
+                }
+            })
+            .map_err(std::io::Error::other)
+        });
+        Ok(Box::pin(stream))
     }
 
     async fn upload_object(

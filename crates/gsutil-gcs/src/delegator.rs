@@ -2,19 +2,21 @@
 //!
 //! Mirrors `gslib/cloud_api_delegator.py` in Python gsutil v5.38.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use gsutil_auth::TokenProvider;
 use gsutil_core::api::{
-    Bucket, Channel, CloudApi, ComposeSourceObject, CopyOptions, CreateNotificationOptions,
-    CsObjectOrPrefix, DownloadOptions, EncryptionKey, HmacKeyCreateResponse, HmacKeyMetadata,
-    IamPolicy, ListObjectsOptions, Notification, Object, Preconditions, ServiceAccount,
-    SignUrlOptions, UploadOptions,
+    Bucket, ByteStream, Channel, CloudApi, ComposeSourceObject, CopyOptions,
+    CreateNotificationOptions, CsObjectOrPrefix, DownloadOptions, EncryptionKey,
+    HmacKeyCreateResponse, HmacKeyMetadata, IamPolicy, ListObjectsOptions, Notification, Object,
+    Preconditions, ServiceAccount, SignUrlOptions, UploadOptions,
 };
 use gsutil_core::config::BotoConfig;
 use gsutil_core::error::{GsutilError, Result};
+use tokio::io::AsyncRead;
 
 use crate::client::GcsJsonClient;
 use crate::xml::XmlApiClient;
@@ -343,6 +345,17 @@ impl CloudApi for CloudApiDelegator {
             .await
     }
 
+    async fn get_object_media_stream(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        options: &DownloadOptions,
+    ) -> Result<ByteStream> {
+        self.default_api()?
+            .get_object_media_stream(bucket_name, object_name, options)
+            .await
+    }
+
     async fn upload_object(
         &self,
         data: Bytes,
@@ -362,6 +375,30 @@ impl CloudApi for CloudApiDelegator {
     ) -> Result<Object> {
         self.default_api()?
             .upload_object_resumable(data, object_metadata, options)
+            .await
+    }
+
+    async fn upload_object_resumable_file(
+        &self,
+        file_path: &Path,
+        start_offset: u64,
+        length: u64,
+        object_metadata: &Object,
+        options: &UploadOptions,
+    ) -> Result<Object> {
+        self.default_api()?
+            .upload_object_resumable_file(file_path, start_offset, length, object_metadata, options)
+            .await
+    }
+
+    async fn upload_object_streaming(
+        &self,
+        reader: Box<dyn AsyncRead + Send + Unpin>,
+        object_metadata: &Object,
+        options: &UploadOptions,
+    ) -> Result<Object> {
+        self.default_api()?
+            .upload_object_streaming(reader, object_metadata, options)
             .await
     }
 

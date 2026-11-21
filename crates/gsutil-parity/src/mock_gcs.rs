@@ -233,6 +233,8 @@ pub struct MockGcsState {
     pub hmac_keys: BTreeMap<String, Value>,
     pub watch_channels: BTreeMap<String, Value>,
     pub request_log: Vec<String>,
+    /// Records every `Content-Range` header seen on resumable `PUT` requests.
+    pub resumable_put_ranges: Vec<String>,
 }
 
 impl MockGcsState {
@@ -245,6 +247,7 @@ impl MockGcsState {
             hmac_keys: BTreeMap::new(),
             watch_channels: BTreeMap::new(),
             request_log: Vec::new(),
+            resumable_put_ranges: Vec::new(),
         }
     }
 
@@ -753,6 +756,33 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     let Some(req) = read_request(&mut reader).await? else {
         return Ok(());
     };
+
+    // Slow-streaming media download for deterministic SIGINT testing:
+    // GET /storage/v1/b/slow-bkt/o/{obj}?alt=media streams 4 KiB every 150ms.
+    let (req_path, req_query) = parse_query(&req.target);
+    if req.method == "GET"
+        && req_query.get("alt").map(String::as_str) == Some("media")
+        && (req_path.starts_with("/storage/v1/b/slow-bkt/o/")
+            || req_path.starts_with("/download/storage/v1/b/slow-bkt/o/"))
+    {
+        let total = 4 * 1024 * 100usize; // 400 KiB over ~15s
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+        );
+        let mut inner = reader.into_inner();
+        inner.write_all(head.as_bytes()).await?;
+        inner.flush().await?;
+        let chunk = vec![0x5Au8; 4096];
+        for _ in 0..100 {
+            if inner.write_all(&chunk).await.is_err() {
+                break;
+            }
+            let _ = inner.flush().await;
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+        return Ok(());
+    }
+
     let resp = route_request(req, &state, addr, is_tls);
 
     let mut head = format!("HTTP/1.1 {} {}\r\n", resp.status, resp.reason);
@@ -1849,6 +1879,9 @@ fn handle_upload(
     if req.method == "PUT" {
         if let Some(upload_id) = query.get("upload_id") {
             let mut st = state.lock().expect("lock poisoned");
+            if let Some(cr) = req.headers.get("content-range") {
+                st.resumable_put_ranges.push(cr.clone());
+            }
             let Some(sess) = st.resumable_sessions.get_mut(upload_id) else {
                 return HttpResponse::error(
                     404,
@@ -1857,6 +1890,23 @@ fn handle_upload(
                     "notFound",
                 );
             };
+            // Fault-injection bucket `fault-resume`:
+            // Commits chunk 1 cleanly, then injects a 503 abort on chunk 2 (once) so the
+            // first process fails mid-upload with chunk 1 committed, and the second process
+            // must query `Content-Range: bytes */<total>` -> `308` and resume from chunk 2!
+            if bucket == "fault-resume"
+                && !sess.dropped_once
+                && !sess.accumulated.is_empty()
+                && !req.body.is_empty()
+            {
+                sess.dropped_once = true;
+                return HttpResponse::error(
+                    503,
+                    "Service Unavailable",
+                    "Simulated mid-upload crash after chunk 1",
+                    "backendError",
+                );
+            }
             // Optional disconnect fault injection on first chunk
             if bucket == "fault-resumable-drop" && !sess.dropped_once && !req.body.is_empty() {
                 sess.dropped_once = true;
@@ -1868,8 +1918,11 @@ fn handle_upload(
                 );
             }
             if let Some(cr) = req.headers.get("content-range") {
-                // Status probe: Content-Range: bytes */*
-                if cr.trim() == "bytes */*" {
+                // Status probe: `Content-Range: bytes */*` OR `Content-Range: bytes */<total>`
+                let trimmed_cr = cr.trim();
+                if trimmed_cr == "bytes */*"
+                    || (trimmed_cr.starts_with("bytes */") && req.body.is_empty())
+                {
                     let mut resp = HttpResponse::empty(308, "Resume Incomplete");
                     if !sess.accumulated.is_empty() {
                         resp.headers.push((

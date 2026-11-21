@@ -28,6 +28,7 @@ use crate::posix::{
     apply_posix_to_local_file, deserialize_posix_from_metadata, parse_rfc3339_to_epoch_secs,
     read_local_posix_attributes, serialize_posix_to_metadata, PosixAttributes,
 };
+use crate::ui::UIController;
 
 /// Default lines per external sort chunk (matches `GSUtil:rsync_buffer_lines`).
 pub const DEFAULT_RSYNC_BUFFER_LINES: usize = 32_000;
@@ -71,6 +72,8 @@ pub struct RsyncConfig {
     pub parallel_operations: bool,
     /// Override for external merge-sort chunk size (defaults to `GSUtil:rsync_buffer_lines`).
     pub buffer_lines: Option<usize>,
+    /// Optional interactive TTY progress controller (`UIController`).
+    pub ui: Option<Arc<UIController>>,
 }
 
 /// A single entry in a sorted source or destination listing.
@@ -218,6 +221,7 @@ pub async fn run_rsync(
         },
         continue_on_error: cfg.continue_on_error,
         parallel_operations: cfg.parallel_operations,
+        ui: cfg.ui.clone(),
         ..Default::default()
     });
     let boto_arc = Arc::new(boto.clone());

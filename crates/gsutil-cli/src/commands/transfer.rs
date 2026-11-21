@@ -20,6 +20,7 @@ use gsutil_transfer::copy::{run_copy, CopyConfig, GzipMode};
 use gsutil_transfer::mv::{run_mv, MvConfig};
 use gsutil_transfer::rewrite::{run_rewrite, RewriteConfig};
 use gsutil_transfer::rsync::{run_rsync, RsyncConfig};
+use gsutil_transfer::ui::UIController;
 
 use crate::commands::stubs;
 use crate::context::CommandContext;
@@ -292,6 +293,7 @@ fn build_copy_config(
         decryption_key: crate::encryption::primary_decryption_key(&ctx.config)?,
         recursive: is_mv,
         delete_source_after_copy: is_mv,
+        ui: Some(UIController::new(ctx.global.quiet)),
         ..Default::default()
     };
 
@@ -398,6 +400,7 @@ pub async fn run_rsync_cmd(
         src_url: args[0].clone(),
         dst_url: args[1].clone(),
         parallel_operations: ctx.global.parallel_operations,
+        ui: Some(UIController::new(ctx.global.quiet)),
         ..Default::default()
     };
 

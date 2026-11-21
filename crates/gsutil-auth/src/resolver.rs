@@ -308,11 +308,30 @@ fn build_auth_http_client(config: &BotoConfig) -> Result<Client> {
         }
     }
     if let Some(proxy) = config.resolve_proxy() {
-        let reqwest_proxy = reqwest::Proxy::all(proxy.to_url())
+        let proxy_url = format_proxy_url(&proxy);
+        let reqwest_proxy = reqwest::Proxy::all(&proxy_url)
             .map_err(|e| GsutilError::command(format!("Invalid proxy configuration: {e}")))?;
         builder = builder.proxy(reqwest_proxy);
     }
     builder
         .build()
         .map_err(|e| GsutilError::command(format!("Failed to initialize auth HTTP client: {e}")))
+}
+
+/// Format a `ProxyConfig` as a `reqwest`-compatible proxy URL, using `socks5h://` / `socks4a://`
+/// when `proxy_rdns` is enabled.
+pub fn format_proxy_url(proxy: &gsutil_core::config::ProxyConfig) -> String {
+    use gsutil_core::config::ProxyType;
+    let scheme = match (proxy.proxy_type, proxy.rdns) {
+        (ProxyType::Http, _) => "http",
+        (ProxyType::Socks4, true) => "socks4a",
+        (ProxyType::Socks4, false) => "socks4",
+        (ProxyType::Socks5, true) => "socks5h",
+        (ProxyType::Socks5, false) => "socks5",
+    };
+    match (&proxy.user, &proxy.pass) {
+        (Some(u), Some(p)) => format!("{scheme}://{u}:{p}@{}:{}", proxy.host, proxy.port),
+        (Some(u), None) => format!("{scheme}://{u}@{}:{}", proxy.host, proxy.port),
+        _ => format!("{scheme}://{}:{}", proxy.host, proxy.port),
+    }
 }

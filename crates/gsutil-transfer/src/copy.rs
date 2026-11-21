@@ -12,27 +12,29 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use chrono::Utc;
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
+use flate2::write::{GzDecoder as GzWriteDecoder, GzEncoder};
 use flate2::Compression;
+use futures::StreamExt;
 use gsutil_core::api::{
     CloudApi, ComposeSourceObject, CopyOptions, CsObjectOrPrefix, DownloadOptions,
-    DownloadStrategy, EncryptionKey, ListObjectsOptions, Object, Preconditions, UploadOptions,
+    DownloadStrategy, EncryptionKey, ListObjectsOptions, Object, Preconditions, SessionUriCallback,
+    UploadOptions,
 };
 use gsutil_core::config::BotoConfig;
 use gsutil_core::error::{GsutilError, Result, ServiceErrorKind};
 use gsutil_core::hash::{
-    concat_crc32c, crc32c_bytes, crc32c_from_base64, crc32c_to_base64, hash_reader, md5_base64,
-    Md5Hasher,
+    concat_crc32c, crc32c_from_base64, crc32c_to_base64, hash_reader, Crc32cHasher, Md5Hasher,
 };
 use gsutil_core::url::{contains_wildcard, strip_one_slash, StorageUrl};
 use gsutil_core::wildcard::{build_bucket_filter_strings, WildcardMatcher};
+use tempfile::NamedTempFile;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use crate::compose::MAX_COMPOSE_ARITY;
 use crate::parallel::{run_parallel_with_results, ParallelConfig};
@@ -48,6 +50,7 @@ use crate::tracker::{
     write_upload_tracker, ParallelUploadComponentEntry, ParallelUploadTrackerData,
     SlicedDownloadTrackerData, TrackerFileType,
 };
+use crate::ui::UIController;
 
 /// Temporary file suffix for atomic local downloads (matches `temporary_file_util.py`).
 pub const TEMP_FILE_SUFFIX: &str = "_.gstmp";
@@ -141,6 +144,8 @@ pub struct CopyConfig {
     pub encryption_key: Option<EncryptionKey>,
     pub decryption_key: Option<EncryptionKey>,
     pub preconditions: Option<Preconditions>,
+    /// Optional interactive TTY progress controller (`UIController`).
+    pub ui: Option<Arc<UIController>>,
 }
 
 /// Result of copying a single source -> destination pair.
@@ -301,6 +306,19 @@ pub async fn run_copy(
         ));
     }
 
+    if let Some(ref ui) = cfg.ui {
+        let total_local_bytes: u64 = pairs
+            .iter()
+            .filter_map(|(src, _)| match src {
+                StorageUrl::File(f) if !f.is_stream => {
+                    fs::metadata(&f.object_name).ok().map(|m| m.len())
+                }
+                _ => None,
+            })
+            .sum();
+        ui.set_totals(pairs.len() as u64, total_local_bytes);
+    }
+
     let par_cfg = ParallelConfig::from_boto(
         boto,
         cfg.parallel_operations,
@@ -309,17 +327,27 @@ pub async fn run_copy(
     let boto_arc = Arc::new(boto.clone());
     let cfg_arc = Arc::new(cfg.clone());
 
-    let (items, batch) =
-        run_parallel_with_results(pairs, &par_cfg, move |(src_url, dst_url)| {
-            let api = Arc::clone(&api);
-            let boto = Arc::clone(&boto_arc);
-            let cfg = Arc::clone(&cfg_arc);
-            let manifest = manifest.clone();
-            async move {
-                copy_single_pair(api, &boto, &cfg, &src_url, &dst_url, manifest.as_deref()).await
+    let (items, batch) = run_parallel_with_results(pairs, &par_cfg, move |(src_url, dst_url)| {
+        let api = Arc::clone(&api);
+        let boto = Arc::clone(&boto_arc);
+        let cfg = Arc::clone(&cfg_arc);
+        let manifest = manifest.clone();
+        async move {
+            let res =
+                copy_single_pair(api, &boto, &cfg, &src_url, &dst_url, manifest.as_deref()).await;
+            if res.is_ok() {
+                if let Some(ref ui) = cfg.ui {
+                    ui.finish_file();
+                }
             }
-        })
-        .await;
+            res
+        }
+    })
+    .await;
+
+    if let Some(ref ui) = cfg.ui {
+        ui.finish();
+    }
 
     let mut summary = CopySummary {
         failed: batch.failed,
@@ -341,14 +369,64 @@ pub async fn run_copy(
     Ok(summary)
 }
 
-/// Stream arbitrary bytes from an async/sync reader directly to a cloud object (`gsutil cp - gs://...`).
-pub async fn copy_stream_to_cloud<R: Read>(
+/// Default bounded streaming resumable chunk size (8 MiB, multiple of 256 KiB)
+/// so peak RSS stays well under 64 MiB even on multi-hundred-MiB uploads unless
+/// the user explicitly configured `GSUtil:json_resumable_chunk_size`.
+const DEFAULT_STREAMING_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
+fn effective_resumable_chunk_size(boto: &BotoConfig) -> usize {
+    if boto.has_option("GSUtil", "json_resumable_chunk_size") {
+        boto.json_resumable_chunk_size() as usize
+    } else {
+        DEFAULT_STREAMING_CHUNK_SIZE
+    }
+}
+
+/// Writer wrapper that updates streaming CRC32C and MD5 hashers on every write.
+struct HashingWriter<W: Write> {
+    inner: W,
+    crc: Crc32cHasher,
+    md5: Md5Hasher,
+    bytes_written: u64,
+}
+
+impl<W: Write> HashingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            crc: Crc32cHasher::new(),
+            md5: Md5Hasher::new(),
+            bytes_written: 0,
+        }
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.crc.update(&buf[..n]);
+        self.md5.update(&buf[..n]);
+        self.bytes_written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Stream arbitrary bytes from an async reader directly to a cloud object (`gsutil cp - gs://...`)
+/// with bounded ~256 KiB pipe memory.
+pub async fn copy_async_stream_to_cloud<R>(
     api: &dyn CloudApi,
     boto: &BotoConfig,
     cfg: &CopyConfig,
     mut reader: R,
     dst_url: &StorageUrl,
-) -> Result<CopyItemResult> {
+) -> Result<CopyItemResult>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+{
     let bucket = dst_url.bucket_name().ok_or_else(|| {
         GsutilError::command("Streaming upload destination must be a cloud object URL.")
     })?;
@@ -356,37 +434,76 @@ pub async fn copy_stream_to_cloud<R: Read>(
         GsutilError::command("Streaming upload destination must specify an object name.")
     })?;
 
-    let mut raw = Vec::new();
-    reader.read_to_end(&mut raw)?;
-
-    let (payload, gzip_encoded) = if matches!(cfg.gzip_mode, GzipMode::All) {
-        (gzip_compress(&raw)?, true)
-    } else {
-        (raw, false)
-    };
-
-    let local_crc = crc32c_bytes(&payload);
-    let local_md5 = md5_base64(&payload);
-    let len = payload.len() as u64;
-
-    let mut meta = build_upload_metadata(bucket, object_name, cfg, gzip_encoded, None);
-    meta.crc32c = Some(crc32c_to_base64(local_crc));
-    meta.md5_hash = Some(local_md5.clone());
+    let gzip_storage = matches!(cfg.gzip_mode, GzipMode::All);
+    let meta = build_upload_metadata(bucket, object_name, cfg, gzip_storage, None);
 
     let opts = UploadOptions {
         canned_acl: cfg.canned_acl.clone(),
         preconditions: effective_upload_preconditions(cfg),
         encryption_key: cfg.encryption_key.clone(),
         fields: None,
-        // For `-Z`, compressed bytes are stored as-is with `metadata.contentEncoding = "gzip"`,
-        // NOT transport-decompressed by GCS.
         gzip_encoded: false,
+        resumable_session_uri: None,
+        session_uri_callback: None,
+        progress_callback: cfg.ui.as_ref().map(|u| u.progress_callback()),
+        total_size: None,
+        chunk_size: Some(effective_resumable_chunk_size(boto)),
     };
 
+    let (mut pipe_w, pipe_r) = tokio::io::duplex(256 * 1024);
+
+    let pump = tokio::spawn(async move {
+        let mut crc = Crc32cHasher::new();
+        let mut md5 = Md5Hasher::new();
+        let mut total_bytes = 0u64;
+        let mut buf = vec![0u8; 64 * 1024];
+
+        if gzip_storage {
+            let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+            loop {
+                let n = reader.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                enc.write_all(&buf[..n])?;
+                let compressed_chunk = std::mem::take(enc.get_mut());
+                if !compressed_chunk.is_empty() {
+                    crc.update(&compressed_chunk);
+                    md5.update(&compressed_chunk);
+                    total_bytes += compressed_chunk.len() as u64;
+                    pipe_w.write_all(&compressed_chunk).await?;
+                }
+            }
+            let tail = enc.finish()?;
+            if !tail.is_empty() {
+                crc.update(&tail);
+                md5.update(&tail);
+                total_bytes += tail.len() as u64;
+                pipe_w.write_all(&tail).await?;
+            }
+        } else {
+            loop {
+                let n = reader.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                crc.update(&buf[..n]);
+                md5.update(&buf[..n]);
+                total_bytes += n as u64;
+                pipe_w.write_all(&buf[..n]).await?;
+            }
+        }
+        pipe_w.shutdown().await?;
+        Ok::<(u32, String, u64), GsutilError>((crc.finalize(), md5.finalize_base64(), total_bytes))
+    });
+
     let dst_api = api.for_provider(dst_url.scheme())?;
-    let uploaded = dst_api
-        .upload_object_resumable(Bytes::from(payload), &meta, &opts)
-        .await?;
+    let upload_fut = dst_api.upload_object_streaming(Box::new(pipe_r), &meta, &opts);
+    let (pump_join, upload_res) = tokio::join!(pump, upload_fut);
+
+    let (local_crc, local_md5, len) = pump_join
+        .map_err(|e| GsutilError::command(format!("Streaming upload pump failed: {e}")))??;
+    let uploaded = upload_res?;
 
     let check_mode = CheckHashesMode::from_config(boto);
     if let Err(err) = validate_hashes(
@@ -418,7 +535,20 @@ pub async fn copy_stream_to_cloud<R: Read>(
     })
 }
 
-/// Stream a cloud object directly to a writer (`gsutil cp gs://... -`).
+/// Stream arbitrary bytes from a synchronous `Read` directly to a cloud object.
+pub async fn copy_stream_to_cloud<R: Read>(
+    api: &dyn CloudApi,
+    boto: &BotoConfig,
+    cfg: &CopyConfig,
+    mut reader: R,
+    dst_url: &StorageUrl,
+) -> Result<CopyItemResult> {
+    let mut raw = Vec::new();
+    reader.read_to_end(&mut raw)?;
+    copy_async_stream_to_cloud(api, boto, cfg, std::io::Cursor::new(raw), dst_url).await
+}
+
+/// Stream a cloud object directly to a writer (`gsutil cp gs://... -`) with O(1) RAM.
 pub async fn copy_cloud_to_stream<W: Write>(
     api: &dyn CloudApi,
     boto: &BotoConfig,
@@ -439,8 +569,8 @@ pub async fn copy_cloud_to_stream<W: Write>(
         .await?;
     let gzip_encoded = is_gzip_encoded(&meta);
 
-    let data = src_api
-        .get_object_media(
+    let mut stream = src_api
+        .get_object_media_stream(
             bucket,
             object_name,
             &DownloadOptions {
@@ -450,32 +580,52 @@ pub async fn copy_cloud_to_stream<W: Write>(
                 compressed_encoding: gzip_encoded,
                 strategy: DownloadStrategy::OneShot,
                 decryption_key: cfg.decryption_key.clone(),
+                progress_callback: cfg.ui.as_ref().map(|u| u.progress_callback()),
             },
         )
         .await?;
+
+    let mut crc = Crc32cHasher::new();
+    let mut md5 = Md5Hasher::new();
+    let mut written_bytes = 0u64;
+
+    if gzip_encoded {
+        let mut dec = GzWriteDecoder::new(writer);
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = chunk_res?;
+            crc.update(&chunk);
+            md5.update(&chunk);
+            dec.write_all(&chunk)?;
+            written_bytes += chunk.len() as u64;
+        }
+        let mut inner = dec.finish()?;
+        inner.flush()?;
+    } else {
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = chunk_res?;
+            crc.update(&chunk);
+            md5.update(&chunk);
+            writer.write_all(&chunk)?;
+            written_bytes += chunk.len() as u64;
+        }
+        writer.flush()?;
+    }
 
     let check_mode = CheckHashesMode::from_config(boto);
     validate_hashes(
         check_mode,
         "downloaded stream",
         &src_url.url_string(),
-        Some(crc32c_bytes(&data)),
-        Some(&md5_base64(&data)),
+        Some(crc.finalize()),
+        Some(&md5.finalize_base64()),
         meta.crc32c.as_deref(),
         meta.md5_hash.as_deref(),
     )?;
 
-    let out = if gzip_encoded {
-        gzip_decompress(&data)?
-    } else {
-        data.to_vec()
-    };
-    writer.write_all(&out)?;
-
     Ok(CopyItemResult {
         src_url: src_url.url_string(),
         dst_url: "file://-".to_string(),
-        bytes_transferred: out.len() as u64,
+        bytes_transferred: written_bytes,
         created_url: None,
         skipped: false,
     })
@@ -493,15 +643,10 @@ pub async fn copy_single_pair(
     let start_ts = Utc::now().to_rfc3339();
     let res = match (src_url, dst_url) {
         (StorageUrl::File(f), StorageUrl::Cloud(_)) if f.is_stream => {
-            let mut buf = Vec::new();
-            std::io::stdin().read_to_end(&mut buf)?;
-            copy_stream_to_cloud(api.as_ref(), boto, cfg, std::io::Cursor::new(buf), dst_url).await
+            copy_async_stream_to_cloud(api.as_ref(), boto, cfg, tokio::io::stdin(), dst_url).await
         }
         (StorageUrl::Cloud(_), StorageUrl::File(f)) if f.is_stream => {
-            let mut out = Vec::new();
-            let res = copy_cloud_to_stream(api.as_ref(), boto, cfg, src_url, &mut out).await?;
-            std::io::stdout().write_all(&out)?;
-            Ok(res)
+            copy_cloud_to_stream(api.as_ref(), boto, cfg, src_url, std::io::stdout()).await
         }
         (StorageUrl::File(_), StorageUrl::Cloud(_)) => {
             copy_local_to_cloud(api.clone(), boto, cfg, src_url, dst_url).await
@@ -633,41 +778,52 @@ async fn copy_local_to_cloud(
         .await;
     }
 
-    // Stream-hash / compress according to `-z`/`-Z` (storage gzip) vs `-j`/`-J` (transport gzip):
-    // - `-z`/`-Z`: upload compressed bytes with `meta.content_encoding = Some("gzip")`,
-    //   hashes of compressed bytes, and `UploadOptions.gzip_encoded = false` (store as-is).
-    // - `-j`/`-J`: upload compressed wire bytes with `meta.content_encoding = None`,
-    //   hashes of uncompressed bytes, and `UploadOptions.gzip_encoded = true` (server decompresses).
-    let (payload, local_crc, local_md5) = if should_gzip_storage {
-        let mut f = File::open(src_path)?;
-        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
-        std::io::copy(&mut f, &mut enc)?;
-        let compressed = enc.finish()?;
-        let crc = crc32c_bytes(&compressed);
-        let md5 = md5_base64(&compressed);
-        (compressed, crc, md5)
+    // Stream-hash / stream-compress into a temp file (O(1) RAM) according to `-z`/`-Z` vs `-j`/`-J`:
+    // - `-z`/`-Z`: stream-compress into temp file, hash compressed bytes, `meta.content_encoding = Some("gzip")`,
+    //   `UploadOptions.gzip_encoded = false` (store as-is).
+    // - `-j`/`-J`: stream-compress into temp file, hash uncompressed bytes, `meta.content_encoding = None`,
+    //   `UploadOptions.gzip_encoded = true` (server decompresses).
+    // - normal: stream-hash source file directly on disk without buffering the file in RAM!
+    let mut temp_gz: Option<NamedTempFile> = None;
+    let (upload_path, transfer_len, local_crc, local_md5) = if should_gzip_storage {
+        let tmp = NamedTempFile::new()?;
+        let mut src_f = File::open(src_path)?;
+        let hw = HashingWriter::new(BufWriter::new(tmp.as_file().try_clone()?));
+        let mut enc = GzEncoder::new(hw, Compression::default());
+        std::io::copy(&mut src_f, &mut enc)?;
+        let mut hw = enc.finish()?;
+        hw.flush()?;
+        let path = tmp.path().to_path_buf();
+        let len = hw.bytes_written;
+        let crc = hw.crc.finalize();
+        let md5 = hw.md5.finalize_base64();
+        temp_gz = Some(tmp);
+        (path, len, crc, md5)
     } else if should_gzip_transport {
-        let mut f = File::open(src_path)?;
-        let hashes = hash_reader(&mut f, true, true)?;
+        let mut src_f = File::open(src_path)?;
+        let hashes = hash_reader(&mut src_f, true, true)?;
         let local_crc = hashes.crc32c.unwrap_or(0);
         let local_md5 = hashes.md5_base64().unwrap_or_default();
-        f.seek(SeekFrom::Start(0))?;
-        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
-        std::io::copy(&mut f, &mut enc)?;
-        let compressed = enc.finish()?;
-        (compressed, local_crc, local_md5)
+        src_f.seek(SeekFrom::Start(0))?;
+        let tmp = NamedTempFile::new()?;
+        let mut enc = GzEncoder::new(
+            BufWriter::new(tmp.as_file().try_clone()?),
+            Compression::default(),
+        );
+        std::io::copy(&mut src_f, &mut enc)?;
+        let mut bw = enc.finish()?;
+        bw.flush()?;
+        let len = tmp.as_file().metadata()?.len();
+        let path = tmp.path().to_path_buf();
+        temp_gz = Some(tmp);
+        (path, len, local_crc, local_md5)
     } else {
-        let mut f = File::open(src_path)?;
-        let hashes = hash_reader(&mut f, true, true)?;
+        let mut src_f = File::open(src_path)?;
+        let hashes = hash_reader(&mut src_f, true, true)?;
         let local_crc = hashes.crc32c.unwrap_or(0);
         let local_md5 = hashes.md5_base64().unwrap_or_default();
-        f.seek(SeekFrom::Start(0))?;
-        let mut buf = Vec::with_capacity(file_size as usize);
-        f.read_to_end(&mut buf)?;
-        (buf, local_crc, local_md5)
+        (src_path.to_path_buf(), file_size, local_crc, local_md5)
     };
-
-    let transfer_len = payload.len() as u64;
 
     let mut meta = build_upload_metadata(
         bucket,
@@ -679,6 +835,26 @@ async fn copy_local_to_cloud(
     meta.crc32c = Some(crc32c_to_base64(local_crc));
     meta.md5_hash = Some(local_md5.clone());
 
+    let use_resumable = transfer_len >= boto.resumable_threshold();
+    let enc_sha = encryption_key_sha256(cfg.encryption_key.as_ref());
+    let (tracker_path, existing_session, session_cb): (
+        Option<PathBuf>,
+        Option<String>,
+        Option<SessionUriCallback>,
+    ) = if use_resumable {
+        let p = get_tracker_file_path(boto, dst_url, TrackerFileType::Upload, "JSON", None, None)?;
+        let existing = read_upload_tracker(&p, enc_sha);
+        let tp_clone = p.clone();
+        let enc_owned = enc_sha.map(ToString::to_string);
+        let cb: SessionUriCallback = Arc::new(move |real_session_uri: &str| {
+            let _ =
+                write_upload_tracker(&tp_clone, enc_owned.clone(), real_session_uri.to_string());
+        });
+        (Some(p), existing, Some(cb))
+    } else {
+        (None, None, None)
+    };
+
     let opts = UploadOptions {
         canned_acl: cfg.canned_acl.clone(),
         preconditions: effective_upload_preconditions(cfg),
@@ -686,37 +862,34 @@ async fn copy_local_to_cloud(
         fields: None,
         // Only set HTTP transport `Content-Encoding: gzip` for `-j`/`-J`, NOT `-z`/`-Z`!
         gzip_encoded: should_gzip_transport,
-    };
-
-    let use_resumable = transfer_len >= boto.resumable_threshold();
-    let tracker_path = if use_resumable {
-        let p = get_tracker_file_path(boto, dst_url, TrackerFileType::Upload, "JSON", None, None)?;
-        let enc_sha = encryption_key_sha256(cfg.encryption_key.as_ref());
-        let existing_session = read_upload_tracker(&p, enc_sha);
-        if existing_session.is_none() {
-            let session_marker = format!(
-                "resumable://{}/{}/{}",
-                dst_url.scheme(),
-                bucket,
-                object_name
-            );
-            write_upload_tracker(&p, enc_sha.map(ToString::to_string), session_marker)?;
-        }
-        Some(p)
-    } else {
-        None
+        resumable_session_uri: existing_session,
+        session_uri_callback: session_cb,
+        progress_callback: cfg.ui.as_ref().map(|u| u.progress_callback()),
+        total_size: Some(transfer_len),
+        chunk_size: Some(effective_resumable_chunk_size(boto)),
     };
 
     let dst_api = api.for_provider(dst_url.scheme())?;
     let upload_res = if use_resumable {
+        // Constant-memory chunked resumable upload directly from disk!
         dst_api
-            .upload_object_resumable(Bytes::from(payload), &meta, &opts)
+            .upload_object_resumable_file(&upload_path, 0, transfer_len, &meta, &opts)
             .await
     } else {
-        dst_api
-            .upload_object(Bytes::from(payload), &meta, &opts)
-            .await
+        // Small file (< resumable_threshold): single-RTT multipart upload.
+        let mut f = File::open(&upload_path)?;
+        let mut buf = Vec::with_capacity(transfer_len as usize);
+        f.read_to_end(&mut buf)?;
+        let res = dst_api.upload_object(Bytes::from(buf), &meta, &opts).await;
+        if res.is_ok() {
+            if let Some(ref ui) = cfg.ui {
+                ui.add_bytes(transfer_len);
+            }
+        }
+        res
     };
+
+    drop(temp_gz);
 
     let uploaded = match upload_res {
         Ok(obj) => {
@@ -874,6 +1047,7 @@ async fn upload_parallel_composite(
     let dst_scheme = dst_url.scheme().to_string();
     let cfg_cloned = cfg.clone();
     let api_for_parts = Arc::clone(&api);
+    let comp_chunk_size = effective_resumable_chunk_size(boto);
 
     let (mut uploaded_parts, batch) = run_parallel_with_results(
         ranges_to_upload,
@@ -885,11 +1059,12 @@ async fn upload_parallel_composite(
             let scheme = dst_scheme.clone();
             let cfg = cfg_cloned.clone();
             async move {
+                // Stream-hash component slice directly from disk (64 KiB buffer, O(1) RAM).
                 let mut f = File::open(&path)?;
                 f.seek(SeekFrom::Start(start))?;
-                let mut buf = vec![0u8; len as usize];
-                f.read_exact(&mut buf)?;
-                let part_crc = crc32c_bytes(&buf);
+                let mut limited = f.take(len);
+                let hashes = hash_reader(&mut limited, true, false)?;
+                let part_crc = hashes.crc32c.unwrap_or(0);
 
                 let meta = Object {
                     bucket: Some(bkt),
@@ -904,10 +1079,15 @@ async fn upload_parallel_composite(
                     encryption_key: cfg.encryption_key.clone(),
                     fields: None,
                     gzip_encoded: false,
+                    resumable_session_uri: None,
+                    session_uri_callback: None,
+                    progress_callback: cfg.ui.as_ref().map(|u| u.progress_callback()),
+                    total_size: Some(len),
+                    chunk_size: Some(comp_chunk_size),
                 };
                 let part_api = api.for_provider(&scheme)?;
                 let obj = part_api
-                    .upload_object(Bytes::from(buf), &meta, &opts)
+                    .upload_object_resumable_file(&path, start, len, &meta, &opts)
                     .await?;
                 Ok((part_idx, temp_name, obj, part_crc, len))
             }
@@ -1148,13 +1328,33 @@ async fn download_single(
         DownloadStrategy::OneShot
     };
 
-    // Real resumable download: when a matching tracker file exists and partial bytes
-    // are already present in `_.gstmp` (non-gzip), request only `[start_byte..]` and
-    // validate hashes over the full assembled file on disk.
+    let progress_cb = cfg.ui.as_ref().map(|u| u.progress_callback());
+
+    // Real streaming resumable download: when a matching tracker file exists and partial bytes
+    // are already present in `_.gstmp` (non-gzip), stream-hash existing bytes, request only
+    // `[start_byte..]`, append chunks streamingly, and validate hashes in O(1) RAM.
     if !gzip_encoded && start_byte > 0 && start_byte <= obj_size && temp_path.exists() {
+        let mut crc = Crc32cHasher::new();
+        let mut md5 = Md5Hasher::new();
+        {
+            let mut rf = File::open(temp_path)?;
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut remaining_prefix = start_byte;
+            while remaining_prefix > 0 {
+                let to_read = (remaining_prefix as usize).min(buf.len());
+                let n = rf.read(&mut buf[..to_read])?;
+                if n == 0 {
+                    break;
+                }
+                crc.update(&buf[..n]);
+                md5.update(&buf[..n]);
+                remaining_prefix -= n as u64;
+            }
+        }
+
         if start_byte < obj_size {
-            let remaining = src_api
-                .get_object_media(
+            let mut stream = src_api
+                .get_object_media_stream(
                     bucket,
                     object_name,
                     &DownloadOptions {
@@ -1164,23 +1364,30 @@ async fn download_single(
                         compressed_encoding: false,
                         strategy,
                         decryption_key: cfg.decryption_key.clone(),
+                        progress_callback: progress_cb,
                     },
                 )
                 .await?;
+
             let mut f = OpenOptions::new().write(true).open(temp_path)?;
             f.seek(SeekFrom::Start(start_byte))?;
-            f.write_all(&remaining)?;
+            let mut bw = BufWriter::with_capacity(256 * 1024, f);
+            while let Some(chunk_res) = stream.next().await {
+                let chunk = chunk_res?;
+                crc.update(&chunk);
+                md5.update(&chunk);
+                bw.write_all(&chunk)?;
+            }
+            bw.flush()?;
         }
 
-        let mut f = File::open(temp_path)?;
-        let hashes = hash_reader(&mut f, true, true)?;
         let check_mode = CheckHashesMode::from_config(boto);
         if let Err(err) = validate_hashes(
             check_mode,
             &dst_url.url_string(),
             &src_url.url_string(),
-            hashes.crc32c,
-            hashes.md5_base64().as_deref(),
+            Some(crc.finalize()),
+            Some(&md5.finalize_base64()),
             src_meta.crc32c.as_deref(),
             src_meta.md5_hash.as_deref(),
         ) {
@@ -1191,8 +1398,9 @@ async fn download_single(
         return Ok(final_len);
     }
 
-    let data = src_api
-        .get_object_media(
+    // Fresh streaming download (constant O(1) RAM for both plain and gzip-encoded objects).
+    let mut stream = src_api
+        .get_object_media_stream(
             bucket,
             object_name,
             &DownloadOptions {
@@ -1202,17 +1410,86 @@ async fn download_single(
                 compressed_encoding: gzip_encoded,
                 strategy,
                 decryption_key: cfg.decryption_key.clone(),
+                progress_callback: progress_cb,
             },
         )
         .await?;
+
+    let mut crc = Crc32cHasher::new();
+    let mut md5 = Md5Hasher::new();
+
+    if gzip_encoded {
+        // Stream compressed wire bytes into GzWriteDecoder -> BufWriter<File> while
+        // validating CRC32C/MD5 against the compressed wire bytes!
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(temp_path)?;
+        let mut dec = GzWriteDecoder::new(BufWriter::with_capacity(256 * 1024, f));
+        let mut stream_err: Option<GsutilError> = None;
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = match chunk_res {
+                Ok(c) => c,
+                Err(e) => {
+                    stream_err = Some(e.into());
+                    break;
+                }
+            };
+            crc.update(&chunk);
+            md5.update(&chunk);
+            if let Err(e) = dec.write_all(&chunk) {
+                // Keep hashing remaining bytes or surface decode error after hash check.
+                stream_err = Some(e.into());
+                break;
+            }
+        }
+        if let Some(e) = stream_err {
+            let _ = fs::remove_file(temp_path);
+            return Err(e);
+        }
+        let mut bw = match dec.finish() {
+            Ok(w) => w,
+            Err(e) => {
+                // Check if hash mismatch caused corrupt gzip stream!
+                let check_mode = CheckHashesMode::from_config(boto);
+                validate_hashes(
+                    check_mode,
+                    &dst_url.url_string(),
+                    &src_url.url_string(),
+                    Some(crc.finalize()),
+                    Some(&md5.finalize_base64()),
+                    src_meta.crc32c.as_deref(),
+                    src_meta.md5_hash.as_deref(),
+                )?;
+                let _ = fs::remove_file(temp_path);
+                return Err(e.into());
+            }
+        };
+        bw.flush()?;
+    } else {
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(temp_path)?;
+        let mut bw = BufWriter::with_capacity(256 * 1024, f);
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = chunk_res?;
+            crc.update(&chunk);
+            md5.update(&chunk);
+            bw.write_all(&chunk)?;
+        }
+        bw.flush()?;
+    }
 
     let check_mode = CheckHashesMode::from_config(boto);
     if let Err(err) = validate_hashes(
         check_mode,
         &dst_url.url_string(),
         &src_url.url_string(),
-        Some(crc32c_bytes(&data)),
-        Some(&md5_base64(&data)),
+        Some(crc.finalize()),
+        Some(&md5.finalize_base64()),
         src_meta.crc32c.as_deref(),
         src_meta.md5_hash.as_deref(),
     ) {
@@ -1220,14 +1497,8 @@ async fn download_single(
         return Err(err);
     }
 
-    let final_bytes = if gzip_encoded {
-        gzip_decompress(&data)?
-    } else {
-        data.to_vec()
-    };
-
-    fs::write(temp_path, &final_bytes)?;
-    Ok(final_bytes.len() as u64)
+    let final_len = fs::metadata(temp_path)?.len();
+    Ok(final_len)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1353,8 +1624,8 @@ async fn download_sliced(
                 let resume_from = saved_pos.clamp(start_byte, end_byte + 1);
                 if resume_from <= end_byte {
                     let src_api = api.for_provider(&scheme)?;
-                    let bytes = src_api
-                        .get_object_media(
+                    let mut stream = src_api
+                        .get_object_media_stream(
                             &bkt,
                             &obj,
                             &DownloadOptions {
@@ -1364,20 +1635,25 @@ async fn download_sliced(
                                 compressed_encoding: false,
                                 strategy: DownloadStrategy::Resumable,
                                 decryption_key: dec_key,
+                                progress_callback: None,
                             },
                         )
                         .await?;
 
                     let mut f = OpenOptions::new().write(true).open(&temp_path)?;
                     f.seek(SeekFrom::Start(resume_from))?;
-                    f.write_all(&bytes)?;
+                    let mut bw = BufWriter::with_capacity(256 * 1024, f);
+                    let mut written = 0u64;
+                    while let Some(chunk_res) = stream.next().await {
+                        let chunk = chunk_res?;
+                        bw.write_all(&chunk)?;
+                        written += chunk.len() as u64;
+                    }
+                    bw.flush()?;
 
                     if let Some(ref ct) = comp_tracker {
-                        let _ = write_download_component_tracker(
-                            ct,
-                            &src_meta,
-                            resume_from + bytes.len() as u64,
-                        );
+                        let _ =
+                            write_download_component_tracker(ct, &src_meta, resume_from + written);
                     }
                 }
 
@@ -1528,8 +1804,8 @@ async fn copy_cloud_daisy_chain(
     let dst_api = api.for_provider(dst_url.scheme())?;
     let gzip_encoded = is_gzip_encoded(src_meta);
 
-    let data = src_api
-        .get_object_media(
+    let mut stream = src_api
+        .get_object_media_stream(
             src_bucket,
             src_obj,
             &DownloadOptions {
@@ -1539,22 +1815,10 @@ async fn copy_cloud_daisy_chain(
                 compressed_encoding: gzip_encoded,
                 strategy: DownloadStrategy::OneShot,
                 decryption_key: cfg.decryption_key.clone(),
+                progress_callback: None,
             },
         )
         .await?;
-
-    let local_crc = crc32c_bytes(&data);
-    let local_md5 = md5_base64(&data);
-    let check_mode = CheckHashesMode::from_config(boto);
-    validate_hashes(
-        check_mode,
-        "daisy-chain stream",
-        &src_url.url_string(),
-        Some(local_crc),
-        Some(&local_md5),
-        src_meta.crc32c.as_deref(),
-        src_meta.md5_hash.as_deref(),
-    )?;
 
     let mut dst_meta = src_meta.clone();
     dst_meta.bucket = Some(dst_bucket.to_string());
@@ -1574,19 +1838,36 @@ async fn copy_cloud_daisy_chain(
         preconditions: effective_upload_preconditions(cfg),
         encryption_key: cfg.encryption_key.clone(),
         fields: None,
-        // For `-Z`, compressed bytes are stored as-is with `metadata.contentEncoding = "gzip"`,
-        // NOT transport-decompressed by GCS.
+        // Daisy-chain preserves the source object's wire bytes & `contentEncoding` as-is.
         gzip_encoded: false,
+        resumable_session_uri: None,
+        session_uri_callback: None,
+        progress_callback: cfg.ui.as_ref().map(|u| u.progress_callback()),
+        total_size: Some(src_meta.size_bytes()),
+        chunk_size: Some(effective_resumable_chunk_size(boto)),
     };
 
-    let len = data.len() as u64;
-    let uploaded = match if len >= boto.resumable_threshold() {
-        dst_api
-            .upload_object_resumable(data, &dst_meta, &opts)
-            .await
-    } else {
-        dst_api.upload_object(data, &dst_meta, &opts).await
-    } {
+    // Constant ~256 KiB RAM streaming pipe from source download stream into destination upload.
+    let (mut pipe_w, pipe_r) = tokio::io::duplex(256 * 1024);
+    let pump = tokio::spawn(async move {
+        let mut crc = Crc32cHasher::new();
+        let mut md5 = Md5Hasher::new();
+        let mut len = 0u64;
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = chunk_res?;
+            crc.update(&chunk);
+            md5.update(&chunk);
+            len += chunk.len() as u64;
+            pipe_w.write_all(&chunk).await?;
+        }
+        pipe_w.shutdown().await?;
+        Ok::<(u32, String, u64), GsutilError>((crc.finalize(), md5.finalize_base64(), len))
+    });
+
+    let upload_fut = dst_api.upload_object_streaming(Box::new(pipe_r), &dst_meta, &opts);
+    let (pump_join, upload_res) = tokio::join!(pump, upload_fut);
+
+    let uploaded = match upload_res {
         Ok(obj) => obj,
         Err(GsutilError::Service(se))
             if cfg.no_clobber && se.kind == ServiceErrorKind::Precondition =>
@@ -1601,6 +1882,25 @@ async fn copy_cloud_daisy_chain(
         }
         Err(e) => return Err(e),
     };
+
+    let (local_crc, local_md5, len) = pump_join
+        .map_err(|e| GsutilError::command(format!("Daisy-chain stream pump failed: {e}")))??;
+
+    let check_mode = CheckHashesMode::from_config(boto);
+    if let Err(err) = validate_hashes(
+        check_mode,
+        "daisy-chain stream",
+        &src_url.url_string(),
+        Some(local_crc),
+        Some(&local_md5),
+        src_meta.crc32c.as_deref(),
+        src_meta.md5_hash.as_deref(),
+    ) {
+        let _ = dst_api
+            .delete_object(dst_bucket, dst_obj, uploaded.generation.as_deref(), None)
+            .await;
+        return Err(err);
+    }
 
     if let Err(err) = validate_hashes(
         check_mode,
@@ -2116,19 +2416,6 @@ fn is_gzip_encoded(obj: &Object) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("gzip"))
 }
 
-fn gzip_compress(data: &[u8]) -> Result<Vec<u8>> {
-    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
-    enc.write_all(data)?;
-    Ok(enc.finish()?)
-}
-
-fn gzip_decompress(data: &[u8]) -> Result<Vec<u8>> {
-    let mut dec = GzDecoder::new(data);
-    let mut out = Vec::new();
-    dec.read_to_end(&mut out)?;
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2369,7 +2656,7 @@ mod tests {
         assert_eq!(res.succeeded, 1);
         assert_eq!(api.copy_calls.load(Ordering::SeqCst), 0);
         assert_eq!(api.download_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(api.upload_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(api.streaming_upload_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             api.get_stored("dst-b", "item.bin").unwrap().data,
             Bytes::from_static(b"daisy-payload")
@@ -2602,8 +2889,8 @@ mod tests {
         .await
         .unwrap();
 
-        // Only 3 of 4 components should have been uploaded (component 0 was reused!).
-        assert_eq!(api.upload_calls.load(Ordering::SeqCst), 3);
+        // Only 3 of 4 components should have been uploaded via resumable file streaming (component 0 was reused!).
+        assert_eq!(api.resumable_upload_calls.load(Ordering::SeqCst), 3);
         assert_eq!(api.compose_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             api.get_stored("bkt", "comp_resume.bin")
@@ -2728,5 +3015,76 @@ mod tests {
         let stored_z = api.get_stored("bkt", "stored.txt").unwrap();
         assert_eq!(stored_z.metadata.content_encoding.as_deref(), Some("gzip"));
         assert_ne!(stored_z.data.as_ref(), payload.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_resumable_upload_crash_persists_real_session_uri_and_resumes_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut boto = test_boto(tmp.path());
+        boto.set("GSUtil", "resumable_threshold", "100");
+        boto.set("GSUtil", "parallel_composite_upload_threshold", "0");
+
+        let api = Arc::new(MockCloudApi::new());
+        api.create_bucket_sync("bkt");
+        // Simulate crash after committing first 150 bytes of a 512-byte upload.
+        api.set_fail_resumable_once_after(Some(150));
+
+        let src_path = tmp.path().join("crash_resume.bin");
+        let payload: Vec<u8> = (0..512).map(|i| (i % 241) as u8).collect();
+        fs::write(&src_path, &payload).unwrap();
+
+        let dst_url = StorageUrl::parse("gs://bkt/crash_resume.bin").unwrap();
+        let tracker_path =
+            get_tracker_file_path(&boto, &dst_url, TrackerFileType::Upload, "JSON", None, None)
+                .unwrap();
+
+        // Attempt 1: fails mid-upload, must leave real session URI in tracker file!
+        let err = run_copy(
+            api.clone(),
+            &boto,
+            &CopyConfig {
+                src_urls: vec![src_path.to_string_lossy().into_owned()],
+                dst_url: "gs://bkt/crash_resume.bin".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("ResumableUploadException"));
+        assert!(tracker_path.exists());
+        let saved_uri = read_upload_tracker(&tracker_path, None).unwrap();
+        assert!(
+            saved_uri.starts_with("https://mock-gcs.local/upload/session-"),
+            "Expected real session URI, got: {saved_uri}"
+        );
+
+        // Attempt 2: resumes from exact committed offset (150), completes, and deletes tracker!
+        let ui = UIController::with_tty(false, false);
+        let res = run_copy(
+            api.clone(),
+            &boto,
+            &CopyConfig {
+                src_urls: vec![src_path.to_string_lossy().into_owned()],
+                dst_url: "gs://bkt/crash_resume.bin".into(),
+                ui: Some(ui.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.succeeded, 1);
+        assert_eq!(api.last_resumed_offset.load(Ordering::SeqCst), 150);
+        assert!(!tracker_path.exists());
+        assert_eq!(
+            api.get_stored("bkt", "crash_resume.bin")
+                .unwrap()
+                .data
+                .as_ref(),
+            payload.as_slice()
+        );
+        assert_eq!(
+            ui.format_final_summary(),
+            "Operation completed over 1 objects/512 B."
+        );
     }
 }

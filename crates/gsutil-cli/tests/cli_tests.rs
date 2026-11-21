@@ -302,6 +302,22 @@ impl CloudApi for MockCloudApi {
         Ok(data.slice(start..end))
     }
 
+    async fn get_object_media_stream(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        options: &DownloadOptions,
+    ) -> Result<gsutil_core::api::ByteStream> {
+        let bytes = self
+            .get_object_media(bucket_name, object_name, options)
+            .await?;
+        let chunks: Vec<std::io::Result<Bytes>> = bytes
+            .chunks(4)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        Ok(Box::pin(futures::stream::iter(chunks)))
+    }
+
     async fn upload_object(
         &self,
         _data: Bytes,
@@ -829,4 +845,51 @@ async fn test_config_and_test_commands() {
     let r = run_cli_captured(&s(&["gsutil", "test", "-l"]), None).await;
     assert_eq!(r.exit_code, 0);
     assert!(r.stdout.contains("cargo test --workspace"));
+}
+
+#[tokio::test]
+async fn test_cat_streams_multi_chunk_object() {
+    let mock = Arc::new(MockCloudApi::default());
+    let api: Arc<dyn CloudApi> = mock.clone();
+    assert_eq!(
+        run_cli_captured(&s(&["gsutil", "mb", "gs://stream-bkt"]), Some(api.clone()))
+            .await
+            .exit_code,
+        0
+    );
+    let payload = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    mock.seed_object("stream-bkt", "big.txt", payload);
+
+    let r = run_cli_captured(
+        &s(&["gsutil", "cat", "gs://stream-bkt/big.txt"]),
+        Some(api.clone()),
+    )
+    .await;
+    assert_eq!(r.exit_code, 0);
+    assert_eq!(r.stdout.as_bytes(), payload);
+}
+
+#[test]
+fn test_ui_controller_quiet_vs_interactive_tty() {
+    use gsutil_transfer::ui::UIController;
+
+    let quiet_ui = UIController::with_tty(true, true);
+    assert!(!quiet_ui.is_interactive());
+    let non_tty_ui = UIController::with_tty(false, false);
+    assert!(!non_tty_ui.is_interactive());
+    let tty_ui = UIController::with_tty(false, true);
+    assert!(tty_ui.is_interactive());
+}
+
+#[test]
+fn test_signal_cleanup_registry_executes_hooks() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let ran = Arc::new(AtomicBool::new(false));
+    let ran_clone = ran.clone();
+    let _guard = gsutil_core::signals::register_cleanup(move || {
+        ran_clone.store(true, Ordering::SeqCst);
+    });
+    gsutil_core::signals::run_all_cleanups();
+    assert!(ran.load(Ordering::SeqCst));
 }

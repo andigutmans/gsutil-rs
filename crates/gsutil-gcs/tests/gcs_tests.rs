@@ -1069,3 +1069,230 @@ async fn test_kms_api_and_pubsub_api_trait_impls() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn test_get_object_media_stream_and_progress_callback() {
+    use futures::StreamExt;
+    use std::sync::atomic::AtomicU64;
+
+    let server = MockServer::start().await;
+    let payload = vec![0x5Au8; 65_536];
+
+    Mock::given(method("GET"))
+        .and(path("/storage/v1/b/stream-bkt/o/blob.bin"))
+        .and(query_param("alt", "media"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
+        .mount(&server)
+        .await;
+
+    let last_reported = Arc::new(AtomicU64::new(0));
+    let cb_ref = Arc::clone(&last_reported);
+    let client = mock_client(&server);
+    let mut stream = client
+        .get_object_media_stream(
+            "stream-bkt",
+            "blob.bin",
+            &DownloadOptions {
+                progress_callback: Some(Arc::new(move |done, _total| {
+                    cb_ref.store(done, Ordering::SeqCst);
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut collected = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        collected.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(collected, payload);
+    assert_eq!(last_reported.load(Ordering::SeqCst), 65_536);
+}
+
+#[tokio::test]
+async fn test_upload_object_resumable_file_session_callback_and_308_resume() {
+    use std::sync::Mutex;
+
+    let server = MockServer::start().await;
+    let total_size = 524_288u64; // 512 KiB = 2 x 256 KiB chunks
+    let mut data = vec![0u8; total_size as usize];
+    for (i, b) in data.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+
+    let tmp_path =
+        std::env::temp_dir().join(format!("gsutil_gcs_resume_test_{}.bin", std::process::id()));
+    std::fs::write(&tmp_path, &data).unwrap();
+
+    // Case 1: Resume an existing session at byte 262144 (308 Range -> upload only second chunk).
+    let existing_session = format!("{}/upload/session/resume-1", server.uri());
+    Mock::given(method("PUT"))
+        .and(path("/upload/session/resume-1"))
+        .and(header("content-range", "bytes */524288"))
+        .respond_with(ResponseTemplate::new(308).insert_header("range", "bytes=0-262143"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/upload/session/resume-1"))
+        .and(header("content-range", "bytes 262144-524287/524288"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "bucket": "res-bkt",
+            "name": "resumed.bin",
+            "size": "524288",
+            "generation": "777"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server);
+    let obj_meta = Object {
+        bucket: Some("res-bkt".to_string()),
+        name: Some("resumed.bin".to_string()),
+        ..Default::default()
+    };
+    let resumed_obj = client
+        .upload_object_resumable_file(
+            &tmp_path,
+            0,
+            total_size,
+            &obj_meta,
+            &UploadOptions {
+                resumable_session_uri: Some(existing_session),
+                chunk_size: Some(262_144),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(resumed_obj.generation.as_deref(), Some("777"));
+
+    // Case 2: Expired existing session (410) -> initiates new session + fires session_uri_callback.
+    let expired_session = format!("{}/upload/session/expired-1", server.uri());
+    let fresh_session = format!("{}/upload/session/fresh-2", server.uri());
+    Mock::given(method("PUT"))
+        .and(path("/upload/session/expired-1"))
+        .and(header("content-range", "bytes */524288"))
+        .respond_with(ResponseTemplate::new(410))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/upload/storage/v1/b/res-bkt/o"))
+        .and(query_param("uploadType", "resumable"))
+        .respond_with(ResponseTemplate::new(200).insert_header("location", fresh_session.as_str()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/upload/session/fresh-2"))
+        .and(header("content-range", "bytes 0-262143/524288"))
+        .respond_with(ResponseTemplate::new(308).insert_header("range", "bytes=0-262143"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/upload/session/fresh-2"))
+        .and(header("content-range", "bytes 262144-524287/524288"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "bucket": "res-bkt",
+            "name": "resumed.bin",
+            "size": "524288",
+            "generation": "888"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let captured_uri = Arc::new(Mutex::new(None::<String>));
+    let cap_clone = Arc::clone(&captured_uri);
+    let fresh_obj = client
+        .upload_object_resumable_file(
+            &tmp_path,
+            0,
+            total_size,
+            &obj_meta,
+            &UploadOptions {
+                resumable_session_uri: Some(expired_session),
+                session_uri_callback: Some(Arc::new(move |uri| {
+                    *cap_clone.lock().unwrap() = Some(uri.to_string());
+                })),
+                chunk_size: Some(262_144),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(fresh_obj.generation.as_deref(), Some("888"));
+    assert_eq!(
+        captured_uri.lock().unwrap().as_deref(),
+        Some(fresh_session.as_str())
+    );
+
+    let _ = std::fs::remove_file(&tmp_path);
+}
+
+#[tokio::test]
+async fn test_upload_object_streaming_chunked_async_read() {
+    let server = MockServer::start().await;
+    let total_size = 262_144 + 4096;
+    let payload = vec![0x33u8; total_size];
+
+    let session_url = format!("{}/upload/session/stream-1", server.uri());
+    Mock::given(method("POST"))
+        .and(path("/upload/storage/v1/b/str-bkt/o"))
+        .and(query_param("uploadType", "resumable"))
+        .respond_with(ResponseTemplate::new(200).insert_header("location", session_url.as_str()))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/upload/session/stream-1"))
+        .and(header("content-range", "bytes 0-262143/*"))
+        .respond_with(ResponseTemplate::new(308).insert_header("range", "bytes=0-262143"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/upload/session/stream-1"))
+        .and(header(
+            "content-range",
+            format!("bytes 262144-{}/{total_size}", total_size - 1).as_str(),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "bucket": "str-bkt",
+            "name": "stdin.bin",
+            "size": total_size.to_string(),
+            "generation": "909"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server);
+    let obj_meta = Object {
+        bucket: Some("str-bkt".to_string()),
+        name: Some("stdin.bin".to_string()),
+        ..Default::default()
+    };
+    let reader = Box::new(std::io::Cursor::new(payload));
+    let obj = client
+        .upload_object_streaming(
+            reader,
+            &obj_meta,
+            &UploadOptions {
+                chunk_size: Some(262_144),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(obj.generation.as_deref(), Some("909"));
+}

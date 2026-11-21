@@ -2,6 +2,7 @@
 
 use std::io::{self, Read};
 
+use futures::StreamExt;
 use regex::Regex;
 
 use gsutil_core::api::{BucketListingRef, DownloadOptions};
@@ -185,8 +186,19 @@ pub async fn run(ctx: &mut CommandContext, sub_opts: &[OptPair], args: &[String]
                 };
 
                 let provider_api = api.for_provider(storage_url.scheme())?;
-                let bytes = provider_api.get_object_media(bucket, name, &opts).await?;
-                ctx.write_stdout(&bytes)?;
+                let mut stream = provider_api
+                    .get_object_media_stream(bucket, name, &opts)
+                    .await?;
+                while let Some(chunk_res) = stream.next().await {
+                    let chunk = chunk_res.map_err(|e| {
+                        if e.kind() == io::ErrorKind::BrokenPipe {
+                            GsutilError::BrokenPipe
+                        } else {
+                            GsutilError::Io(e)
+                        }
+                    })?;
+                    ctx.write_stdout(&chunk)?;
+                }
                 ctx.flush_stdout()?;
             }
         }

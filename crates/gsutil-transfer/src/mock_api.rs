@@ -1,7 +1,8 @@
 //! In-memory mock `CloudApi` implementation for `gsutil-transfer` unit tests.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -11,6 +12,7 @@ use flate2::read::GzDecoder;
 use gsutil_core::api::*;
 use gsutil_core::error::{GsutilError, Result, ServiceError};
 use gsutil_core::hash::{crc32c_base64, md5_base64};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 #[derive(Debug, Clone)]
 pub(crate) struct StoredObject {
@@ -28,6 +30,10 @@ struct Store {
     corrupt_download_bytes: bool,
     /// Fail `copy_object` with an error to test fallback/failure handling.
     fail_copy: bool,
+    /// Active resumable upload sessions: `session_uri -> committed_bytes`.
+    resumable_sessions: BTreeMap<String, Vec<u8>>,
+    /// If set, the next resumable file upload commits this many bytes then aborts once.
+    fail_resumable_once_after: Option<usize>,
 }
 
 /// Thread-safe in-memory `CloudApi` mock with counters and fault injection.
@@ -37,11 +43,13 @@ pub(crate) struct MockCloudApi {
     next_gen: AtomicU64,
     pub upload_calls: AtomicUsize,
     pub resumable_upload_calls: AtomicUsize,
+    pub streaming_upload_calls: AtomicUsize,
     pub download_calls: AtomicUsize,
     pub range_download_calls: AtomicUsize,
     pub copy_calls: AtomicUsize,
     pub compose_calls: AtomicUsize,
     pub delete_calls: AtomicUsize,
+    pub last_resumed_offset: AtomicUsize,
 }
 
 impl MockCloudApi {
@@ -109,6 +117,10 @@ impl MockCloudApi {
 
     pub fn set_corrupt_download_bytes(&self, v: bool) {
         self.store.lock().unwrap().corrupt_download_bytes = v;
+    }
+
+    pub fn set_fail_resumable_once_after(&self, bytes: Option<usize>) {
+        self.store.lock().unwrap().fail_resumable_once_after = bytes;
     }
 
     pub fn get_stored(&self, bucket: &str, name: &str) -> Option<StoredObject> {
@@ -540,6 +552,123 @@ impl CloudApi for MockCloudApi {
     ) -> Result<Object> {
         self.resumable_upload_calls.fetch_add(1, Ordering::SeqCst);
         self.do_upload(data, object_metadata, options)
+    }
+
+    async fn get_object_media_stream(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        options: &DownloadOptions,
+    ) -> Result<ByteStream> {
+        let data = self
+            .get_object_media(bucket_name, object_name, options)
+            .await?;
+        let total = Some(data.len() as u64);
+        let progress = options.progress_callback.clone();
+        // Yield in 64-byte chunks to exercise multi-chunk streaming paths.
+        let mut chunks: Vec<std::io::Result<Bytes>> = Vec::new();
+        let mut offset = 0usize;
+        let step = 64usize;
+        while offset < data.len() {
+            let end = (offset + step).min(data.len());
+            chunks.push(Ok(data.slice(offset..end)));
+            offset = end;
+        }
+        if let Some(cb) = progress {
+            cb(data.len() as u64, total);
+        }
+        Ok(Box::pin(futures::stream::iter(chunks)))
+    }
+
+    async fn upload_object_resumable_file(
+        &self,
+        file_path: &Path,
+        start_offset: u64,
+        length: u64,
+        object_metadata: &Object,
+        options: &UploadOptions,
+    ) -> Result<Object> {
+        self.resumable_upload_calls.fetch_add(1, Ordering::SeqCst);
+
+        let (session_uri, mut committed) = {
+            let mut s = self.store.lock().unwrap();
+            if let Some(ref existing_uri) = options.resumable_session_uri {
+                if let Some(buf) = s.resumable_sessions.get(existing_uri).cloned() {
+                    self.last_resumed_offset.store(buf.len(), Ordering::SeqCst);
+                    (existing_uri.clone(), buf)
+                } else {
+                    let id = self.next_gen.fetch_add(1, Ordering::SeqCst);
+                    let uri = format!("https://mock-gcs.local/upload/session-{id}");
+                    s.resumable_sessions.insert(uri.clone(), Vec::new());
+                    (uri, Vec::new())
+                }
+            } else {
+                let id = self.next_gen.fetch_add(1, Ordering::SeqCst);
+                let uri = format!("https://mock-gcs.local/upload/session-{id}");
+                s.resumable_sessions.insert(uri.clone(), Vec::new());
+                (uri, Vec::new())
+            }
+        };
+
+        if let Some(ref cb) = options.session_uri_callback {
+            cb(&session_uri);
+        }
+
+        let already = committed.len() as u64;
+        let remaining = length.saturating_sub(already) as usize;
+        let mut file = std::fs::File::open(file_path)?;
+        file.seek(SeekFrom::Start(start_offset + already))?;
+        let mut tail = vec![0u8; remaining];
+        file.read_exact(&mut tail)?;
+
+        let fault_after = {
+            let mut s = self.store.lock().unwrap();
+            s.fail_resumable_once_after.take()
+        };
+        if let Some(limit) = fault_after {
+            let commit_now = limit.min(tail.len());
+            committed.extend_from_slice(&tail[..commit_now]);
+            if let Some(ref cb) = options.progress_callback {
+                cb(committed.len() as u64, Some(length));
+            }
+            self.store
+                .lock()
+                .unwrap()
+                .resumable_sessions
+                .insert(session_uri, committed);
+            return Err(ServiceError::resumable_upload(
+                "Simulated mid-upload connection reset",
+                Some(503),
+                None,
+            )
+            .into());
+        }
+
+        committed.extend_from_slice(&tail);
+        if let Some(ref cb) = options.progress_callback {
+            cb(committed.len() as u64, Some(length));
+        }
+        self.store
+            .lock()
+            .unwrap()
+            .resumable_sessions
+            .remove(&session_uri);
+        self.do_upload(Bytes::from(committed), object_metadata, options)
+    }
+
+    async fn upload_object_streaming(
+        &self,
+        mut reader: Box<dyn AsyncRead + Send + Unpin>,
+        object_metadata: &Object,
+        options: &UploadOptions,
+    ) -> Result<Object> {
+        self.streaming_upload_calls.fetch_add(1, Ordering::SeqCst);
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await?;
+        if let Some(ref cb) = options.progress_callback {
+            cb(buf.len() as u64, options.total_size);
+        }
+        self.do_upload(Bytes::from(buf), object_metadata, options)
     }
 
     async fn copy_object(
