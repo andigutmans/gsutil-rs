@@ -784,6 +784,9 @@ pub struct UploadOptions {
     pub total_size: Option<u64>,
     /// Resumable upload chunk size in bytes (must be a multiple of 256 KiB).
     pub chunk_size: Option<usize>,
+    /// Optional sink populated with the hardware CRC32C computed on-the-fly during
+    /// single-pass streaming file uploads (avoids a full pre-read pass over large files).
+    pub streamed_crc32c_out: Option<Arc<std::sync::Mutex<Option<u32>>>>,
 }
 
 impl fmt::Debug for UploadOptions {
@@ -905,6 +908,20 @@ pub trait CloudApi: Send + Sync {
         bucket_name: &str,
         options: &ListObjectsOptions,
     ) -> Result<Vec<CsObjectOrPrefix>>;
+
+    /// Stream object listing pages one page at a time to keep memory O(page_size).
+    async fn list_objects_paged(
+        &self,
+        bucket_name: &str,
+        options: &ListObjectsOptions,
+        on_page: &mut (dyn FnMut(Vec<CsObjectOrPrefix>) -> Result<()> + Send),
+    ) -> Result<()> {
+        let all = self.list_objects(bucket_name, options).await?;
+        if !all.is_empty() {
+            on_page(all)?;
+        }
+        Ok(())
+    }
 
     async fn get_object_metadata(
         &self,

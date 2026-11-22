@@ -403,17 +403,11 @@ pub async fn run_copy(
     Ok(summary)
 }
 
-/// Default bounded streaming resumable chunk size (8 MiB, multiple of 256 KiB)
-/// so peak RSS stays well under 64 MiB even on multi-hundred-MiB uploads unless
-/// the user explicitly configured `GSUtil:json_resumable_chunk_size`.
-const DEFAULT_STREAMING_CHUNK_SIZE: usize = 8 * 1024 * 1024;
-
+/// Return the configured resumable chunk size (default 100 MiB, matching Python gsutil).
+/// File uploads stream each chunk in 1 MiB blocks via `Body::wrap_stream`, so peak RSS
+/// stays ~15 MiB regardless of chunk size.
 fn effective_resumable_chunk_size(boto: &BotoConfig) -> usize {
-    if boto.has_option("GSUtil", "json_resumable_chunk_size") {
-        boto.json_resumable_chunk_size() as usize
-    } else {
-        DEFAULT_STREAMING_CHUNK_SIZE
-    }
+    boto.json_resumable_chunk_size() as usize
 }
 
 /// Writer wrapper that updates streaming CRC32C and MD5 hashers on every write.
@@ -482,6 +476,7 @@ where
         progress_callback: cfg.ui.as_ref().map(|u| u.progress_callback()),
         total_size: None,
         chunk_size: Some(effective_resumable_chunk_size(boto)),
+        streamed_crc32c_out: None,
     };
 
     let (mut pipe_w, pipe_r) = tokio::io::duplex(256 * 1024);
@@ -894,8 +889,16 @@ async fn copy_local_to_cloud(
     // - `-j`/`-J`: stream-compress into temp file, hash uncompressed bytes, `meta.content_encoding = None`,
     //   `UploadOptions.gzip_encoded = true` (server decompresses).
     // - normal: stream-hash source file directly on disk without buffering the file in RAM!
+    let check_mode = CheckHashesMode::from_config(boto);
     let mut temp_gz: Option<NamedTempFile> = None;
-    let (upload_path, transfer_len, local_crc, local_md5) = if should_gzip_storage {
+    let will_stream_resumable_raw =
+        !should_gzip_storage && !should_gzip_transport && file_size >= boto.resumable_threshold();
+    let (upload_path, transfer_len, mut local_crc_opt, local_md5_opt): (
+        PathBuf,
+        u64,
+        Option<u32>,
+        Option<String>,
+    ) = if should_gzip_storage {
         let tmp = NamedTempFile::new()?;
         let mut src_f = File::open(src_path)?;
         let hw = HashingWriter::new(BufWriter::new(tmp.as_file().try_clone()?));
@@ -908,7 +911,7 @@ async fn copy_local_to_cloud(
         let crc = hw.crc.finalize();
         let md5 = hw.md5.finalize_base64();
         temp_gz = Some(tmp);
-        (path, len, crc, md5)
+        (path, len, Some(crc), Some(md5))
     } else if should_gzip_transport {
         let mut src_f = File::open(src_path)?;
         let hashes = hash_reader(&mut src_f, true, true)?;
@@ -926,13 +929,22 @@ async fn copy_local_to_cloud(
         let len = tmp.as_file().metadata()?.len();
         let path = tmp.path().to_path_buf();
         temp_gz = Some(tmp);
-        (path, len, local_crc, local_md5)
+        (path, len, Some(local_crc), Some(local_md5))
+    } else if will_stream_resumable_raw {
+        // Large resumable upload: skip full pre-read + software MD5 pass;
+        // compute hardware CRC32C on-the-fly while streaming chunks to GCS.
+        (src_path.to_path_buf(), file_size, None, None)
     } else {
         let mut src_f = File::open(src_path)?;
         let hashes = hash_reader(&mut src_f, true, true)?;
         let local_crc = hashes.crc32c.unwrap_or(0);
         let local_md5 = hashes.md5_base64().unwrap_or_default();
-        (src_path.to_path_buf(), file_size, local_crc, local_md5)
+        (
+            src_path.to_path_buf(),
+            file_size,
+            Some(local_crc),
+            Some(local_md5),
+        )
     };
 
     let mut meta = build_upload_metadata(
@@ -942,10 +954,19 @@ async fn copy_local_to_cloud(
         should_gzip_storage,
         posix_attrs.as_ref(),
     );
-    meta.crc32c = Some(crc32c_to_base64(local_crc));
-    meta.md5_hash = Some(local_md5.clone());
+    if let Some(crc) = local_crc_opt {
+        meta.crc32c = Some(crc32c_to_base64(crc));
+    }
+    if let Some(ref md5) = local_md5_opt {
+        meta.md5_hash = Some(md5.clone());
+    }
 
     let use_resumable = transfer_len >= boto.resumable_threshold();
+    let streamed_crc_slot = if use_resumable && local_crc_opt.is_none() {
+        Some(Arc::new(std::sync::Mutex::new(None)))
+    } else {
+        None
+    };
     let enc_sha = encryption_key_sha256(cfg.encryption_key.as_ref());
     let (tracker_path, existing_session, session_cb): (
         Option<PathBuf>,
@@ -977,6 +998,7 @@ async fn copy_local_to_cloud(
         progress_callback: cfg.ui.as_ref().map(|u| u.progress_callback()),
         total_size: Some(transfer_len),
         chunk_size: Some(effective_resumable_chunk_size(boto)),
+        streamed_crc32c_out: streamed_crc_slot.clone(),
     };
 
     let dst_api = api.for_provider(dst_url.scheme())?;
@@ -1025,13 +1047,23 @@ async fn copy_local_to_cloud(
         Err(e) => return Err(e),
     };
 
-    let check_mode = CheckHashesMode::from_config(boto);
+    if local_crc_opt.is_none() {
+        local_crc_opt = streamed_crc_slot
+            .as_ref()
+            .and_then(|s| s.lock().ok().and_then(|mut g| g.take()));
+        if local_crc_opt.is_none() && check_mode != CheckHashesMode::Never {
+            let mut src_f = File::open(src_path)?;
+            let hashes = hash_reader(&mut src_f, true, false)?;
+            local_crc_opt = hashes.crc32c;
+        }
+    }
+
     if let Err(err) = validate_hashes(
         check_mode,
         &src_url.url_string(),
         &dst_url.url_string(),
-        Some(local_crc),
-        Some(&local_md5),
+        local_crc_opt,
+        local_md5_opt.as_deref(),
         uploaded.crc32c.as_deref(),
         uploaded.md5_hash.as_deref(),
     ) {
@@ -1220,6 +1252,7 @@ async fn upload_parallel_composite(
                     progress_callback: cfg.ui.as_ref().map(|u| u.progress_callback()),
                     total_size: Some(len),
                     chunk_size: Some(comp_chunk_size),
+                    streamed_crc32c_out: None,
                 };
                 let part_api = api.for_provider(&scheme)?;
                 let obj = part_api
@@ -2034,6 +2067,7 @@ async fn copy_cloud_daisy_chain(
         progress_callback: cfg.ui.as_ref().map(|u| u.progress_callback()),
         total_size: Some(src_meta.size_bytes()),
         chunk_size: Some(effective_resumable_chunk_size(boto)),
+        streamed_crc32c_out: None,
     };
 
     // Constant ~256 KiB RAM streaming pipe from source download stream into destination upload.

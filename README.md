@@ -10,7 +10,7 @@ A high-performance Rust rewrite of Google Cloud Storage's [`gsutil`](https://git
 
 - **Comprehensive Command Surface:** All **41 `gsutil` commands** plus all **15 legacy `OLD_ALIAS_MAP` aliases** (`getacl`, `setacl`, `chacl`, `getcors`, `setcors`, `getversioning`, `setversioning`, `enablelogging`, `disablelogging`, `getwebcfg`, `setwebcfg`, etc.), POSIX `getopt` global flags (`-m`, `-q`, `-h`, `-o`, `-d`/`-D`/`-DD`, `-u`, `-i`, `-v`, `--trace-token`, `--perf-trace-token`), `.boto` INI config + `-o Section:Key=Val` overrides, and `Did you mean this?` fuzzy command suggestions.
 - **Exact Error & Exit-Code Parity:** Matches `gsutil`'s exit codes (`0` on success or `EPIPE`, `1` on errors / `-m` partial failures), `CommandException:` / `ServiceException:` / `AccessDeniedException:` / `NotFoundException:` / `PreconditionException:` formatting, and secret redaction under `-D`.
-- **Constant-Memory Streaming I/O:** Bounded-memory streaming resumable uploads (`256 KiB` disk reads via `reqwest::Body::wrap_stream` using configured `100 MiB` chunks), streaming downloads directly to `_.gstmp` with on-the-fly hardware-accelerated **CRC32C** (`crc32c`) / **MD5** / **gzip** (`-z`/`-Z` storage & `-j`/`-J` transport), bounded `256 KiB` duplex daisy-chain copies (`-D`), and streaming `cat`. Verified at **`14.0 MiB` peak RSS** on a **10 GiB** upload, **`44.3 MiB` peak RSS** on a **10 GiB** parallel composite upload, and **`30.4 MiB` peak RSS** on a **100 GiB** single-object download.
+- **Constant-Memory Streaming I/O & Listings:** Single-pass streaming resumable uploads (`1 MiB` disk reads via `reqwest::Body::wrap_stream` using `100 MiB` chunks with on-the-fly hardware **CRC32C**), streaming downloads directly to `_.gstmp`, bounded `256 KiB` duplex daisy-chain copies (`-D`), streaming `cat`, and page-by-page streaming `ls`, `du`, and `rsync` (`ExternalBatchSorter`). Verified at **`12.8 MiB` RSS** listing **250,000 objects**, **`17.3 MiB` RSS** on a **1 GiB** single-stream upload (matching Python `gsutil`'s throughput at **4.3× less RAM**), **`44.3 MiB` RSS** on a **10 GiB** parallel composite upload, and **`30.4 MiB` RSS** on a **100 GiB** single-object download.
 - **Real Cross-Process Resumable Recovery:** Persists real GCS resumable session URIs under `~/.gsutil/tracker-files/` and probes `Content-Range: bytes */<total>` → `308 Range` on restart to resume from the exact committed byte offset.
 - **Full GCP Integration:** GCS JSON API v1, GCS XML & S3 SigV4 (`XmlApiClient` + `CloudApiDelegator`), Cloud KMS / CMEK & CSEK encryption, Cloud Pub/Sub notifications, V2/V4 `signurl`, HMAC keys, SOCKS4/5 proxies, Enterprise Certificate Proxy (mTLS/ECP), interactive TTY progress (`UIController`), and `SIGINT`/`SIGTERM` cleanup.
 
@@ -38,8 +38,8 @@ Measured in-region on a GCE `n2-standard-8` VM (`us-central1-a`, PD-SSD) against
 
 | Workload | Scale | Python `gsutil` v5.38 | Rust `gsutil-rs` | Speedup | Python RSS | Rust RSS |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `ls -r` | 250,000 objects (4 levels deep) | 28.21 s (`8,863 obj/s`) | **16.19 s** (`15,441 obj/s`) | **1.74×** | 75.4 MiB | 493.7 MiB |
-| `du -s` | 250,000 objects (`505,976,000` B) | 86.24 s | **13.60 s** | **6.34×** | 74.3 MiB | 295.0 MiB |
+| `ls -r` | 250,000 objects (4 levels deep) | 28.21 s (`8,863 obj/s`) | **16.19 s** (`15,441 obj/s`) | **1.74×** | 75.4 MiB | **12.8 MiB**\*\* |
+| `du -s` | 250,000 objects (`505,976,000` B) | 86.24 s | **13.60 s** | **6.34×** | 74.3 MiB | **13.0 MiB**\*\* |
 | `-m rsync -r -n` (no-op diff) | 250,000 objects (`0` changes) | 568.53 s | **20.75 s** | **27.4×** | 114.9 MiB | 565.4 MiB |
 | Incremental `-m rsync -r` | 100 modified / 250,000 objects | >600 s (timed out) | **21.45 s** | **>28.0×** | — | 565.7 MiB |
 | Mixed + adversarial `-m cp -r` upload | 5,000 files (`1.35 GiB`) | 25.35 s (`53.4 MiB/s`) | **13.48 s** (`100.4 MiB/s`) | **1.88×** | 170.2 MiB | 153.6 MiB |
@@ -53,7 +53,8 @@ Measured in-region on a GCE `n2-standard-8` VM (`us-central1-a`, PD-SSD) against
 | `compose` (`10 × 10 GiB`) | 100 GiB single object | — | **0.75 s** | — | — | **11.5 MiB** |
 | `cp` single-object download | **100 GiB** (`107,374,182,400` B) | 726.27 s (`141.0 MiB/s`) | **538.57 s** (`190.1 MiB/s`) | **1.35×** | 75.1 MiB | **30.4 MiB** |
 
-*\*Single-stream resumable upload currently uses `reqwest`'s default HTTP/2 flow-control windowing (limiting single-connection throughput vs. Python `httplib2`'s HTTP/1.1) while achieving 5.4× lower peak RSS (`14.0 MiB`).*
+*\*Updated after VM run: fixing an `8 MiB` chunk override in `copy.rs` and replacing the full pre-read MD5 pass with single-pass on-the-fly hardware CRC32C brought single-stream resumable upload throughput to parity with Python `gsutil` (`19.64 s` vs. `19.20 s` on 1 GiB at **`17.3 MiB` vs. `74.5 MiB` RSS**, and `4.01 s` vs. `7.70 s` on 200 MiB).*
+*\*\*Updated after VM run: page-by-page streaming (`list_objects_paged`) + minimal `fields` projections reduced 250,000-object peak RSS from `493.7 MiB` → **`12.8 MiB`** (`ls -r`) and `295.0 MiB` → **`13.0 MiB`** (`du -s`).*
 
 ---
 
@@ -70,7 +71,6 @@ Measured in-region on a GCE `n2-standard-8` VM (`us-central1-a`, PD-SSD) against
   - **Hermetic TLS Mock (`--backend mock`, 39 modules):** **615/774 (79.5%)** passing, **19 modules at 100.0%**.
 
 ### Known Limitations / Roadmap
-- Tune single-stream resumable upload HTTP/2 adaptive window / HTTP/1.1 option on `media_http` to match or beat Python's single-connection throughput (`139 MiB/s`), and stream `ls`/`du`/`rsync` listings to reduce RSS on 250k+ object trees.
 - Remaining upstream edge cases in `test_cp` (multi-source naming edge cases; Python-internal `--testcallbackfile` pickle tests do not apply), `test_rsync`, `test_acl`/`test_defacl`/`test_iam`, and `test_Doption`.
 - Live testing against real AWS S3 (currently verified against hermetic SigV4 mock).
 - Cross-platform support (macOS & Windows), `_ARGCOMPLETE` shell tab completion, standalone interactive OAuth `gsutil config`, and `cargo audit`/`cargo deny`.

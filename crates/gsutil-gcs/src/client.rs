@@ -354,10 +354,12 @@ impl GcsJsonClient {
     pub fn new(config: GcsJsonClientConfig, credentials: Arc<dyn TokenProvider>) -> Result<Self> {
         let http = Client::builder()
             .pool_max_idle_per_host(32)
+            .tcp_nodelay(true)
             .build()
             .map_err(|e| GsutilError::command(format!("Failed to build GCS HTTP client: {e}")))?;
         let media_http = Client::builder()
             .pool_max_idle_per_host(32)
+            .tcp_nodelay(true)
             .no_gzip()
             .build()
             .map_err(|e| {
@@ -829,6 +831,21 @@ impl CloudApi for GcsJsonClient {
         bucket_name: &str,
         options: &ListObjectsOptions,
     ) -> Result<Vec<CsObjectOrPrefix>> {
+        let mut results = Vec::new();
+        self.list_objects_paged(bucket_name, options, &mut |mut page| {
+            results.append(&mut page);
+            Ok(())
+        })
+        .await?;
+        Ok(results)
+    }
+
+    async fn list_objects_paged(
+        &self,
+        bucket_name: &str,
+        options: &ListObjectsOptions,
+        on_page: &mut (dyn FnMut(Vec<CsObjectOrPrefix>) -> Result<()> + Send),
+    ) -> Result<()> {
         let url = format!(
             "{}/b/{}/o",
             self.config.storage_base_url,
@@ -837,7 +854,6 @@ impl CloudApi for GcsJsonClient {
         let fields_slice = options.fields.as_deref();
         let projection = projection_for_fields(fields_slice);
 
-        let mut results = Vec::new();
         let mut next_page_token: Option<String> = None;
 
         loop {
@@ -870,6 +886,7 @@ impl CloudApi for GcsJsonClient {
 
             // gsutil ls depends on yielding objects before prefixes.
             let needs_hash_decrypt = fields_request_hashes(fields_slice);
+            let mut page_items = Vec::with_capacity(page.items.len() + page.prefixes.len());
             for mut obj in page.items {
                 if needs_hash_decrypt {
                     if let Some(ref ce) = obj.customer_encryption {
@@ -897,10 +914,13 @@ impl CloudApi for GcsJsonClient {
                         }
                     }
                 }
-                results.push(CsObjectOrPrefix::Object(Box::new(obj)));
+                page_items.push(CsObjectOrPrefix::Object(Box::new(obj)));
             }
             for prefix in page.prefixes {
-                results.push(CsObjectOrPrefix::Prefix(prefix));
+                page_items.push(CsObjectOrPrefix::Prefix(prefix));
+            }
+            if !page_items.is_empty() {
+                on_page(page_items)?;
             }
 
             match page.next_page_token {
@@ -909,7 +929,7 @@ impl CloudApi for GcsJsonClient {
             }
         }
 
-        Ok(results)
+        Ok(())
     }
 
     async fn get_object_metadata(
@@ -1753,6 +1773,14 @@ impl CloudApi for GcsJsonClient {
         );
 
         let mut retries_without_progress: u32 = 0;
+        let mut streaming_crc: Option<Arc<std::sync::Mutex<gsutil_core::hash::Crc32cHasher>>> =
+            if offset == 0 && options.streamed_crc32c_out.is_some() {
+                Some(Arc::new(std::sync::Mutex::new(
+                    gsutil_core::hash::Crc32cHasher::new(),
+                )))
+            } else {
+                None
+            };
 
         while offset < length {
             let to_read = (chunk_size as u64).min(length - offset);
@@ -1760,12 +1788,14 @@ impl CloudApi for GcsJsonClient {
             stream_file
                 .seek(SeekFrom::Start(start_offset + offset))
                 .await?;
-            let body_stream =
-                futures::stream::try_unfold((stream_file, to_read), |(mut f, rem)| async move {
+            let chunk_crc = streaming_crc.clone();
+            let body_stream = futures::stream::try_unfold(
+                (stream_file, to_read, chunk_crc),
+                |(mut f, rem, crc_opt)| async move {
                     if rem == 0 {
                         return Ok::<_, std::io::Error>(None);
                     }
-                    let n = (rem as usize).min(256 * 1024);
+                    let n = (rem as usize).min(1024 * 1024);
                     let mut buf = vec![0u8; n];
                     let got = f.read(&mut buf).await?;
                     if got == 0 {
@@ -1775,8 +1805,14 @@ impl CloudApi for GcsJsonClient {
                         ));
                     }
                     buf.truncate(got);
-                    Ok(Some((Bytes::from(buf), (f, rem - got as u64))))
-                });
+                    if let Some(ref c) = crc_opt {
+                        if let Ok(mut guard) = c.lock() {
+                            guard.update(&buf);
+                        }
+                    }
+                    Ok(Some((Bytes::from(buf), (f, rem - got as u64, crc_opt))))
+                },
+            );
             let body = reqwest::Body::wrap_stream(body_stream);
 
             let end_inclusive = offset + to_read - 1;
@@ -1793,6 +1829,13 @@ impl CloudApi for GcsJsonClient {
 
             match send_res {
                 Ok(ResumablePutOutcome::Complete(obj)) => {
+                    if let (Some(ref crc_hasher), Some(ref out_slot)) =
+                        (&streaming_crc, &options.streamed_crc32c_out)
+                    {
+                        if let (Ok(h), Ok(mut slot)) = (crc_hasher.lock(), out_slot.lock()) {
+                            *slot = Some(h.finalize());
+                        }
+                    }
                     if let Some(ref cb) = options.progress_callback {
                         cb(length, Some(length));
                     }
@@ -1800,6 +1843,9 @@ impl CloudApi for GcsJsonClient {
                 }
                 Ok(ResumablePutOutcome::Continue(next_off)) => {
                     let advanced = next_off.unwrap_or(offset + to_read);
+                    if advanced != offset + to_read {
+                        streaming_crc = None;
+                    }
                     if advanced > offset {
                         retries_without_progress = 0;
                     }
@@ -1812,6 +1858,7 @@ impl CloudApi for GcsJsonClient {
                     err,
                     retry_after_secs,
                 }) => {
+                    streaming_crc = None;
                     retries_without_progress += 1;
                     if retries_without_progress > self.config.retry_policy.max_retries {
                         return Err(err);
@@ -2910,7 +2957,13 @@ impl GcsJsonClient {
         headers: &HeaderMap,
     ) -> std::result::Result<ResumablePutOutcome, ResumablePutError> {
         let req = self
-            .prepare_request(Method::PUT, session_uri, &[], Some(headers))
+            .prepare_request_with_client(
+                &self.media_http,
+                Method::PUT,
+                session_uri,
+                &[],
+                Some(headers),
+            )
             .await
             .map_err(ResumablePutError::Fatal)?
             .body(chunk);
@@ -3333,6 +3386,7 @@ fn build_reqwest_client(boto_config: &BotoConfig, no_gzip: bool) -> Result<Clien
     let mut builder = Client::builder()
         .pool_max_idle_per_host(32)
         .tcp_keepalive(Duration::from_secs(60))
+        .tcp_nodelay(true)
         .danger_accept_invalid_certs(!boto_config.https_validate_certificates());
 
     if no_gzip {

@@ -190,45 +190,48 @@ pub async fn run_rsync(
         eprintln!("Building synchronization state...");
     }
 
+    let check_src_orphan_posix =
+        cfg.preserve_posix && src_root.is_cloud_url() && dst_root.is_file_url();
+
     let (src_res, dst_res) = tokio::join!(
-        list_tree(api.as_ref(), &src_root, cfg, exclude_re.as_ref()),
-        list_tree(api.as_ref(), &dst_root, cfg, exclude_re.as_ref()),
+        list_tree_sorted(
+            api.as_ref(),
+            &src_root,
+            cfg,
+            exclude_re.as_ref(),
+            buffer_lines,
+            check_src_orphan_posix,
+        ),
+        list_tree_sorted(
+            api.as_ref(),
+            &dst_root,
+            cfg,
+            exclude_re.as_ref(),
+            buffer_lines,
+            false,
+        ),
     );
-    let src_entries = match src_res {
-        Ok(entries) => entries,
+    let sorted_src_file = match src_res {
+        Ok(file) => file,
         Err(err) => {
-            eprintln!("{err}");
-            return Err(GsutilError::command(
-                "Caught non-retryable exception - aborting rsync",
-            ));
-        }
-    };
-    let dst_entries = match dst_res {
-        Ok(entries) => entries,
-        Err(err) => {
-            eprintln!("{err}");
-            return Err(GsutilError::command(
-                "Caught non-retryable exception - aborting rsync",
-            ));
-        }
-    };
-
-    // Validate POSIX permission access before syncing cloud -> local with `-P`.
-    if cfg.preserve_posix && src_root.is_cloud_url() && dst_root.is_file_url() {
-        for entry in &src_entries {
-            if let Some(mode) = entry.mode {
-                if (mode & 0o400) == 0 {
-                    return Err(GsutilError::command(
-                        "This sync will orphan file(s), please fix their permissions before trying again.",
-                    ));
-                }
+            if err.to_string().contains("This sync will orphan file(s)") {
+                return Err(err);
             }
+            eprintln!("{err}");
+            return Err(GsutilError::command(
+                "Caught non-retryable exception - aborting rsync",
+            ));
         }
-    }
-
-    // External merge-sort both listings to temp files.
-    let sorted_src_file = batch_sort_entries(src_entries.into_iter(), buffer_lines)?;
-    let sorted_dst_file = batch_sort_entries(dst_entries.into_iter(), buffer_lines)?;
+    };
+    let sorted_dst_file = match dst_res {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!("{err}");
+            return Err(GsutilError::command(
+                "Caught non-retryable exception - aborting rsync",
+            ));
+        }
+    };
 
     let actions = compute_diffs_from_sorted_files(
         sorted_src_file.path(),
@@ -465,31 +468,41 @@ impl Ord for HeapItem {
     }
 }
 
-/// Externally sort `RsyncEntry` records by `rel_path` in chunks of `buffer_lines`,
-/// merging chunks with a k-way min-heap into a temporary JSONL file.
-pub fn batch_sort_entries<I>(mut iter: I, buffer_lines: usize) -> Result<NamedTempFile>
-where
-    I: Iterator<Item = RsyncEntry>,
-{
-    let mut chunk_files: Vec<NamedTempFile> = Vec::new();
-    let chunk_cap = buffer_lines.max(1);
+/// Streaming external merge-sorter that bounds in-memory entries to `buffer_lines`,
+/// spilling sorted runs to temp files and merging them via a k-way min-heap on `finish()`.
+pub struct ExternalBatchSorter {
+    chunk_cap: usize,
+    buf: Vec<RsyncEntry>,
+    chunk_files: Vec<NamedTempFile>,
+}
 
-    loop {
-        let mut chunk: Vec<RsyncEntry> = Vec::with_capacity(chunk_cap.min(4096));
-        for _ in 0..chunk_cap {
-            match iter.next() {
-                Some(e) => chunk.push(e),
-                None => break,
-            }
+impl ExternalBatchSorter {
+    pub fn new(buffer_lines: usize) -> Self {
+        let chunk_cap = buffer_lines.max(1);
+        Self {
+            chunk_cap,
+            buf: Vec::with_capacity(chunk_cap.min(4096)),
+            chunk_files: Vec::new(),
         }
-        if chunk.is_empty() {
-            break;
+    }
+
+    pub fn push(&mut self, entry: RsyncEntry) -> Result<()> {
+        self.buf.push(entry);
+        if self.buf.len() >= self.chunk_cap {
+            self.flush_chunk()?;
         }
-        chunk.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        Ok(())
+    }
+
+    fn flush_chunk(&mut self) -> Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        self.buf.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
         let mut tmp = NamedTempFile::new()?;
         {
             let mut w = BufWriter::new(tmp.as_file_mut());
-            for entry in &chunk {
+            for entry in &self.buf {
                 serde_json::to_writer(&mut w, entry).map_err(|e| {
                     GsutilError::command(format!("Failed to serialize rsync entry: {e}"))
                 })?;
@@ -497,43 +510,65 @@ where
             }
             w.flush()?;
         }
-        chunk_files.push(tmp);
+        self.buf.clear();
+        self.chunk_files.push(tmp);
+        Ok(())
     }
 
-    let mut out = NamedTempFile::new()?;
-    let mut readers: Vec<BufReader<File>> = Vec::with_capacity(chunk_files.len());
-    for cf in &chunk_files {
-        readers.push(BufReader::new(File::open(cf.path())?));
-    }
-
-    let mut heap: BinaryHeap<HeapItem> = BinaryHeap::new();
-    for (idx, r) in readers.iter_mut().enumerate() {
-        if let Some(entry) = read_next_entry(r)? {
-            heap.push(HeapItem {
-                entry,
-                chunk_idx: idx,
-            });
+    pub fn finish(mut self) -> Result<NamedTempFile> {
+        self.flush_chunk()?;
+        if self.chunk_files.len() == 1 {
+            return Ok(self.chunk_files.remove(0));
         }
-    }
 
-    {
-        let mut writer = BufWriter::new(out.as_file_mut());
-        while let Some(HeapItem { entry, chunk_idx }) = heap.pop() {
-            serde_json::to_writer(&mut writer, &entry).map_err(|e| {
-                GsutilError::command(format!("Failed to write merged rsync entry: {e}"))
-            })?;
-            writer.write_all(b"\n")?;
-            if let Some(next_entry) = read_next_entry(&mut readers[chunk_idx])? {
+        let mut out = NamedTempFile::new()?;
+        let mut readers: Vec<BufReader<File>> = Vec::with_capacity(self.chunk_files.len());
+        for cf in &self.chunk_files {
+            readers.push(BufReader::new(File::open(cf.path())?));
+        }
+
+        let mut heap: BinaryHeap<HeapItem> = BinaryHeap::new();
+        for (idx, r) in readers.iter_mut().enumerate() {
+            if let Some(entry) = read_next_entry(r)? {
                 heap.push(HeapItem {
-                    entry: next_entry,
-                    chunk_idx,
+                    entry,
+                    chunk_idx: idx,
                 });
             }
         }
-        writer.flush()?;
-    }
 
-    Ok(out)
+        {
+            let mut writer = BufWriter::new(out.as_file_mut());
+            while let Some(HeapItem { entry, chunk_idx }) = heap.pop() {
+                serde_json::to_writer(&mut writer, &entry).map_err(|e| {
+                    GsutilError::command(format!("Failed to write merged rsync entry: {e}"))
+                })?;
+                writer.write_all(b"\n")?;
+                if let Some(next_entry) = read_next_entry(&mut readers[chunk_idx])? {
+                    heap.push(HeapItem {
+                        entry: next_entry,
+                        chunk_idx,
+                    });
+                }
+            }
+            writer.flush()?;
+        }
+
+        Ok(out)
+    }
+}
+
+/// Externally sort `RsyncEntry` records by `rel_path` in chunks of `buffer_lines`,
+/// merging chunks with a k-way min-heap into a temporary JSONL file.
+pub fn batch_sort_entries<I>(iter: I, buffer_lines: usize) -> Result<NamedTempFile>
+where
+    I: Iterator<Item = RsyncEntry>,
+{
+    let mut sorter = ExternalBatchSorter::new(buffer_lines);
+    for entry in iter {
+        sorter.push(entry)?;
+    }
+    sorter.finish()
 }
 
 fn read_next_entry(reader: &mut BufReader<File>) -> Result<Option<RsyncEntry>> {
@@ -711,33 +746,41 @@ fn resolve_entry_hashes(
 // Tree Listing Helpers (Local & Cloud)
 // ---------------------------------------------------------------------------
 
-async fn list_tree(
+async fn list_tree_sorted(
     api: &dyn CloudApi,
     root: &StorageUrl,
     cfg: &RsyncConfig,
     exclude_re: Option<&Regex>,
-) -> Result<Vec<RsyncEntry>> {
+    buffer_lines: usize,
+    check_orphan_posix: bool,
+) -> Result<NamedTempFile> {
+    let mut sorter = ExternalBatchSorter::new(buffer_lines);
     match root {
-        StorageUrl::File(f) => list_local_tree(Path::new(&f.object_name), cfg, exclude_re),
-        StorageUrl::Cloud(_) => list_cloud_tree(api, root, cfg, exclude_re).await,
+        StorageUrl::File(f) => {
+            list_local_tree_into(Path::new(&f.object_name), cfg, exclude_re, &mut sorter)?;
+        }
+        StorageUrl::Cloud(_) => {
+            list_cloud_tree_into(api, root, cfg, exclude_re, check_orphan_posix, &mut sorter)
+                .await?;
+        }
     }
+    sorter.finish()
 }
 
-fn list_local_tree(
+fn list_local_tree_into(
     root: &Path,
     cfg: &RsyncConfig,
     exclude_re: Option<&Regex>,
-) -> Result<Vec<RsyncEntry>> {
+    sorter: &mut ExternalBatchSorter,
+) -> Result<()> {
     if !root.exists() {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    let mut entries = Vec::new();
     let mut visited = HashSet::new();
     if let Ok(canon) = fs::canonicalize(root) {
         visited.insert(canon);
     }
-    walk_local_rsync(root, root, cfg, exclude_re, &mut visited, &mut entries)?;
-    Ok(entries)
+    walk_local_rsync(root, root, cfg, exclude_re, &mut visited, sorter)
 }
 
 fn walk_local_rsync(
@@ -746,7 +789,7 @@ fn walk_local_rsync(
     cfg: &RsyncConfig,
     exclude_re: Option<&Regex>,
     visited_dirs: &mut HashSet<PathBuf>,
-    out: &mut Vec<RsyncEntry>,
+    sorter: &mut ExternalBatchSorter,
 ) -> Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -778,7 +821,7 @@ fn walk_local_rsync(
                         continue;
                     }
                 }
-                walk_local_rsync(root, &path, cfg, exclude_re, visited_dirs, out)?;
+                walk_local_rsync(root, &path, cfg, exclude_re, visited_dirs, sorter)?;
             }
             continue;
         }
@@ -805,7 +848,7 @@ fn walk_local_rsync(
         }
 
         let posix = read_local_posix_attributes(&path)?;
-        out.push(RsyncEntry {
+        sorter.push(RsyncEntry {
             rel_path: rel,
             full_url: format!("file://{}", path.to_string_lossy()),
             size: meta.len(),
@@ -817,17 +860,19 @@ fn walk_local_rsync(
             mode: posix.mode,
             crc32c: None,
             md5: None,
-        });
+        })?;
     }
     Ok(())
 }
 
-async fn list_cloud_tree(
+async fn list_cloud_tree_into(
     api: &dyn CloudApi,
     root: &StorageUrl,
     cfg: &RsyncConfig,
     exclude_re: Option<&Regex>,
-) -> Result<Vec<RsyncEntry>> {
+    check_orphan_posix: bool,
+    sorter: &mut ExternalBatchSorter,
+) -> Result<()> {
     let bucket = root
         .bucket_name()
         .ok_or_else(|| GsutilError::command("rsync cloud URL must specify a bucket."))?;
@@ -841,9 +886,21 @@ async fn list_cloud_tree(
         _ => None,
     };
 
-    let listed = api
-        .for_provider(scheme)?
-        .list_objects(
+    let rsync_fields = vec![
+        "name".to_string(),
+        "size".to_string(),
+        "crc32c".to_string(),
+        "md5Hash".to_string(),
+        "timeCreated".to_string(),
+        "contentEncoding".to_string(),
+        "metadata".to_string(),
+    ];
+
+    let prefix_str = prefix.as_deref().unwrap_or("");
+    let now_limit = chrono::Utc::now().timestamp() + 86_400;
+
+    api.for_provider(scheme)?
+        .list_objects_paged(
             bucket,
             &ListObjectsOptions {
                 prefix: prefix.clone(),
@@ -853,88 +910,95 @@ async fn list_cloud_tree(
                     Some("/".to_string())
                 },
                 all_versions: false,
-                fields: None,
+                fields: Some(rsync_fields),
             },
-        )
-        .await?;
-
-    let prefix_str = prefix.as_deref().unwrap_or("");
-    let mut entries = Vec::new();
-    for item in listed {
-        let CsObjectOrPrefix::Object(obj) = item else {
-            continue;
-        };
-        let Some(name) = obj.name.as_deref() else {
-            continue;
-        };
-        let full_url = format!("{scheme}://{bucket}/{name}");
-        let parsed_u = StorageUrl::parse(&full_url)?;
-        if parsed_u.is_cloud_subdir_placeholder(Some(obj.size_bytes())) {
-            continue;
-        }
-        let rel = name.strip_prefix(prefix_str).unwrap_or(name).to_string();
-        if rel.is_empty() {
-            continue;
-        }
-        if let Some(re) = exclude_re {
-            if re.is_match(&rel) {
-                continue;
-            }
-        }
-
-        if let Some(ref custom_meta) = obj.metadata {
-            if let Some(raw_mtime) = custom_meta.get(crate::posix::MTIME_ATTR) {
-                let parsed = raw_mtime.trim().parse::<i64>().ok();
-                match parsed {
-                    None => eprintln!("WARNING: {full_url} has an invalid mtime in its metadata"),
-                    Some(v) if v < 0 => {
-                        eprintln!("WARNING: {full_url} has an invalid mtime in its metadata")
+            &mut |page| {
+                for item in page {
+                    let CsObjectOrPrefix::Object(obj) = item else {
+                        continue;
+                    };
+                    let Some(name) = obj.name.as_deref() else {
+                        continue;
+                    };
+                    let full_url = format!("{scheme}://{bucket}/{name}");
+                    let parsed_u = StorageUrl::parse(&full_url)?;
+                    if parsed_u.is_cloud_subdir_placeholder(Some(obj.size_bytes())) {
+                        continue;
                     }
-                    Some(v) if v > chrono::Utc::now().timestamp() + 86_400 => {
+                    let rel = name.strip_prefix(prefix_str).unwrap_or(name).to_string();
+                    if rel.is_empty() {
+                        continue;
+                    }
+                    if let Some(re) = exclude_re {
+                        if re.is_match(&rel) {
+                            continue;
+                        }
+                    }
+
+                    if let Some(ref custom_meta) = obj.metadata {
+                        if let Some(raw_mtime) = custom_meta.get(crate::posix::MTIME_ATTR) {
+                            let parsed = raw_mtime.trim().parse::<i64>().ok();
+                            match parsed {
+                                None => eprintln!(
+                                    "WARNING: {full_url} has an invalid mtime in its metadata"
+                                ),
+                                Some(v) if v < 0 => eprintln!(
+                                    "WARNING: {full_url} has an invalid mtime in its metadata"
+                                ),
+                                Some(v) if v > now_limit => eprintln!(
+                                    "WARNING: {full_url} has an mtime more than 1 day from current system time"
+                                ),
+                                _ => {}
+                            }
+                        }
+                    }
+                    if obj
+                        .content_encoding
+                        .as_deref()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("gzip"))
+                        && !cfg.quiet
+                    {
                         eprintln!(
-                            "WARNING: {full_url} has an mtime more than 1 day from current system time"
+                            "WARNING: {full_url} has a compressed content-encoding, so it may be re-downloaded."
                         );
                     }
-                    _ => {}
+                    let posix = obj
+                        .metadata
+                        .as_ref()
+                        .map(deserialize_posix_from_metadata)
+                        .unwrap_or_default();
+                    if check_orphan_posix {
+                        if let Some(mode) = posix.mode {
+                            if (mode & 0o400) == 0 {
+                                return Err(GsutilError::command(
+                                    "This sync will orphan file(s), please fix their permissions before trying again.",
+                                ));
+                            }
+                        }
+                    }
+                    let time_created = obj
+                        .time_created
+                        .as_deref()
+                        .and_then(parse_rfc3339_to_epoch_secs);
+
+                    sorter.push(RsyncEntry {
+                        rel_path: rel,
+                        full_url,
+                        size: obj.size_bytes(),
+                        time_created,
+                        mtime: posix.mtime,
+                        atime: posix.atime,
+                        uid: posix.uid,
+                        gid: posix.gid,
+                        mode: posix.mode,
+                        crc32c: obj.crc32c,
+                        md5: obj.md5_hash,
+                    })?;
                 }
-            }
-        }
-        if obj
-            .content_encoding
-            .as_deref()
-            .is_some_and(|e| e.eq_ignore_ascii_case("gzip"))
-            && !cfg.quiet
-        {
-            eprintln!(
-                "WARNING: {full_url} has a compressed content-encoding, so it may be re-downloaded."
-            );
-        }
-        let posix = obj
-            .metadata
-            .as_ref()
-            .map(deserialize_posix_from_metadata)
-            .unwrap_or_default();
-        let time_created = obj
-            .time_created
-            .as_deref()
-            .and_then(parse_rfc3339_to_epoch_secs);
-
-        entries.push(RsyncEntry {
-            rel_path: rel,
-            full_url,
-            size: obj.size_bytes(),
-            time_created,
-            mtime: posix.mtime,
-            atime: posix.atime,
-            uid: posix.uid,
-            gid: posix.gid,
-            mode: posix.mode,
-            crc32c: obj.crc32c.clone(),
-            md5: obj.md5_hash.clone(),
-        });
-    }
-
-    Ok(entries)
+                Ok(())
+            },
+        )
+        .await
 }
 
 fn build_child_url(root: &StorageUrl, rel_path: &str) -> String {

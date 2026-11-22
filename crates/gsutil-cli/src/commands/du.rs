@@ -12,7 +12,7 @@ use crate::context::CommandContext;
 use crate::dispatch::{CommandSpec, NO_MAX};
 use crate::format::make_human_readable;
 use crate::getopt::OptPair;
-use crate::wildcard_iter::{iter_all, iter_buckets, iter_objects};
+use crate::wildcard_iter::{iter_all, iter_buckets, iter_objects_streaming};
 
 pub const SYNOPSIS: &str = "\n  gsutil du url...\n";
 
@@ -146,44 +146,61 @@ pub async fn run(ctx: &mut CommandContext, sub_opts: &[OptPair], args: &[String]
                 } else {
                     target_str.clone()
                 };
-                let mut objs = iter_objects(
+                let mut o_cnt = 0u64;
+                let mut b_cnt = 0u64;
+                let mut raw_seen = 0u64;
+                let du_fields = ["name".to_string(), "size".to_string()];
+                iter_objects_streaming(
                     api.as_ref(),
                     &query_pattern,
                     project_id.as_deref(),
                     all_versions,
-                    Some(&["name".to_string(), "size".to_string()]),
+                    Some(&du_fields),
+                    &mut |obj_blr| {
+                        if let BucketListingRef::Object { url, metadata } = obj_blr {
+                            raw_seen += 1;
+                            let obj_url_str = url.url_string();
+                            let obj_name = url.object_name().unwrap_or("");
+                            if !matchers
+                                .iter()
+                                .any(|m| m.is_match(obj_name) || m.is_match(&obj_url_str))
+                            {
+                                o_cnt += 1;
+                                b_cnt += metadata.as_ref().map_or(0, |m| m.size_bytes());
+                            }
+                        }
+                        Ok(())
+                    },
                 )
                 .await?;
-                if objs.is_empty()
+                if raw_seen == 0
                     && !target_url.is_bucket()
                     && !target_str.ends_with('/')
                     && !contains_wildcard(&target_str)
                 {
                     let sub_pattern = target_url.create_prefix_url(Some("**"));
-                    objs = iter_objects(
+                    iter_objects_streaming(
                         api.as_ref(),
                         &sub_pattern,
                         project_id.as_deref(),
                         all_versions,
-                        Some(&["name".to_string(), "size".to_string()]),
+                        Some(&du_fields),
+                        &mut |obj_blr| {
+                            if let BucketListingRef::Object { url, metadata } = obj_blr {
+                                let obj_url_str = url.url_string();
+                                let obj_name = url.object_name().unwrap_or("");
+                                if !matchers
+                                    .iter()
+                                    .any(|m| m.is_match(obj_name) || m.is_match(&obj_url_str))
+                                {
+                                    o_cnt += 1;
+                                    b_cnt += metadata.as_ref().map_or(0, |m| m.size_bytes());
+                                }
+                            }
+                            Ok(())
+                        },
                     )
                     .await?;
-                }
-                let mut o_cnt = 0u64;
-                let mut b_cnt = 0u64;
-                for obj_blr in objs {
-                    if let BucketListingRef::Object { url, metadata } = obj_blr {
-                        let obj_url_str = url.url_string();
-                        let obj_name = url.object_name().unwrap_or("");
-                        if matchers
-                            .iter()
-                            .any(|m| m.is_match(obj_name) || m.is_match(&obj_url_str))
-                        {
-                            continue;
-                        }
-                        o_cnt += 1;
-                        b_cnt += metadata.as_ref().map_or(0, |m| m.size_bytes());
-                    }
                 }
                 (o_cnt, b_cnt)
             } else {

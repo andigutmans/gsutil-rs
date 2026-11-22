@@ -275,6 +275,17 @@ impl CloudApi for CloudApiDelegator {
         self.default_api()?.list_objects(bucket_name, options).await
     }
 
+    async fn list_objects_paged(
+        &self,
+        bucket_name: &str,
+        options: &ListObjectsOptions,
+        on_page: &mut (dyn FnMut(Vec<CsObjectOrPrefix>) -> Result<()> + Send),
+    ) -> Result<()> {
+        self.default_api()?
+            .list_objects_paged(bucket_name, options, on_page)
+            .await
+    }
+
     async fn get_object_metadata(
         &self,
         bucket_name: &str,

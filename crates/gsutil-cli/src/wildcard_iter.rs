@@ -85,15 +85,16 @@ pub async fn iter_buckets(
     Ok(refs)
 }
 
-/// Expand a cloud URL (which may contain wildcards `*`, `?`, `[...]`, `**`) into
-/// matching objects and/or prefixes.
-pub async fn iter_all(
+/// Stream-expand a cloud URL (which may contain wildcards `*`, `?`, `[...]`, `**`)
+/// into matching objects and/or prefixes, invoking `on_item` page-by-page for O(page_size) memory.
+pub async fn iter_all_streaming(
     api: &dyn CloudApi,
     url_str: &str,
     project_id: Option<&str>,
     all_versions: bool,
     fields: Option<&[String]>,
-) -> Result<Vec<BucketListingRef>> {
+    on_item: &mut (dyn FnMut(BucketListingRef) -> Result<()> + Send),
+) -> Result<()> {
     let url = StorageUrl::parse(url_str)?;
     let cloud = url
         .as_cloud()
@@ -101,7 +102,10 @@ pub async fn iter_all(
     let api = api.for_provider(cloud.scheme.as_str())?;
 
     if cloud.is_provider() {
-        return iter_buckets(api, url_str, project_id, fields).await;
+        for b in iter_buckets(api, url_str, project_id, fields).await? {
+            on_item(b)?;
+        }
+        return Ok(());
     }
 
     let bucket_pat = cloud.bucket_name.as_deref().unwrap_or("");
@@ -119,7 +123,6 @@ pub async fn iter_all(
 
     let Some(obj_pat) = cloud.object_name.as_deref() else {
         // Bucket URL without object part -> return bucket refs.
-        let mut out = Vec::new();
         for b in buckets {
             let b_url = StorageUrl::Cloud(CloudUrl {
                 scheme: cloud.scheme,
@@ -127,15 +130,14 @@ pub async fn iter_all(
                 object_name: None,
                 generation: None,
             });
-            out.push(BucketListingRef::Bucket {
+            on_item(BucketListingRef::Bucket {
                 url: b_url,
                 metadata: None,
-            });
+            })?;
         }
-        return Ok(out);
+        return Ok(());
     };
 
-    let mut results = Vec::new();
     for bucket_name in buckets {
         expand_bucket_objects(
             api,
@@ -145,21 +147,47 @@ pub async fn iter_all(
             cloud.generation.as_deref(),
             all_versions,
             fields,
-            &mut results,
+            on_item,
         )
         .await?;
     }
-    Ok(results)
+    Ok(())
 }
 
-/// Expand only objects (filtering out prefixes/buckets) for a cloud URL.
-pub async fn iter_objects(
+/// Expand a cloud URL (which may contain wildcards `*`, `?`, `[...]`, `**`) into
+/// matching objects and/or prefixes.
+pub async fn iter_all(
     api: &dyn CloudApi,
     url_str: &str,
     project_id: Option<&str>,
     all_versions: bool,
     fields: Option<&[String]>,
 ) -> Result<Vec<BucketListingRef>> {
+    let mut results = Vec::new();
+    iter_all_streaming(
+        api,
+        url_str,
+        project_id,
+        all_versions,
+        fields,
+        &mut |item| {
+            results.push(item);
+            Ok(())
+        },
+    )
+    .await?;
+    Ok(results)
+}
+
+/// Stream-expand only objects (filtering out prefixes/buckets) for a cloud URL.
+pub async fn iter_objects_streaming(
+    api: &dyn CloudApi,
+    url_str: &str,
+    project_id: Option<&str>,
+    all_versions: bool,
+    fields: Option<&[String]>,
+    on_obj: &mut (dyn FnMut(BucketListingRef) -> Result<()> + Send),
+) -> Result<()> {
     // Match Python WildcardIterator.IterObjects: for a non-wildcard bucket URL
     // (e.g. `gs://nonexistent`), verify bucket existence so GCS returns
     // BucketNotFoundException / NotFoundException instead of silently returning empty.
@@ -172,13 +200,49 @@ pub async fn iter_objects(
                     provider_api
                         .get_bucket(bucket_pat, Some(&["id".to_string()]))
                         .await?;
-                    return Ok(Vec::new());
+                    return Ok(());
                 }
             }
         }
     }
-    let all = iter_all(api, url_str, project_id, all_versions, fields).await?;
-    Ok(all.into_iter().filter(|r| r.is_object()).collect())
+    iter_all_streaming(
+        api,
+        url_str,
+        project_id,
+        all_versions,
+        fields,
+        &mut |item| {
+            if item.is_object() {
+                on_obj(item)?;
+            }
+            Ok(())
+        },
+    )
+    .await
+}
+
+/// Expand only objects (filtering out prefixes/buckets) for a cloud URL.
+pub async fn iter_objects(
+    api: &dyn CloudApi,
+    url_str: &str,
+    project_id: Option<&str>,
+    all_versions: bool,
+    fields: Option<&[String]>,
+) -> Result<Vec<BucketListingRef>> {
+    let mut results = Vec::new();
+    iter_objects_streaming(
+        api,
+        url_str,
+        project_id,
+        all_versions,
+        fields,
+        &mut |item| {
+            results.push(item);
+            Ok(())
+        },
+    )
+    .await?;
+    Ok(results)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -190,7 +254,7 @@ async fn expand_bucket_objects_inner(
     generation: Option<&str>,
     all_versions: bool,
     fields: Option<&[String]>,
-    out: &mut Vec<BucketListingRef>,
+    on_item: &mut (dyn FnMut(BucketListingRef) -> Result<()> + Send),
 ) -> Result<()> {
     // Non-wildcard direct object lookup when generation is specified or exact object name.
     if !contains_wildcard(obj_pat) {
@@ -206,10 +270,10 @@ async fn expand_bucket_objects_inner(
                         object_name: Some(obj_pat.to_string()),
                         generation: obj.generation.clone().or_else(|| Some(gen.to_string())),
                     });
-                    out.push(BucketListingRef::Object {
+                    on_item(BucketListingRef::Object {
                         url: obj_url,
                         metadata: Some(Box::new(obj)),
-                    });
+                    })?;
                 }
                 Err(e) if e.is_not_found() => {}
                 Err(e) => return Err(e),
@@ -224,66 +288,77 @@ async fn expand_bucket_objects_inner(
             all_versions,
             fields: fields.map(|f| f.to_vec()),
         };
-        let items = api.list_objects(bucket_name, &opts).await?;
         let trimmed = strip_one_slash(obj_pat);
         let dir_prefix = format!("{trimmed}/");
 
         if obj_pat.ends_with('/') {
             // Trailing-slash URL (e.g. `gs://bucket/prefix/`): if any object or
             // sub-prefix exists under this prefix, emit it as a directory Prefix.
-            if !items.is_empty() {
+            let mut found_any = false;
+            api.list_objects_paged(bucket_name, &opts, &mut |page| {
+                if !page.is_empty() {
+                    found_any = true;
+                }
+                Ok(())
+            })
+            .await?;
+            if found_any {
                 let pref_url = StorageUrl::Cloud(CloudUrl {
                     scheme,
                     bucket_name: Some(bucket_name.to_string()),
                     object_name: Some(obj_pat.to_string()),
                     generation: None,
                 });
-                out.push(BucketListingRef::Prefix {
+                on_item(BucketListingRef::Prefix {
                     url: pref_url,
                     prefix: obj_pat.to_string(),
-                });
+                })?;
             }
             return Ok(());
         }
 
-        for item in items {
-            match item {
-                CsObjectOrPrefix::Object(obj) => {
-                    let name = obj.name.as_deref().unwrap_or("");
-                    if name == obj_pat || name == trimmed {
-                        let gen_opt = if all_versions {
-                            obj.generation.clone()
-                        } else {
-                            None
-                        };
-                        let obj_url = StorageUrl::Cloud(CloudUrl {
-                            scheme,
-                            bucket_name: Some(bucket_name.to_string()),
-                            object_name: Some(name.to_string()),
-                            generation: gen_opt,
-                        });
-                        out.push(BucketListingRef::Object {
-                            url: obj_url,
-                            metadata: Some(obj),
-                        });
+        api.list_objects_paged(bucket_name, &opts, &mut |page| {
+            for item in page {
+                match item {
+                    CsObjectOrPrefix::Object(obj) => {
+                        let name = obj.name.as_deref().unwrap_or("");
+                        if name == obj_pat || name == trimmed {
+                            let gen_opt = if all_versions {
+                                obj.generation.clone()
+                            } else {
+                                None
+                            };
+                            let obj_url = StorageUrl::Cloud(CloudUrl {
+                                scheme,
+                                bucket_name: Some(bucket_name.to_string()),
+                                object_name: Some(name.to_string()),
+                                generation: gen_opt,
+                            });
+                            on_item(BucketListingRef::Object {
+                                url: obj_url,
+                                metadata: Some(obj),
+                            })?;
+                        }
                     }
-                }
-                CsObjectOrPrefix::Prefix(pref) => {
-                    if pref == dir_prefix || pref == obj_pat {
-                        let pref_url = StorageUrl::Cloud(CloudUrl {
-                            scheme,
-                            bucket_name: Some(bucket_name.to_string()),
-                            object_name: Some(pref.clone()),
-                            generation: None,
-                        });
-                        out.push(BucketListingRef::Prefix {
-                            url: pref_url,
-                            prefix: pref,
-                        });
+                    CsObjectOrPrefix::Prefix(pref) => {
+                        if pref == dir_prefix || pref == obj_pat {
+                            let pref_url = StorageUrl::Cloud(CloudUrl {
+                                scheme,
+                                bucket_name: Some(bucket_name.to_string()),
+                                object_name: Some(pref.clone()),
+                                generation: None,
+                            });
+                            on_item(BucketListingRef::Prefix {
+                                url: pref_url,
+                                prefix: pref,
+                            })?;
+                        }
                     }
                 }
             }
-        }
+            Ok(())
+        })
+        .await?;
         return Ok(());
     }
 
@@ -296,52 +371,55 @@ async fn expand_bucket_objects_inner(
         all_versions,
         fields: fields.map(|f| f.to_vec()),
     };
-    let items = api.list_objects(bucket_name, &opts).await?;
 
     let mut sub_prefixes = Vec::new();
-    for item in items {
-        match item {
-            CsObjectOrPrefix::Object(obj) => {
-                let name = obj.name.as_deref().unwrap_or("");
-                if filter.suffix_wildcard.is_empty() && matcher.is_match(name) {
-                    let gen_opt = if all_versions {
-                        obj.generation.clone()
-                    } else {
-                        None
-                    };
-                    let obj_url = StorageUrl::Cloud(CloudUrl {
-                        scheme,
-                        bucket_name: Some(bucket_name.to_string()),
-                        object_name: Some(name.to_string()),
-                        generation: gen_opt,
-                    });
-                    out.push(BucketListingRef::Object {
-                        url: obj_url,
-                        metadata: Some(obj),
-                    });
-                }
-            }
-            CsObjectOrPrefix::Prefix(pref) => {
-                let stripped = strip_one_slash(&pref);
-                if matcher.is_match(stripped) || matcher.is_match(&pref) {
-                    if filter.suffix_wildcard.is_empty() {
-                        let pref_url = StorageUrl::Cloud(CloudUrl {
+    api.list_objects_paged(bucket_name, &opts, &mut |page| {
+        for item in page {
+            match item {
+                CsObjectOrPrefix::Object(obj) => {
+                    let name = obj.name.as_deref().unwrap_or("");
+                    if filter.suffix_wildcard.is_empty() && matcher.is_match(name) {
+                        let gen_opt = if all_versions {
+                            obj.generation.clone()
+                        } else {
+                            None
+                        };
+                        let obj_url = StorageUrl::Cloud(CloudUrl {
                             scheme,
                             bucket_name: Some(bucket_name.to_string()),
-                            object_name: Some(pref.clone()),
-                            generation: None,
+                            object_name: Some(name.to_string()),
+                            generation: gen_opt,
                         });
-                        out.push(BucketListingRef::Prefix {
-                            url: pref_url,
-                            prefix: pref,
-                        });
-                    } else {
-                        sub_prefixes.push(format!("{pref}{}", filter.suffix_wildcard));
+                        on_item(BucketListingRef::Object {
+                            url: obj_url,
+                            metadata: Some(obj),
+                        })?;
+                    }
+                }
+                CsObjectOrPrefix::Prefix(pref) => {
+                    let stripped = strip_one_slash(&pref);
+                    if matcher.is_match(stripped) || matcher.is_match(&pref) {
+                        if filter.suffix_wildcard.is_empty() {
+                            let pref_url = StorageUrl::Cloud(CloudUrl {
+                                scheme,
+                                bucket_name: Some(bucket_name.to_string()),
+                                object_name: Some(pref.clone()),
+                                generation: None,
+                            });
+                            on_item(BucketListingRef::Prefix {
+                                url: pref_url,
+                                prefix: pref,
+                            })?;
+                        } else {
+                            sub_prefixes.push(format!("{pref}{}", filter.suffix_wildcard));
+                        }
                     }
                 }
             }
         }
-    }
+        Ok(())
+    })
+    .await?;
 
     for sub in sub_prefixes {
         Box::pin(expand_bucket_objects(
@@ -352,7 +430,7 @@ async fn expand_bucket_objects_inner(
             generation,
             all_versions,
             fields,
-            out,
+            on_item,
         ))
         .await?;
     }
@@ -370,7 +448,7 @@ fn expand_bucket_objects<'a>(
     generation: Option<&'a str>,
     all_versions: bool,
     fields: Option<&'a [String]>,
-    out: &'a mut Vec<BucketListingRef>,
+    on_item: &'a mut (dyn FnMut(BucketListingRef) -> Result<()> + Send),
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(expand_bucket_objects_inner(
         api,
@@ -380,7 +458,7 @@ fn expand_bucket_objects<'a>(
         generation,
         all_versions,
         fields,
-        out,
+        on_item,
     ))
 }
 

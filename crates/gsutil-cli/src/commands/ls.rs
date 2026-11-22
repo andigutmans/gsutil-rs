@@ -11,7 +11,7 @@ use crate::format::{
     make_human_readable,
 };
 use crate::getopt::OptPair;
-use crate::wildcard_iter::{iter_all, iter_buckets};
+use crate::wildcard_iter::{iter_all_streaming, iter_buckets};
 
 pub const SYNOPSIS: &str = "\n  gsutil ls [-a] [-b] [-d] [-l] [-L] [-r] [-p proj_id] url...\n";
 
@@ -264,6 +264,34 @@ fn bucket_fields_for_style(style: ListingStyle) -> Option<Vec<String>> {
     }
 }
 
+fn object_fields_for_style(opts: &LsOpts) -> Option<Vec<String>> {
+    match opts.style {
+        ListingStyle::Short => {
+            if opts.all_versions {
+                Some(vec!["name".to_string(), "generation".to_string()])
+            } else {
+                Some(vec!["name".to_string()])
+            }
+        }
+        ListingStyle::Long => {
+            let mut f = vec![
+                "name".to_string(),
+                "size".to_string(),
+                "timeCreated".to_string(),
+            ];
+            if opts.all_versions {
+                f.push("generation".to_string());
+                f.push("metageneration".to_string());
+            }
+            if opts.include_etag {
+                f.push("etag".to_string());
+            }
+            Some(f)
+        }
+        ListingStyle::LongLong => None,
+    }
+}
+
 fn print_bucket_info(
     ctx: &CommandContext,
     blr: &BucketListingRef,
@@ -363,76 +391,84 @@ fn recurse_prefix_and_print<'a>(
             prefix: Some(prefix.clone()),
             delimiter: Some("/".to_string()),
             all_versions: opts.all_versions,
-            fields: None,
+            fields: object_fields_for_style(opts),
         };
-        let raw_items = provider_api.list_objects(&bucket, &list_opts).await?;
         let mut num_dirs = 0u64;
         let mut num_objs = 0u64;
         let mut num_bytes = 0u64;
+        let mut sub_prefixes: Vec<String> = Vec::new();
 
-        for item in raw_items {
-            match item {
-                CsObjectOrPrefix::Object(obj) => {
-                    let name = obj.name.clone().unwrap_or_default();
-                    let gen_opt = if opts.all_versions {
-                        obj.generation.clone()
-                    } else {
-                        None
-                    };
-                    let obj_url = StorageUrl::Cloud(CloudUrl {
-                        scheme,
-                        bucket_name: Some(bucket.clone()),
-                        object_name: Some(name),
-                        generation: gen_opt,
-                    });
-                    let blr = BucketListingRef::Object {
-                        url: obj_url,
-                        metadata: Some(obj),
-                    };
-                    let (o, b) = print_object(ctx, &blr, opts)?;
-                    num_objs += o;
-                    num_bytes += b;
-                }
-                CsObjectOrPrefix::Prefix(sub_prefix) => {
-                    if sub_prefix == prefix {
-                        continue;
-                    }
-                    let pref_url = StorageUrl::Cloud(CloudUrl {
-                        scheme,
-                        bucket_name: Some(bucket.clone()),
-                        object_name: Some(sub_prefix.clone()),
-                        generation: None,
-                    });
-                    let blr = BucketListingRef::Prefix {
-                        url: pref_url.clone(),
-                        prefix: sub_prefix.clone(),
-                    };
-                    if opts.recursive {
-                        if print_initial_newline {
-                            ctx.println("")?;
-                        } else {
-                            print_initial_newline = true;
+        provider_api
+            .list_objects_paged(&bucket, &list_opts, &mut |page| {
+                for item in page {
+                    match item {
+                        CsObjectOrPrefix::Object(obj) => {
+                            let name = obj.name.clone().unwrap_or_default();
+                            let gen_opt = if opts.all_versions {
+                                obj.generation.clone()
+                            } else {
+                                None
+                            };
+                            let obj_url = StorageUrl::Cloud(CloudUrl {
+                                scheme,
+                                bucket_name: Some(bucket.clone()),
+                                object_name: Some(name),
+                                generation: gen_opt,
+                            });
+                            let blr = BucketListingRef::Object {
+                                url: obj_url,
+                                metadata: Some(obj),
+                            };
+                            let (o, b) = print_object(ctx, &blr, opts)?;
+                            num_objs += o;
+                            num_bytes += b;
                         }
-                        ctx.println(&format!("{}:", pref_url.url_string()))?;
-                        let (nd, no, nb) = recurse_prefix_and_print(
-                            ctx,
-                            api,
-                            scheme,
-                            bucket.clone(),
-                            sub_prefix,
-                            opts,
-                            true,
-                        )
-                        .await?;
-                        num_dirs += nd;
-                        num_objs += no;
-                        num_bytes += nb;
-                    } else {
-                        print_prefix(ctx, &blr, opts.style)?;
-                        num_dirs += 1;
+                        CsObjectOrPrefix::Prefix(sub_prefix) => {
+                            if sub_prefix == prefix {
+                                continue;
+                            }
+                            if opts.recursive {
+                                sub_prefixes.push(sub_prefix);
+                            } else {
+                                let pref_url = StorageUrl::Cloud(CloudUrl {
+                                    scheme,
+                                    bucket_name: Some(bucket.clone()),
+                                    object_name: Some(sub_prefix.clone()),
+                                    generation: None,
+                                });
+                                let blr = BucketListingRef::Prefix {
+                                    url: pref_url,
+                                    prefix: sub_prefix,
+                                };
+                                print_prefix(ctx, &blr, opts.style)?;
+                                num_dirs += 1;
+                            }
+                        }
                     }
                 }
+                Ok(())
+            })
+            .await?;
+
+        for sub_prefix in sub_prefixes {
+            let pref_url = StorageUrl::Cloud(CloudUrl {
+                scheme,
+                bucket_name: Some(bucket.clone()),
+                object_name: Some(sub_prefix.clone()),
+                generation: None,
+            });
+            if print_initial_newline {
+                ctx.println("")?;
+            } else {
+                print_initial_newline = true;
             }
+            ctx.println(&format!("{}:", pref_url.url_string()))?;
+            let (nd, no, nb) =
+                recurse_prefix_and_print(ctx, api, scheme, bucket.clone(), sub_prefix, opts, true)
+                    .await?;
+            num_dirs += nd;
+            num_objs += no;
+            num_bytes += nb;
         }
         Ok((num_dirs, num_objs, num_bytes))
     })
@@ -448,47 +484,62 @@ fn recurse_expand_and_print<'a>(
     mut print_initial_newline: bool,
 ) -> LsFuture<'a> {
     Box::pin(async move {
-        let items = iter_all(api, &pattern, project_id, opts.all_versions, None).await?;
+        let fields = object_fields_for_style(opts);
         let mut num_dirs = 0u64;
         let mut num_objs = 0u64;
         let mut num_bytes = 0u64;
+        let mut sub_prefixes: Vec<(StorageUrl, String)> = Vec::new();
 
-        for blr in &items {
-            match blr {
-                BucketListingRef::Object { .. } => {
-                    let (o, b) = print_object(ctx, blr, opts)?;
-                    num_objs += o;
-                    num_bytes += b;
-                }
-                BucketListingRef::Prefix { url, prefix } => {
-                    if opts.recursive {
-                        if print_initial_newline {
-                            ctx.println("")?;
-                        } else {
-                            print_initial_newline = true;
-                        }
-                        ctx.println(&format!("{}:", url.url_string()))?;
-                        if let Some(cloud) = url.as_cloud() {
-                            let (nd, no, nb) = recurse_prefix_and_print(
-                                ctx,
-                                api,
-                                cloud.scheme,
-                                cloud.bucket_name.clone().unwrap_or_default(),
-                                prefix.clone(),
-                                opts,
-                                true,
-                            )
-                            .await?;
-                            num_dirs += nd;
-                            num_objs += no;
-                            num_bytes += nb;
-                        }
-                    } else {
-                        print_prefix(ctx, blr, opts.style)?;
-                        num_dirs += 1;
+        iter_all_streaming(
+            api,
+            &pattern,
+            project_id,
+            opts.all_versions,
+            fields.as_deref(),
+            &mut |blr| {
+                match blr {
+                    BucketListingRef::Object { .. } => {
+                        let (o, b) = print_object(ctx, &blr, opts)?;
+                        num_objs += o;
+                        num_bytes += b;
                     }
+                    BucketListingRef::Prefix { url, prefix } => {
+                        if opts.recursive {
+                            sub_prefixes.push((url, prefix));
+                        } else {
+                            let pref_blr = BucketListingRef::Prefix { url, prefix };
+                            print_prefix(ctx, &pref_blr, opts.style)?;
+                            num_dirs += 1;
+                        }
+                    }
+                    BucketListingRef::Bucket { .. } => {}
                 }
-                BucketListingRef::Bucket { .. } => {}
+                Ok(())
+            },
+        )
+        .await?;
+
+        for (url, prefix) in sub_prefixes {
+            if print_initial_newline {
+                ctx.println("")?;
+            } else {
+                print_initial_newline = true;
+            }
+            ctx.println(&format!("{}:", url.url_string()))?;
+            if let Some(cloud) = url.as_cloud() {
+                let (nd, no, nb) = recurse_prefix_and_print(
+                    ctx,
+                    api,
+                    cloud.scheme,
+                    cloud.bucket_name.clone().unwrap_or_default(),
+                    prefix,
+                    opts,
+                    true,
+                )
+                .await?;
+                num_dirs += nd;
+                num_objs += no;
+                num_bytes += nb;
             }
         }
         Ok((num_dirs, num_objs, num_bytes))
@@ -513,90 +564,105 @@ async fn list_url(
         return Ok((true, total_objs, total_bytes));
     }
 
+    let fields = object_fields_for_style(opts);
+
     if opts.recursive {
-        let items = iter_all(
+        let mut matched_any = false;
+        let mut total_objs = 0u64;
+        let mut total_bytes = 0u64;
+        let mut print_newline = false;
+        let mut sub_prefixes: Vec<(StorageUrl, String)> = Vec::new();
+
+        iter_all_streaming(
             api,
             &storage_url.url_string(),
             project_id,
             opts.all_versions,
-            None,
-        )
-        .await?;
-        if items.is_empty() {
-            return Ok((false, 0, 0));
-        }
-        let mut total_objs = 0u64;
-        let mut total_bytes = 0u64;
-        let mut print_newline = false;
-        for blr in &items {
-            match blr {
-                BucketListingRef::Object { .. } => {
-                    let (o, b) = print_object(ctx, blr, opts)?;
-                    total_objs += o;
-                    total_bytes += b;
-                    print_newline = true;
-                }
-                BucketListingRef::Prefix { url, prefix } => {
-                    if print_newline {
-                        ctx.println("")?;
-                    } else {
+            fields.as_deref(),
+            &mut |blr| {
+                matched_any = true;
+                match blr {
+                    BucketListingRef::Object { .. } => {
+                        let (o, b) = print_object(ctx, &blr, opts)?;
+                        total_objs += o;
+                        total_bytes += b;
                         print_newline = true;
                     }
-                    ctx.println(&format!("{}:", url.url_string()))?;
-                    if let Some(cloud) = url.as_cloud() {
-                        let (_, no, nb) = recurse_prefix_and_print(
-                            ctx,
-                            api,
-                            cloud.scheme,
-                            cloud.bucket_name.clone().unwrap_or_default(),
-                            prefix.clone(),
-                            opts,
-                            true,
-                        )
-                        .await?;
-                        total_objs += no;
-                        total_bytes += nb;
+                    BucketListingRef::Prefix { url, prefix } => {
+                        sub_prefixes.push((url, prefix));
                     }
+                    BucketListingRef::Bucket { .. } => {}
                 }
-                BucketListingRef::Bucket { .. } => {}
+                Ok(())
+            },
+        )
+        .await?;
+
+        if !matched_any {
+            return Ok((false, 0, 0));
+        }
+
+        for (url, prefix) in sub_prefixes {
+            if print_newline {
+                ctx.println("")?;
+            } else {
+                print_newline = true;
+            }
+            ctx.println(&format!("{}:", url.url_string()))?;
+            if let Some(cloud) = url.as_cloud() {
+                let (_, no, nb) = recurse_prefix_and_print(
+                    ctx,
+                    api,
+                    cloud.scheme,
+                    cloud.bucket_name.clone().unwrap_or_default(),
+                    prefix,
+                    opts,
+                    true,
+                )
+                .await?;
+                total_objs += no;
+                total_bytes += nb;
             }
         }
         return Ok((true, total_objs, total_bytes));
     }
 
     // Non-recursive object or subdirectory URL.
-    let items = iter_all(
+    let mut item_count = 0u64;
+    let mut total_objs = 0u64;
+    let mut total_bytes = 0u64;
+    let mut subdirs = Vec::new();
+
+    iter_all_streaming(
         api,
         &storage_url.url_string(),
         project_id,
         opts.all_versions,
-        None,
+        fields.as_deref(),
+        &mut |blr| {
+            item_count += 1;
+            match blr {
+                BucketListingRef::Object { .. } => {
+                    let (o, b) = print_object(ctx, &blr, opts)?;
+                    total_objs += o;
+                    total_bytes += b;
+                }
+                BucketListingRef::Prefix { .. } => {
+                    if !opts.list_subdir_contents {
+                        print_prefix(ctx, &blr, opts.style)?;
+                    } else {
+                        subdirs.push(blr.url().clone());
+                    }
+                }
+                BucketListingRef::Bucket { .. } => {}
+            }
+            Ok(())
+        },
     )
     .await?;
 
-    if items.is_empty() {
+    if item_count == 0 {
         return Ok((false, 0, 0));
-    }
-
-    let mut total_objs = 0u64;
-    let mut total_bytes = 0u64;
-    let mut subdirs = Vec::new();
-    for blr in &items {
-        match blr {
-            BucketListingRef::Object { .. } => {
-                let (o, b) = print_object(ctx, blr, opts)?;
-                total_objs += o;
-                total_bytes += b;
-            }
-            BucketListingRef::Prefix { .. } => {
-                if !opts.list_subdir_contents {
-                    print_prefix(ctx, blr, opts.style)?;
-                } else {
-                    subdirs.push(blr.url().clone());
-                }
-            }
-            BucketListingRef::Bucket { .. } => {}
-        }
     }
 
     for subdir in subdirs {
@@ -606,7 +672,7 @@ async fn list_url(
                 "Cloud folder {subdir_url_str} contains a wildcard; gsutil does not currently support objects with wildcards in their name."
             )));
         }
-        if items.len() > 1 {
+        if item_count > 1 {
             ctx.println(&format!("{subdir_url_str}:"))?;
         }
         if let Some(cloud) = subdir.as_cloud() {
