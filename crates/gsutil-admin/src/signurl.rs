@@ -338,11 +338,19 @@ pub async fn run_signurl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<
     }
 
     let loaded_key = if let Some(key_path) = key_file_opt {
-        if key_path.to_ascii_lowercase().ends_with(".p12") {
+        let raw_bytes = std::fs::read(key_path).map_err(|e| {
+            GsutilError::command(format!(
+                "Could not read private key file \"{key_path}\": {e}"
+            ))
+        })?;
+        let looks_like_json = std::str::from_utf8(&raw_bytes)
+            .ok()
+            .is_some_and(|s| s.trim_start().starts_with('{'));
+        if !looks_like_json || key_path.to_ascii_lowercase().ends_with(".p12") {
             let (email, rsa_key) = load_p12_key(key_path, &p12_password)?;
             Some((email, rsa_key))
         } else {
-            let raw = std::fs::read_to_string(key_path).map_err(|e| {
+            let raw = String::from_utf8(raw_bytes).map_err(|e| {
                 GsutilError::command(format!(
                     "Could not read private key file \"{key_path}\": {e}"
                 ))

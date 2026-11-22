@@ -4,7 +4,14 @@ all-features = false
 
 [advisories]
 version = 2
-ignore = []
+ignore = [
+    # rsa 0.9.x Marvin Attack affects network-observable RSA decryption timing sidechannels.
+    # gsutil-rs only performs local PKCS#1 v1.5 signing (JWT / signurl), never RSA decryption.
+    # Remove once rsa 0.10 stabilizes.
+    "RUSTSEC-2023-0071",
+    # chrono unmaintained notice (no security vulnerability); track future migration to jiff/time.
+    "RUSTSEC-2026-0543",
+]
 
 [licenses]
 version = 2

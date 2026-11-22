@@ -147,9 +147,19 @@ pub async fn resolve_credentials_with_options(
         }
     }
 
+    // 4b. When `[Tests] bypass_anonymous_access_warning = True` is set with no `.boto`
+    //     credentials (Python gsutil's `SetAnonymousBotoCreds()`), stay strictly anonymous
+    //     and do NOT fall back to ambient ADC / gcloud / GCE metadata credentials.
+    let force_anonymous =
+        base_creds.is_none() && config.get_bool("Tests", "bypass_anonymous_access_warning", false);
+
     // 5. When Context-Aware Access mTLS/ECP is enabled, prefer `gcloud` active user credentials
     //    because `gcloud` natively negotiates ECP/mTLS certificates and RAPT reauth.
-    if base_creds.is_none() && options.allow_gcloud_fallback && is_mtls_enabled(config) {
+    if !force_anonymous
+        && base_creds.is_none()
+        && options.allow_gcloud_fallback
+        && is_mtls_enabled(config)
+    {
         let gcloud = GcloudCredentials::with_cache_dir(config.state_dir());
         if gcloud.try_fetch_initial().await.is_some() {
             base_creds = Some(Arc::new(gcloud));
@@ -157,7 +167,7 @@ pub async fn resolve_credentials_with_options(
     }
 
     // 6. Application Default Credentials (GOOGLE_APPLICATION_CREDENTIALS or well-known ADC JSON).
-    if base_creds.is_none() && options.allow_adc {
+    if !force_anonymous && base_creds.is_none() && options.allow_adc {
         let adc_path = options
             .adc_path_override
             .clone()
@@ -172,7 +182,7 @@ pub async fn resolve_credentials_with_options(
     }
 
     // 7. `gcloud` active user credentials fallback (`gcloud auth print-access-token`).
-    if base_creds.is_none() && options.allow_gcloud_fallback {
+    if !force_anonymous && base_creds.is_none() && options.allow_gcloud_fallback {
         let gcloud = GcloudCredentials::with_cache_dir(config.state_dir());
         if gcloud.try_fetch_initial().await.is_some() {
             base_creds = Some(Arc::new(gcloud));
@@ -180,7 +190,7 @@ pub async fn resolve_credentials_with_options(
     }
 
     // 8. GCE metadata server (`[GoogleCompute] service_account` or live metadata probe).
-    if base_creds.is_none() {
+    if !force_anonymous && base_creds.is_none() {
         if let Some(sa_name) = config
             .get("GoogleCompute", "service_account")
             .filter(|s| !s.trim().is_empty())

@@ -247,6 +247,17 @@ pub async fn run_iam(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
                 ))
             })?;
             if let Some(etag) = etag_override {
+                if !etag.is_empty() {
+                    use base64::Engine as _;
+                    if base64::engine::general_purpose::STANDARD
+                        .decode(&etag)
+                        .is_err()
+                    {
+                        return Err(GsutilError::argument(format!(
+                            "Invalid etag \"{etag}\" (must be valid base64)."
+                        )));
+                    }
+                }
                 policy.etag = if etag.is_empty() { None } else { Some(etag) };
             }
 

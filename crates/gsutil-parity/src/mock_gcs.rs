@@ -517,15 +517,10 @@ impl MockGcsServer {
         let leaf_cert = leaf_params
             .signed_by(&leaf_key, &ca_cert, &ca_key)
             .map_err(|e| std::io::Error::other(format!("rcgen leaf signed_by error: {e}")))?;
-        let chain_pem = format!("{}\n{}", leaf_cert.pem(), ca_pem);
-        let key_pem = leaf_key.serialize_pem();
-
-        let mut cert_cursor = std::io::Cursor::new(chain_pem.as_bytes());
-        let certs: Vec<_> =
-            rustls_pemfile::certs(&mut cert_cursor).collect::<Result<Vec<_>, _>>()?;
-        let mut key_cursor = std::io::Cursor::new(key_pem.as_bytes());
-        let key = rustls_pemfile::private_key(&mut key_cursor)?
-            .ok_or_else(|| std::io::Error::other("missing generated private key"))?;
+        let certs = vec![leaf_cert.der().clone(), ca_cert.der().clone()];
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_key.serialize_der()),
+        );
 
         let tls_cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()

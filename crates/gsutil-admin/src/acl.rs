@@ -92,7 +92,7 @@ fn parse_acl_grant(flag: &str, raw_id: &str, role: String) -> AclChange {
         "-u" => {
             if is_canonical_hex_id(raw_id) {
                 AclChange::Grant {
-                    entity: None,
+                    entity: Some(format!("user-{raw_id}")),
                     entity_id: Some(raw_id.to_string()),
                     project_team: None,
                     role,
@@ -114,7 +114,7 @@ fn parse_acl_grant(flag: &str, raw_id: &str, role: String) -> AclChange {
         "-g" => {
             if is_canonical_hex_id(raw_id) {
                 AclChange::Grant {
-                    entity: None,
+                    entity: Some(format!("group-{raw_id}")),
                     entity_id: Some(raw_id.to_string()),
                     project_team: None,
                     role,
@@ -816,6 +816,15 @@ pub async fn run_defacl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<(
                 continue_on_error,
                 ..
             } = parse_acl_ch_args(&args[1..])?;
+            for ch in &changes {
+                if let AclChange::Grant { role, .. } = ch {
+                    if role == "WRITER" {
+                        return Err(GsutilError::command(
+                            "WRITER cannot be set as a default object ACL.",
+                        ));
+                    }
+                }
+            }
             for raw in &url_args {
                 match StorageUrl::parse(raw)? {
                     StorageUrl::Cloud(c) if c.is_bucket() => {
