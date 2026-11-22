@@ -23,6 +23,10 @@ jobs:
             target: aarch64-apple-darwin
             asset: gsutil-rs-macos-arm64.tar.gz
             archive: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: gsutil-rs-macos-x86_64.tar.gz
+            archive: tar.gz
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset: gsutil-rs-linux-x86_64.tar.gz

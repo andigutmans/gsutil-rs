@@ -20,6 +20,15 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  security:
+    name: Security & License Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: --all-features check advisories licenses sources
+
   test:
     name: Build, Clippy & Test (${{ matrix.os }})
     strategy:
