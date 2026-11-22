@@ -836,7 +836,8 @@ async fn test_ecp_proxy_port_routing_and_target_host_header() {
 
     let port = server.address().port();
     std::env::set_var("GSUTIL_ECP_PROXY_PORT", port.to_string());
-    let cfg = BotoConfig::new();
+    let mut cfg = BotoConfig::new();
+    cfg.set("Credentials", "use_client_certificate", "True");
     let client = GcsJsonClient::from_boto_config(
         &cfg,
         Arc::new(StaticTokenProvider {

@@ -333,7 +333,12 @@ mod tests {
     #[test]
     fn test_measure_command_captures_exit_and_rss() {
         #[cfg(windows)]
-        let m = measure_command(Path::new("cmd"), &["/C", "exit 0"], &BTreeMap::new()).unwrap();
+        let m = measure_command(
+            Path::new("cmd"),
+            &["/C".to_string(), "exit 0".to_string()],
+            &BTreeMap::new(),
+        )
+        .unwrap();
         #[cfg(not(windows))]
         let m = measure_command(Path::new("true"), &[], &BTreeMap::new()).unwrap();
         assert_eq!(m.exit_code, 0);
