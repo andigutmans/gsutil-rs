@@ -40,11 +40,20 @@ jobs:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
       - name: Set up Google Cloud SDK (Python gsutil)
         uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GSUTIL_TEST_PROJECT }}
+      - name: Ensure gcloud SA credentials are active for reference Python gsutil
+        shell: bash
+        run: |
+          GCLOUD_BIN="$(command -v gcloud.cmd || command -v gcloud)"
+          "${GCLOUD_BIN}" auth activate-service-account --key-file="${GOOGLE_APPLICATION_CREDENTIALS}" --quiet
+          "${GCLOUD_BIN}" config set project "${{ secrets.GSUTIL_TEST_PROJECT }}" --quiet
       - name: Build release gsutil & gsutil-parity
         run: cargo build --release -p gsutil-cli -p gsutil-parity
       - name: Run live GCS differential parity
         shell: bash
         env:
+          CLOUDSDK_CORE_PROJECT: ${{ secrets.GSUTIL_TEST_PROJECT }}
           GSUTIL_TEST_PROJECT: ${{ secrets.GSUTIL_TEST_PROJECT }}
           GSUTIL_TEST_BUCKET: ${{ secrets.GSUTIL_TEST_BUCKET }}
         run: |
