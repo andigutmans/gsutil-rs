@@ -19,6 +19,6 @@ url.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 bytes.workspace = true
-rand = "0.8"
+rand = "0.10"
 tempfile.workspace = true
 tokio.workspace = true
