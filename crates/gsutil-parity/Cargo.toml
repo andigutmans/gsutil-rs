@@ -14,7 +14,7 @@ chrono.workspace = true
 crc32c.workspace = true
 flate2 = "1"
 md-5.workspace = true
-rcgen = "0.13"
+rcgen = "0.14"
 regex.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde.workspace = true
