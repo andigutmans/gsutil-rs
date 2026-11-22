@@ -55,6 +55,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Set up Python with crcmod (for reference Python gsutil)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install crcmod for reference Python gsutil
+        shell: bash
+        run: |
+          python -m pip install --quiet crcmod
+          echo "CLOUDSDK_PYTHON=$(which python)" >> "${GITHUB_ENV}"
       - name: Set up Google Cloud SDK (Python gsutil)
         uses: google-github-actions/setup-gcloud@v2
       - name: Build release gsutil & gsutil-parity
