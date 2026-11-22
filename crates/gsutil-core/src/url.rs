@@ -571,6 +571,14 @@ mod tests {
 
         let stream = StorageUrl::parse("-").unwrap();
         assert!(stream.is_stream());
+
+        let win1 = StorageUrl::parse(r"C:\Users\alice\data.bin").unwrap();
+        assert!(win1.is_file_url());
+        assert_eq!(win1.object_name(), Some(r"C:\Users\alice\data.bin"));
+
+        let win2 = StorageUrl::parse("file://C:/Users/alice/data.bin").unwrap();
+        assert!(win2.is_file_url());
+        assert_eq!(win2.object_name(), Some("C:/Users/alice/data.bin"));
     }
 
     #[test]

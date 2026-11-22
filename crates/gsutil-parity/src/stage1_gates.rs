@@ -66,14 +66,29 @@ pub fn run_measured_rss(bin: &Path, opts: &RunOptions) -> Result<MeasuredRun, St
         buf
     });
 
-    let pid = child.id() as libc::pid_t;
-    let mut status: libc::c_int = 0;
-    let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::wait4(pid, &mut status, 0, &mut rusage) };
+    let (exit_code, peak_rss_mib) = wait_with_rusage(child);
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     let stdout_bytes = t_out.join().unwrap_or_default();
     let stderr_bytes = t_err.join().unwrap_or_default();
+
+    Ok(MeasuredRun {
+        output: InvocationOutput {
+            exit_code,
+            stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+            duration_ms: elapsed_ms,
+        },
+        peak_rss_mib,
+    })
+}
+
+#[cfg(unix)]
+fn wait_with_rusage(child: std::process::Child) -> (i32, f64) {
+    let pid = child.id() as libc::pid_t;
+    let mut status: libc::c_int = 0;
+    let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::wait4(pid, &mut status, 0, &mut rusage) };
 
     let exit_code = if rc < 0 {
         -1
@@ -85,18 +100,19 @@ pub fn run_measured_rss(bin: &Path, opts: &RunOptions) -> Result<MeasuredRun, St
         -1
     };
 
-    // On Linux `ru_maxrss` is in KiB; convert to MiB.
+    // On macOS `ru_maxrss` is in bytes; on Linux it is in KiB.
+    #[cfg(target_os = "macos")]
+    let peak_rss_mib = (rusage.ru_maxrss as f64) / (1024.0 * 1024.0);
+    #[cfg(not(target_os = "macos"))]
     let peak_rss_mib = (rusage.ru_maxrss as f64) / 1024.0;
 
-    Ok(MeasuredRun {
-        output: InvocationOutput {
-            exit_code,
-            stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
-            duration_ms: elapsed_ms,
-        },
-        peak_rss_mib,
-    })
+    (exit_code, peak_rss_mib)
+}
+
+#[cfg(not(unix))]
+fn wait_with_rusage(mut child: std::process::Child) -> (i32, f64) {
+    let exit_code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+    (exit_code, 0.0)
 }
 
 /// Stream-hash a file on disk using 256 KiB chunks (constant RAM) returning `(crc32c, md5_hex)`.
@@ -435,10 +451,17 @@ async fn run_gate_sigint(runner: &GsutilRunner) -> CaseResult {
         Err(e) => return make_gate_result(id, "cp", args, false, None, Some(e.to_string())),
     };
 
-    // Wait for download to be in-flight, then send SIGINT.
+    // Wait for download to be in-flight, then send SIGINT (Unix) or terminate (non-Unix).
     tokio::time::sleep(Duration::from_millis(450)).await;
+    #[cfg(unix)]
     unsafe {
         libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+    #[cfg(not(unix))]
+    let mut child = child;
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
     }
 
     let output = match child.wait_with_output() {

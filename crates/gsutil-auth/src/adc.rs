@@ -160,6 +160,26 @@ pub fn certificate_config_path() -> Option<PathBuf> {
             return Some(user_cfg);
         }
     }
+    #[cfg(windows)]
+    {
+        if let Ok(appdata) = env::var("APPDATA") {
+            let win_user_cfg = PathBuf::from(appdata)
+                .join("gcloud")
+                .join("certificate_config.json");
+            if win_user_cfg.is_file() {
+                return Some(win_user_cfg);
+            }
+        }
+        if let Ok(progdata) = env::var("PROGRAMDATA") {
+            let win_sys_cfg = PathBuf::from(progdata)
+                .join("Google")
+                .join("Cloud SDK")
+                .join("certificate_config.json");
+            if win_sys_cfg.is_file() {
+                return Some(win_sys_cfg);
+            }
+        }
+    }
     let system_cfg = PathBuf::from("/etc/gcloud/certificate_config.json");
     if system_cfg.is_file() {
         return Some(system_cfg);
@@ -219,12 +239,20 @@ pub struct GcloudCredentials {
     cached: RwLock<Option<AccessToken>>,
 }
 
+fn default_gcloud_bin() -> String {
+    if cfg!(windows) {
+        "gcloud.cmd".to_string()
+    } else {
+        "gcloud".to_string()
+    }
+}
+
 impl GcloudCredentials {
     pub fn new() -> Self {
         let cache_file =
             dirs::home_dir().map(|h| h.join(".gsutil").join("gcloud_token_cache.json"));
         Self {
-            gcloud_bin: "gcloud".to_string(),
+            gcloud_bin: default_gcloud_bin(),
             cache_file,
             cached: RwLock::new(None),
         }
@@ -232,7 +260,7 @@ impl GcloudCredentials {
 
     pub fn with_cache_dir(state_dir: PathBuf) -> Self {
         Self {
-            gcloud_bin: "gcloud".to_string(),
+            gcloud_bin: default_gcloud_bin(),
             cache_file: Some(state_dir.join("gcloud_token_cache.json")),
             cached: RwLock::new(None),
         }

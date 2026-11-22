@@ -3393,6 +3393,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_cp_recursive_follows_and_excludes_symlinks() {
         use std::os::unix::fs::symlink;

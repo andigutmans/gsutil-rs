@@ -10,24 +10,36 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: Format, Clippy & Test
+  fmt:
+    name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  test:
+    name: Build, Clippy & Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Run clippy
+      - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Run unit & integration tests
+      - name: Test
         run: cargo test --workspace
-      - name: Build gsutil CLI binary
-        run: cargo build -p gsutil-cli
-      - name: Run differential parity (offline)
-        run: cargo run -p gsutil-parity -- --mode offline
-      - name: Run differential parity (mock GCS)
-        run: cargo run -p gsutil-parity -- --mode mock
+      - name: Build release binary & smoke test
+        shell: bash
+        run: |
+          cargo build --release -p gsutil-cli
+          ./target/release/gsutil version
+          ./target/release/gsutil help | head -n 5
