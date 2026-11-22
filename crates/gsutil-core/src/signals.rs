@@ -90,8 +90,11 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn test_cleanup_guard_unregisters_on_drop() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ran = Arc::new(AtomicBool::new(false));
         let ran_clone = Arc::clone(&ran);
         {
@@ -106,6 +109,7 @@ mod tests {
 
     #[test]
     fn test_run_all_cleanups_executes_lifo() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let order = Arc::new(Mutex::new(Vec::new()));
         let o1 = Arc::clone(&order);
         let o2 = Arc::clone(&order);
