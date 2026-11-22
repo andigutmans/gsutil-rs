@@ -99,6 +99,7 @@ pub async fn run_cli_captured(raw_argv: &[String], api: Option<Arc<dyn CloudApi>
     };
 
     let debug_level = global.debug_level;
+    gsutil_core::set_debug_level(debug_level);
     let test_exception_traces = global.test_exception_traces;
     let show_usage_and_exit = global.show_usage_and_exit;
 
@@ -174,6 +175,7 @@ pub async fn run_cli_with_api(raw_argv: &[String], api: Option<Arc<dyn CloudApi>
     }
 
     let debug_level = global.debug_level;
+    gsutil_core::set_debug_level(debug_level);
     let test_exception_traces = global.test_exception_traces;
     let show_usage_and_exit = global.show_usage_and_exit;
 

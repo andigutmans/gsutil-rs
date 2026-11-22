@@ -5,6 +5,12 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    ignore:
+      # rsa 0.9 requires digest/sha2 0.10 and pkcs8 0.10; re-enable once rsa 0.10 stabilizes.
+      - dependency-name: "sha2"
+        versions: [">= 0.11.0"]
+      - dependency-name: "pkcs8"
+        versions: [">= 0.11.0"]
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

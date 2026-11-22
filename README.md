@@ -103,11 +103,11 @@ Measured in-region on a GCE `n2-standard-8` VM (`us-central1-a`, PD-SSD) against
   - **Full multi-topology live suite:** **74/74 (100.0%)**, covering UBLA, non-UBLA fine-grained ACLs, versioned, dual-region, Requester Pays, retention, KMS/CMEK, Pub/Sub, HMAC CRUD + live GCS XML `GOOG4-HMAC-SHA256`, live V4/V2 `signurl` HTTP 200 `PUT`/`GET`, `-i` service account impersonation, `iam` roundtrip, and 5/5 recursive wildcard expansion parity (`*`, `sub*`, `**/*.ext`, non-recursive `*.ext`, plain dir `-r`).
   - **Stage 1 production gates (`--mode stage1`):** **5/5 (100.0%)** (200 MiB `< 64 MiB` RSS upload/download, cross-process `308` crash-resume, live `_.gstmp` recovery, `SIGINT` cleanup).
 - **Official Upstream Python `gslib/tests/` Black-Box Gate (`scripts/run_upstream_gsutil_tests.py`):**
-  - **Live GCP (`--backend live`):** **23 official upstream modules at 100.0% live pass** (`test_acl` 64/64, `test_defacl` 24/24, `test_signurl` 14/14, `test_kms` 5/5, `test_retention`, `test_cors`, `test_setmeta`, `test_compose` with live Cloud KMS/CMEK, `test_lifecycle`, `test_web`, `test_pap`, `test_label`, `test_versioning`, `test_cat`, `test_rb`, `test_autoclass`, `test_defstorageclass`, `test_rpo`, `test_hash`, `test_notification`, `test_ubla`, `test_bucketpolicyonly`, `test_hmac`), plus `test_iam` at **39/41 (95.1%)** (the remaining 2 assert Python-internal `AttributeError` tracebacks).
+  - **Live GCP (`--backend live`):** **23 official upstream modules at 100.0% live pass** (`test_acl` 64/64, `test_defacl` 24/24, `test_signurl` 14/14, `test_kms` 5/5, `test_retention`, `test_cors`, `test_setmeta`, `test_compose` with live Cloud KMS/CMEK, `test_lifecycle`, `test_web`, `test_pap`, `test_label`, `test_versioning`, `test_cat`, `test_rb`, `test_autoclass`, `test_defstorageclass`, `test_rpo`, `test_hash`, `test_notification`, `test_ubla`, `test_bucketpolicyonly`, `test_hmac`), plus `test_iam` at **39/41 (95.1%)**, `test_rsync` at **46/50 (92.0%)**, and `test_Doption` at **4/5 (80.0%)** (only Python-internal `User-Agent` assertion differs).
   - **Hermetic TLS Mock (`--backend mock`, 39 modules):** **615/774 (79.5%)** passing, **19 modules at 100.0%**.
 
 ### Known Limitations / Roadmap
-- Remaining upstream edge cases in `test_cp` (multi-source naming edge cases; Python-internal `--testcallbackfile` pickle tests do not apply), `test_rsync`, and `test_Doption`.
+- Remaining upstream edge cases in `test_cp` (multi-source naming edge cases; Python-internal `--testcallbackfile` pickle tests do not apply) and PCRE negative-lookahead `(?!...)` filters in `rsync -y`.
 - Live testing against real AWS S3 (currently verified against hermetic SigV4 mock).
 - `_ARGCOMPLETE` shell tab completion and standalone interactive OAuth `gsutil config`.
 

@@ -463,10 +463,15 @@ pub async fn run_rsync_cmd(
                     )));
                 }
                 cfg.exclude_pattern = Some(a.clone());
+                if o == "-y" {
+                    cfg.exclude_dirs = true;
+                }
             }
             _ => {}
         }
     }
+
+    cfg.encryption_key = crate::encryption::configured_encryption_key(&ctx.config)?;
 
     if cfg.preserve_acl && cfg.canned_acl.is_some() {
         return Err(GsutilError::command(

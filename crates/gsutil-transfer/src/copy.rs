@@ -246,6 +246,9 @@ pub fn validate_hashes(
     }
 
     if let (Some(l_crc), Some(c_crc_b64)) = (local_crc32c, cloud_crc32c_b64) {
+        if gsutil_core::debug_level() >= 2 {
+            eprintln!("Comparing local vs cloud crc32c-checksum for {dst_desc}.");
+        }
         let l_crc_b64 = crc32c_to_base64(l_crc);
         if l_crc_b64 != c_crc_b64 {
             return Err(GsutilError::HashMismatch(format!(
@@ -256,6 +259,9 @@ pub fn validate_hashes(
     }
 
     if let (Some(l_md5), Some(c_md5)) = (local_md5_b64, cloud_md5_b64) {
+        if gsutil_core::debug_level() >= 2 {
+            eprintln!("Comparing local vs cloud md5-checksum for {dst_desc}.");
+        }
         if l_md5 != c_md5 {
             return Err(GsutilError::HashMismatch(format!(
                 "CommandException: md5 signature computed for {src_desc} ({l_md5}) \
@@ -397,6 +403,9 @@ pub async fn run_copy(
         summary.items.push(item);
     }
 
+    if gsutil_core::debug_level() >= 2 {
+        eprintln!("total_bytes_transferred: {}", summary.total_bytes);
+    }
     if batch.failed > 0 {
         batch.into_result()?;
     }
@@ -859,6 +868,9 @@ async fn copy_local_to_cloud(
     if should_gzip_transport && !cfg.quiet {
         eprintln!("Using compressed transport encoding for {src_url}.");
     }
+    if should_gzip_transport && gsutil_core::debug_level() >= 2 {
+        eprintln!("send: Using gzip transport encoding for the request.");
+    }
     let pc_threshold = boto.parallel_composite_upload_threshold();
     let use_parallel_composite = !should_gzip_storage
         && !should_gzip_transport
@@ -893,7 +905,7 @@ async fn copy_local_to_cloud(
     let mut temp_gz: Option<NamedTempFile> = None;
     let will_stream_resumable_raw =
         !should_gzip_storage && !should_gzip_transport && file_size >= boto.resumable_threshold();
-    let (upload_path, transfer_len, mut local_crc_opt, local_md5_opt): (
+    let (upload_path, transfer_len, mut local_crc_opt, mut local_md5_opt): (
         PathBuf,
         u64,
         Option<u32>,
@@ -1056,6 +1068,16 @@ async fn copy_local_to_cloud(
             let hashes = hash_reader(&mut src_f, true, false)?;
             local_crc_opt = hashes.crc32c;
         }
+    }
+    if local_md5_opt.is_none()
+        && gsutil_core::debug_level() >= 2
+        && uploaded.md5_hash.is_some()
+        && check_mode != CheckHashesMode::Never
+        && file_size <= 16 * 1024 * 1024
+    {
+        let mut src_f = File::open(src_path)?;
+        let hashes = hash_reader(&mut src_f, false, true)?;
+        local_md5_opt = hashes.md5_base64();
     }
 
     if let Err(err) = validate_hashes(

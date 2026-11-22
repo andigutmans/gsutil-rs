@@ -739,6 +739,13 @@ def main():
         is_mock=(args.backend == 'mock'),
         live_boto_path=(args._live_boto or None),
     )
+    # gsutil-rs uses native hardware CRC32C, so upstream tests should not expect
+    # Python's slow-crcmod warning banner in stderr (e.g. test_rsync NO_CHANGES).
+    try:
+      from gslib.utils import boto_util as _bu
+      _bu.UsingCrcmodExtension = lambda: True
+    except Exception:
+      pass
     loader = unittest.TestLoader()
     full_mod = f'gslib.tests.{args._worker_module}'
     try:

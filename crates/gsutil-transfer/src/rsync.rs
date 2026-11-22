@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gsutil_core::api::{CloudApi, CsObjectOrPrefix, ListObjectsOptions, Object};
+use gsutil_core::api::{CloudApi, CsObjectOrPrefix, EncryptionKey, ListObjectsOptions, Object};
 use gsutil_core::config::BotoConfig;
 use gsutil_core::error::{GsutilError, Result};
 use gsutil_core::hash::hash_reader;
@@ -60,8 +60,12 @@ pub struct RsyncConfig {
     pub skip_old_files: bool,
     /// `-U`: skip unsupported object types.
     pub skip_unsupported: bool,
-    /// `-x <regex>`: exclude paths matching regex (relative to root).
+    /// `-x <regex>` / `-y <regex>`: exclude paths matching regex (relative to root).
     pub exclude_pattern: Option<String>,
+    /// `-y <regex>`: also prune matching local directories before recursing.
+    pub exclude_dirs: bool,
+    /// Optional CMEK / CSEK encryption key (`GSUtil:encryption_key`).
+    pub encryption_key: Option<EncryptionKey>,
     /// `-a <canned_acl>`: canned ACL to apply to uploaded/copied objects.
     pub canned_acl: Option<String>,
     /// `-j <ext1,ext2>`: gzip-compress matching extensions on upload.
@@ -175,6 +179,9 @@ pub async fn run_rsync(
     let src_root = StorageUrl::parse(&cfg.src_url)?;
     let dst_root = StorageUrl::parse(&cfg.dst_url)?;
 
+    validate_rsync_root_url(api.as_ref(), &src_root).await?;
+    validate_rsync_root_url(api.as_ref(), &dst_root).await?;
+
     let buffer_lines = cfg
         .buffer_lines
         .unwrap_or_else(|| {
@@ -273,7 +280,7 @@ pub async fn run_rsync(
     if cfg.parallel_operations && !cfg.quiet {
         let force = boto.get_bool("GSUtil", "task_estimation_force", false);
         let threshold = boto.get_u64("GSUtil", "task_estimation_threshold", 50_000) as usize;
-        if force || (threshold > 0 && actions.len() >= threshold) {
+        if threshold > 0 && (force || actions.len() >= threshold) {
             let total_size: u64 = actions
                 .iter()
                 .map(|a| match a {
@@ -294,6 +301,7 @@ pub async fn run_rsync(
         preserve_posix: cfg.preserve_posix,
         preserve_mtime: true,
         canned_acl: cfg.canned_acl.clone(),
+        encryption_key: cfg.encryption_key.clone(),
         gzip_transport: if cfg.gzip_all {
             GzipMode::All
         } else {
@@ -389,8 +397,8 @@ pub async fn run_rsync(
     summary.removed = remove_batch.succeeded;
     summary.failed += remove_batch.failed;
 
-    // 3. POSIX metadata-only updates (-P)
-    let quiet_posix = cfg.quiet;
+    // 3. POSIX / mtime metadata-only updates
+    let quiet_posix = cfg.quiet || !cfg.preserve_posix;
     let posix_batch = run_parallel(posix_actions, &par_cfg, {
         let api = Arc::clone(&api);
         move |act| {
@@ -676,12 +684,18 @@ fn compare_matching_entries(
         }
     }
 
-    let needs_copy = if cfg.compute_checksums {
+    let src_is_cloud = src.full_url.starts_with("gs://") || src.full_url.starts_with("s3://");
+    let dst_is_cloud = dst.full_url.starts_with("gs://") || dst.full_url.starts_with("s3://");
+    let cloud_to_cloud = src_is_cloud && dst_is_cloud;
+
+    let needs_copy = if cfg.compute_checksums || cloud_to_cloud {
         !entries_have_matching_checksum(src, dst)?
     } else if src.size != dst.size {
         true
     } else if let (Some(sm), Some(dm)) = (src.mtime, dst.mtime) {
         sm != dm
+    } else if src.effective_mtime().is_some() && src.effective_mtime() == dst.effective_mtime() {
+        false
     } else {
         // Same size, missing mtime on at least one side -> compare checksums.
         !entries_have_matching_checksum(src, dst)?
@@ -702,6 +716,18 @@ fn compare_matching_entries(
             dst_url: dst.full_url.clone(),
             rel_path: src.rel_path.clone(),
             posix: src.posix_attrs(),
+        }));
+    }
+
+    if src.mtime.is_some() && dst.mtime.is_none() {
+        return Ok(Some(DiffAction::PosixSrcToDst {
+            src_url: src.full_url.clone(),
+            dst_url: dst.full_url.clone(),
+            rel_path: src.rel_path.clone(),
+            posix: PosixAttributes {
+                mtime: src.mtime,
+                ..Default::default()
+            },
         }));
     }
 
@@ -745,6 +771,43 @@ fn resolve_entry_hashes(
 // ---------------------------------------------------------------------------
 // Tree Listing Helpers (Local & Cloud)
 // ---------------------------------------------------------------------------
+
+async fn validate_rsync_root_url(api: &dyn CloudApi, root: &StorageUrl) -> Result<()> {
+    if let StorageUrl::Cloud(c) = root {
+        if let (Some(bucket), Some(obj)) = (c.bucket_name.as_deref(), c.object_name.as_deref()) {
+            if !obj.is_empty() && !obj.ends_with('/') {
+                let provider = api.for_provider(c.scheme.as_str())?;
+                if provider
+                    .get_object_metadata(bucket, obj, None, None)
+                    .await
+                    .is_ok()
+                {
+                    let sub_prefix = format!("{obj}/");
+                    let has_children = provider
+                        .list_objects(
+                            bucket,
+                            &ListObjectsOptions {
+                                prefix: Some(sub_prefix),
+                                delimiter: Some("/".to_string()),
+                                all_versions: false,
+                                fields: Some(vec!["name".to_string()]),
+                            },
+                        )
+                        .await
+                        .map(|items| !items.is_empty())
+                        .unwrap_or(false);
+                    if !has_children {
+                        return Err(GsutilError::command(format!(
+                            "arg ({}) does not name a directory, bucket, or bucket subdir.",
+                            root.url_string()
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 async fn list_tree_sorted(
     api: &dyn CloudApi,
@@ -816,6 +879,22 @@ fn walk_local_rsync(
                 continue;
             }
             if cfg.recursive {
+                if cfg.exclude_dirs {
+                    if let Some(re) = exclude_re {
+                        let rel_dir = path
+                            .strip_prefix(root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        let rel_dir_slash = format!("{rel_dir}/");
+                        if re.is_match(&rel_dir) || re.is_match(&rel_dir_slash) {
+                            if !cfg.quiet {
+                                eprintln!("Skipping excluded directory {}...", path.display());
+                            }
+                            continue;
+                        }
+                    }
+                }
                 if let Ok(canon) = fs::canonicalize(&path) {
                     if !visited_dirs.insert(canon) {
                         continue;
@@ -943,7 +1022,7 @@ async fn list_cloud_tree_into(
                                     "WARNING: {full_url} has an invalid mtime in its metadata"
                                 ),
                                 Some(v) if v < 0 => eprintln!(
-                                    "WARNING: {full_url} has an invalid mtime in its metadata"
+                                    "WARNING: {full_url} has a negative mtime in its metadata"
                                 ),
                                 Some(v) if v > now_limit => eprintln!(
                                     "WARNING: {full_url} has an mtime more than 1 day from current system time"
@@ -970,6 +1049,7 @@ async fn list_cloud_tree_into(
                     if check_orphan_posix {
                         if let Some(mode) = posix.mode {
                             if (mode & 0o400) == 0 {
+                                eprintln!("Mode for {full_url} won't allow read access.");
                                 return Err(GsutilError::command(
                                     "This sync will orphan file(s), please fix their permissions before trying again.",
                                 ));
@@ -1093,8 +1173,9 @@ mod tests {
             ..Default::default()
         };
         let dry_summary = run_rsync(api.clone(), &boto, &dry_cfg).await.unwrap();
-        // Should plan: copy added.txt, changed.txt, sub/nested.txt; remove extra.txt; skip keep.txt & ignore.tmp
-        assert_eq!(dry_summary.planned_actions.len(), 4);
+        // Should plan: copy added.txt, changed.txt, sub/nested.txt; remove extra.txt;
+        // update missing mtime on keep.txt; ignore ignore.tmp.
+        assert_eq!(dry_summary.planned_actions.len(), 5);
         // Dry run must not mutate bucket!
         assert!(api.get_stored("dst", "extra.txt").is_some());
         assert!(api.get_stored("dst", "added.txt").is_none());
