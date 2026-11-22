@@ -2355,7 +2355,8 @@ fn expand_local_source(
             static_parts.into_iter().collect()
         };
         let has_double_star = raw_path.contains("**");
-        let matcher = WildcardMatcher::compile(raw_path)?;
+        let normalized_pat = raw_path.replace('\\', "/");
+        let matcher = WildcardMatcher::compile(&normalized_pat)?;
         let mut results = Vec::new();
         let mut visited = HashSet::new();
 
@@ -2395,7 +2396,7 @@ fn expand_local_source(
                     Err(_) if skip_unsupported || exclude_symlinks => continue,
                     Err(e) => return Err(e.into()),
                 };
-                let p_str = path.to_string_lossy();
+                let p_str = path.to_string_lossy().replace('\\', "/");
                 let matched = matcher.is_match(&p_str);
                 if meta.is_dir() {
                     if matched && !has_double_star {

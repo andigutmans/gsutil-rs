@@ -185,8 +185,19 @@ fn hash_and_return_path(
 }
 
 fn canonical_or_raw(path: &str) -> String {
-    fs::canonicalize(path)
-        .map(|p| p.to_string_lossy().into_owned())
+    let p = Path::new(path);
+    // Canonicalize the parent directory + filename so the result is identical both
+    // before the destination file exists (download start) and after (download finish),
+    // including on macOS (`/var` -> `/private/var`) and Windows (`\\?\` prefix).
+    if let (Some(parent), Some(fname)) = (p.parent(), p.file_name()) {
+        if !parent.as_os_str().is_empty() {
+            if let Ok(canon_parent) = fs::canonicalize(parent) {
+                return canon_parent.join(fname).to_string_lossy().into_owned();
+            }
+        }
+    }
+    fs::canonicalize(p)
+        .map(|c| c.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string())
 }
 
