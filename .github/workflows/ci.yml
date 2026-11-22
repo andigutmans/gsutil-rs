@@ -27,7 +27,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          arguments: --all-features check advisories licenses sources
+          arguments: --all-features
+          command-arguments: advisories licenses sources
 
   test:
     name: Build, Clippy & Test (${{ matrix.os }})
