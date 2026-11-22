@@ -427,7 +427,30 @@ pub async fn run_acl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
                     })?;
                     writeln!(ctx.out, "{json}")?;
                 } else {
-                    let meta = api.get_bucket(bname, Some(&["acl".to_string()])).await?;
+                    let meta = api
+                        .get_bucket(
+                            bname,
+                            Some(&["acl".to_string(), "iamConfiguration".to_string()]),
+                        )
+                        .await?;
+                    let ubla_enabled = meta
+                        .iam_configuration
+                        .as_ref()
+                        .and_then(|ic| {
+                            ic.uniform_bucket_level_access
+                                .as_ref()
+                                .and_then(|u| u.enabled)
+                                .or_else(|| ic.bucket_policy_only.as_ref().and_then(|b| b.enabled))
+                        })
+                        .unwrap_or(false);
+                    if ubla_enabled {
+                        return Err(gsutil_core::error::ServiceError::bad_request(
+                            "Cannot get legacy ACL for a bucket that has uniform bucket-level access. Read more at https://cloud.google.com/storage/docs/uniform-bucket-level-access",
+                            Some(400),
+                            None,
+                        )
+                        .into());
+                    }
                     let mut acl = meta.acl.unwrap_or_default();
                     for entry in &mut acl {
                         entry.kind = None;
