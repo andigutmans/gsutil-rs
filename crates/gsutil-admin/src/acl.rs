@@ -427,7 +427,7 @@ pub async fn run_acl(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
                     })?;
                     writeln!(ctx.out, "{json}")?;
                 } else {
-                    let meta = api.get_bucket(bname, None).await?;
+                    let meta = api.get_bucket(bname, Some(&["acl".to_string()])).await?;
                     let mut acl = meta.acl.unwrap_or_default();
                     for entry in &mut acl {
                         entry.kind = None;
