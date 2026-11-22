@@ -86,11 +86,11 @@ pub struct GsutilRunner {
 }
 
 impl GsutilRunner {
-    /// Discover reference and Rust binaries from environment or default workspace paths.
+    /// Discover reference and Rust binaries from environment, PATH, or default workspace paths.
     pub fn discover() -> Self {
         let ref_bin = std::env::var("GSUTIL_REF_BIN")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/usr/bin/gsutil"));
+            .unwrap_or_else(|_| Self::default_ref_bin());
 
         let rust_bin = std::env::var("GSUTIL_RUST_BIN")
             .map(PathBuf::from)
@@ -106,20 +106,40 @@ impl GsutilRunner {
         }
     }
 
+    fn default_ref_bin() -> PathBuf {
+        let names: &[&str] = if cfg!(windows) {
+            &["gsutil.cmd", "gsutil.exe", "gsutil"]
+        } else {
+            &["gsutil"]
+        };
+        if let Some(path_var) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                for name in names {
+                    let cand = dir.join(name);
+                    if cand.is_file() {
+                        return cand;
+                    }
+                }
+            }
+        }
+        PathBuf::from("/usr/bin/gsutil")
+    }
+
     fn default_rust_bin() -> PathBuf {
+        let exe = format!("gsutil{}", std::env::consts::EXE_SUFFIX);
         // Prefer release if present, otherwise debug, walking up to workspace root.
         let candidates = [
-            PathBuf::from("target/release/gsutil"),
-            PathBuf::from("target/debug/gsutil"),
-            PathBuf::from("../../target/release/gsutil"),
-            PathBuf::from("../../target/debug/gsutil"),
+            PathBuf::from("target/release").join(&exe),
+            PathBuf::from("target/debug").join(&exe),
+            PathBuf::from("../../target/release").join(&exe),
+            PathBuf::from("../../target/debug").join(&exe),
         ];
         for c in &candidates {
             if c.exists() {
                 return c.clone();
             }
         }
-        PathBuf::from("target/debug/gsutil")
+        PathBuf::from("target/debug").join(exe)
     }
 
     pub fn ref_available(&self) -> bool {
@@ -146,6 +166,9 @@ impl GsutilRunner {
 
         for (k, v) in &opts.env {
             cmd.env(k, v);
+            if cfg!(windows) && k == "HOME" {
+                cmd.env("USERPROFILE", v);
+            }
         }
 
         if let Some(ref cwd) = opts.cwd {

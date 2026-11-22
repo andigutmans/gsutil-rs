@@ -1,0 +1,60 @@
+name: Live GCS Integration (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_stage1:
+        description: "Also run Stage 1 200 MiB streaming / crash-resume gates"
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  live-gcs:
+    name: Live GCS Parity (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Authenticate to GCP (dedicated test SA)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - name: Set up Google Cloud SDK (Python gsutil)
+        uses: google-github-actions/setup-gcloud@v2
+      - name: Build release gsutil & gsutil-parity
+        run: cargo build --release -p gsutil-cli -p gsutil-parity
+      - name: Run live GCS differential parity
+        shell: bash
+        env:
+          GSUTIL_TEST_PROJECT: ${{ secrets.GSUTIL_TEST_PROJECT }}
+          GSUTIL_TEST_BUCKET: ${{ secrets.GSUTIL_TEST_BUCKET }}
+        run: |
+          EXT=""
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then EXT=".exe"; fi
+          REF_BIN="$(command -v gsutil.cmd || command -v gsutil)"
+          ./target/release/gsutil-parity${EXT} \
+            --mode live \
+            --ref-bin "${REF_BIN}" \
+            --rust-bin "./target/release/gsutil${EXT}"
+      - name: Run Stage 1 200 MiB streaming gates (optional)
+        if: ${{ inputs.run_stage1 }}
+        shell: bash
+        env:
+          GSUTIL_TEST_PROJECT: ${{ secrets.GSUTIL_TEST_PROJECT }}
+          GSUTIL_TEST_BUCKET: ${{ secrets.GSUTIL_TEST_BUCKET }}
+        run: |
+          EXT=""
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then EXT=".exe"; fi
+          REF_BIN="$(command -v gsutil.cmd || command -v gsutil)"
+          ./target/release/gsutil-parity${EXT} \
+            --mode stage1 \
+            --ref-bin "${REF_BIN}" \
+            --rust-bin "./target/release/gsutil${EXT}"

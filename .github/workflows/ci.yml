@@ -43,3 +43,35 @@ jobs:
           cargo build --release -p gsutil-cli
           ./target/release/gsutil version
           ./target/release/gsutil help | head -n 5
+
+  parity:
+    name: Differential Parity vs Python gsutil (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Set up Google Cloud SDK (Python gsutil)
+        uses: google-github-actions/setup-gcloud@v2
+      - name: Build release gsutil & gsutil-parity
+        run: cargo build --release -p gsutil-cli -p gsutil-parity
+      - name: Run offline & TLS mock differential parity
+        shell: bash
+        run: |
+          EXT=""
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then EXT=".exe"; fi
+          REF_BIN="$(command -v gsutil.cmd || command -v gsutil)"
+          echo "Reference Python gsutil: ${REF_BIN}"
+          "${REF_BIN}" version
+          ./target/release/gsutil-parity${EXT} \
+            --mode offline \
+            --ref-bin "${REF_BIN}" \
+            --rust-bin "./target/release/gsutil${EXT}"
+          ./target/release/gsutil-parity${EXT} \
+            --mode mock \
+            --ref-bin "${REF_BIN}" \
+            --rust-bin "./target/release/gsutil${EXT}"
