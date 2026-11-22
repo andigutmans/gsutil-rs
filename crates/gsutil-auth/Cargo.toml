@@ -12,7 +12,7 @@ chrono.workspace = true
 dirs.workspace = true
 pkcs8 = { version = "0.10", features = ["pem"] }
 reqwest.workspace = true
-rsa = { version = "0.9", features = ["sha2"] }
+rsa = { version = "0.10", features = ["sha2"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
