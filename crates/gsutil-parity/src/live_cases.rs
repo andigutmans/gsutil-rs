@@ -127,7 +127,12 @@ pub fn run_live_gcs_suite(
         .with_replacement(&rs_pfx, "<PFX>")
         .strip_ui();
 
-    // Helper: runs Python with `-o GSUtil:use_gcloud_storage=True` on `py-<id>` vs Rust on `rs-<id>`.
+    let use_gcloud_shim = std::env::var("BOTO_CONFIG")
+        .map(|v| v.trim().is_empty())
+        .unwrap_or(true);
+
+    // Helper: runs Python (with `-o GSUtil:use_gcloud_storage=True` when no explicit BOTO_CONFIG is set)
+    // on `py-<id>` vs Rust on `rs-<id>`.
     let run_diff_live = |results: &mut Vec<CaseResult>,
                          id: &str,
                          cmd: &str,
@@ -138,10 +143,14 @@ pub fn run_live_gcs_suite(
         if !matches_filter(filter, id, "live_gcs", cmd) {
             return;
         }
-        let mut full_ref = vec![
-            "-o".to_string(),
-            "GSUtil:use_gcloud_storage=True".to_string(),
-        ];
+        let mut full_ref = if use_gcloud_shim {
+            vec![
+                "-o".to_string(),
+                "GSUtil:use_gcloud_storage=True".to_string(),
+            ]
+        } else {
+            Vec::new()
+        };
         full_ref.extend(ref_args);
         let ref_opts = RunOptions::new(full_ref);
         let rust_opts = RunOptions::new(rust_args);
@@ -249,13 +258,20 @@ pub fn run_live_gcs_suite(
     if matches_filter(filter, "live_cp_download_9m_resumable", "live_gcs", "cp") {
         let py_dl: PathBuf = tmp.path().join("dl_9m_py.bin");
         let rs_dl: PathBuf = tmp.path().join("dl_9m_rs.bin");
-        let ref_opts = RunOptions::new([
-            "-o",
-            "GSUtil:use_gcloud_storage=True",
-            "cp",
-            &format!("{py_base}/rand9m.bin"),
-            &py_dl.to_string_lossy(),
+        let mut ref_args = if use_gcloud_shim {
+            vec![
+                "-o".to_string(),
+                "GSUtil:use_gcloud_storage=True".to_string(),
+            ]
+        } else {
+            Vec::new()
+        };
+        ref_args.extend([
+            "cp".to_string(),
+            format!("{py_base}/rand9m.bin"),
+            py_dl.to_string_lossy().into_owned(),
         ]);
+        let ref_opts = RunOptions::new(ref_args);
         let rust_opts = RunOptions::new([
             "cp",
             &format!("{rs_base}/rand9m.bin"),
