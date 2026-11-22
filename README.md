@@ -1,8 +1,10 @@
 # gsutil-rs
 
+[![CI](https://github.com/andigutmans/gsutil-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/andigutmans/gsutil-rs/actions/workflows/ci.yml)
+
 A high-performance Rust rewrite of Google Cloud Storage's [`gsutil`](https://github.com/GoogleCloudPlatform/gsutil) CLI, targeting drop-in CLI, error-code, and protocol compatibility with **gsutil v5.38**.
 
-> **Status:** Active pre-production development (Linux `x86_64` verified; macOS & Windows support planned).
+> **Status:** Active pre-production development — CI verified on **Linux (`x86_64`), macOS (`arm64`), and Windows (`x86_64`)**.
 
 ---
 
@@ -73,7 +75,7 @@ Measured in-region on a GCE `n2-standard-8` VM (`us-central1-a`, PD-SSD) against
 ### Known Limitations / Roadmap
 - Remaining upstream edge cases in `test_cp` (multi-source naming edge cases; Python-internal `--testcallbackfile` pickle tests do not apply), `test_rsync`, `test_acl`/`test_defacl`/`test_iam`, and `test_Doption`.
 - Live testing against real AWS S3 (currently verified against hermetic SigV4 mock).
-- Cross-platform support (macOS & Windows), `_ARGCOMPLETE` shell tab completion, standalone interactive OAuth `gsutil config`, and `cargo audit`/`cargo deny`.
+- `_ARGCOMPLETE` shell tab completion, standalone interactive OAuth `gsutil config`, and `cargo audit`/`cargo deny`.
 
 ---
 
