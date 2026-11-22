@@ -42,12 +42,19 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ secrets.GSUTIL_TEST_PROJECT }}
-      - name: Ensure gcloud SA credentials are active for reference Python gsutil
+      - name: Configure isolated SA .boto for Python & Rust gsutil
         shell: bash
         run: |
-          GCLOUD_BIN="$(command -v gcloud.cmd || command -v gcloud)"
-          "${GCLOUD_BIN}" auth activate-service-account --key-file="${GOOGLE_APPLICATION_CREDENTIALS}" --quiet
-          "${GCLOUD_BIN}" config set project "${{ secrets.GSUTIL_TEST_PROJECT }}" --quiet
+          BOTO_FILE="${RUNNER_TEMP}/ci-sa.boto"
+          cat > "${BOTO_FILE}" <<EOF
+          [Credentials]
+          gs_service_key_file = ${GOOGLE_APPLICATION_CREDENTIALS}
+          [GSUtil]
+          default_project_id = ${{ secrets.GSUTIL_TEST_PROJECT }}
+          EOF
+          echo "BOTO_CONFIG=${BOTO_FILE}" >> "${GITHUB_ENV}"
+          echo "BOTO_PATH=${BOTO_FILE}" >> "${GITHUB_ENV}"
+          echo "CLOUDSDK_CORE_PASS_CREDENTIALS_TO_GSUTIL=false" >> "${GITHUB_ENV}"
       - name: Build release gsutil & gsutil-parity
         run: cargo build --release -p gsutil-cli -p gsutil-parity
       - name: Run live GCS differential parity
