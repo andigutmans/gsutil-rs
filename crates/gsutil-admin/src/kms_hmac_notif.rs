@@ -83,7 +83,7 @@ pub async fn run_kms(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
                     writeln!(
                         ctx.out,
                         "Clearing default encryption key for {}...",
-                        b.bucket_url_string()
+                        bucket_display_no_slash(&b)
                     )?;
                     let patch = Bucket {
                         clear_fields: vec!["encryption".to_string()],
@@ -97,7 +97,7 @@ pub async fn run_kms(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
                     writeln!(
                         ctx.out,
                         "Setting default KMS key for bucket {}...",
-                        b.bucket_url_string()
+                        bucket_display_no_slash(&b)
                     )?;
                     let patch = Bucket {
                         encryption: Some(BucketEncryption {
@@ -115,7 +115,7 @@ pub async fn run_kms(ctx: &mut AdminContext<'_>, args: &[String]) -> Result<()> 
                             writeln!(
                                 ctx.out,
                                 "Default encryption key for {}:\n{key}",
-                                b.bucket_url_string()
+                                bucket_display_no_slash(&b)
                             )?;
                         }
                         _ => {

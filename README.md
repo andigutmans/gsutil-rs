@@ -4,7 +4,40 @@
 
 A high-performance Rust rewrite of Google Cloud Storage's [`gsutil`](https://github.com/GoogleCloudPlatform/gsutil) CLI, targeting drop-in CLI, error-code, and protocol compatibility with **gsutil v5.38**.
 
-> **Status:** Active pre-production development — CI verified on **Linux (`x86_64`), macOS (`arm64`), and Windows (`x86_64`)**.
+> **Status:** `v0.1.0` — CI verified on **Linux (`x86_64`), macOS (`arm64` & `x86_64`), and Windows (`x86_64`)** with automated `cargo-deny` security/license auditing and Dependabot updates.
+
+---
+
+## Installation
+
+### Prebuilt Binaries (Recommended)
+
+Download the latest release archive for your platform from [GitHub Releases](https://github.com/andigutmans/gsutil-rs/releases):
+
+- **macOS (Apple Silicon):** `gsutil-rs-macos-arm64.tar.gz`
+- **macOS (Intel):** `gsutil-rs-macos-x86_64.tar.gz`
+- **Linux (`x86_64`):** `gsutil-rs-linux-x86_64.tar.gz`
+- **Windows (`x86_64`):** `gsutil-rs-windows-x86_64.zip`
+
+```bash
+# Example (Linux x86_64 — substitute your platform archive)
+curl -LO https://github.com/andigutmans/gsutil-rs/releases/latest/download/gsutil-rs-linux-x86_64.tar.gz
+curl -LO https://github.com/andigutmans/gsutil-rs/releases/latest/download/SHA256SUMS.txt
+sha256sum -c --ignore-missing SHA256SUMS.txt
+tar -xzf gsutil-rs-linux-x86_64.tar.gz
+./gsutil version -l
+```
+
+### Build from Source
+
+Requires Rust **1.87+**:
+
+```bash
+git clone https://github.com/andigutmans/gsutil-rs.git
+cd gsutil-rs
+cargo build --release -p gsutil-cli
+./target/release/gsutil version -l
+```
 
 ---
 
@@ -62,20 +95,21 @@ Measured in-region on a GCE `n2-standard-8` VM (`us-central1-a`, PD-SSD) against
 
 ## Verification & Compatibility Status
 
-- **Unit & Integration Tests:** `cargo test --workspace` — **147/147 passing** (`cargo fmt` & `cargo clippy -D warnings` clean).
-- **Differential Parity (`gsutil-parity`):**
-  - `--mode offline` vs. Python `gsutil` v5.38: **63/63 (100.0%)**
-  - `--mode mock` vs. Python `gsutil` v5.38 over 2-tier CA TLS: **64/64 (100.0%)**
-  - `--mode live` against real GCS + Cloud KMS + Pub/Sub + IAM: **74/74 (100.0%)**, covering multi-topology buckets (UBLA, non-UBLA fine-grained ACLs, versioned, dual-region, Requester Pays, retention, KMS/CMEK, Pub/Sub), HMAC CRUD + live GCS XML `GOOG4-HMAC-SHA256`, live V4/V2 `signurl` HTTP 200 `PUT`/`GET`, `-i` service account impersonation, `iam` roundtrip, and 5/5 recursive wildcard expansion parity (`*`, `sub*`, `**/*.ext`, non-recursive `*.ext`, plain dir `-r`).
-  - `--mode stage1` production gates: **5/5 (100.0%)** (200 MiB `< 64 MiB` RSS upload/download, cross-process `308` crash-resume, live `_.gstmp` recovery, `SIGINT` cleanup).
+- **Continuous Integration & Supply-Chain Security (GitHub Actions):**
+  - **Linux (`ubuntu-latest`), macOS (`macos-latest`), and Windows (`windows-latest`):** `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (**147/147 passing**), and **127/127 (100.0%)** differential parity (`--mode offline` 63/63 + `--mode mock` 64/64 over 2-tier CA TLS) against Python `gsutil` on every push and PR.
+  - **Security & License Audit:** Automated [`cargo-deny`](deny.toml) advisory, license, and source checks in CI + weekly [Dependabot](.github/dependabot.yml) updates for Cargo crates and GitHub Actions.
+- **Cross-Platform Live GCS Differential Parity (`gsutil-parity --mode live`):**
+  - **GitHub Actions 3-OS Live GCS (`ubuntu-latest`, `macos-latest`, `windows-latest`):** **59/59 (100.0%)** on all three operating systems — Rust `gsutil-rs` runs **2.4× faster** on Linux, **1.7× faster** on macOS, and **3.6× faster** on Windows live GCS (**46.6× faster** on Windows TLS mock!).
+  - **Full multi-topology live suite:** **74/74 (100.0%)**, covering UBLA, non-UBLA fine-grained ACLs, versioned, dual-region, Requester Pays, retention, KMS/CMEK, Pub/Sub, HMAC CRUD + live GCS XML `GOOG4-HMAC-SHA256`, live V4/V2 `signurl` HTTP 200 `PUT`/`GET`, `-i` service account impersonation, `iam` roundtrip, and 5/5 recursive wildcard expansion parity (`*`, `sub*`, `**/*.ext`, non-recursive `*.ext`, plain dir `-r`).
+  - **Stage 1 production gates (`--mode stage1`):** **5/5 (100.0%)** (200 MiB `< 64 MiB` RSS upload/download, cross-process `308` crash-resume, live `_.gstmp` recovery, `SIGINT` cleanup).
 - **Official Upstream Python `gslib/tests/` Black-Box Gate (`scripts/run_upstream_gsutil_tests.py`):**
-  - **Live GCP (`--backend live`, 31 modules):** **19 official upstream modules at 100.0% live pass** (including `test_retention`, `test_cors`, `test_setmeta`, `test_compose` with live Cloud KMS/CMEK, `test_lifecycle`, `test_web`, `test_pap`, `test_label`, `test_versioning`, `test_cat`, `test_rb`, `test_autoclass`, `test_defstorageclass`, `test_rpo`, `test_hash`, `test_notification`, `test_ubla`, `test_bucketpolicyonly`, `test_hmac`), plus 132/147 (89.8%) across the 9 security/IAM/ACL/KMS/signurl modules.
+  - **Live GCP (`--backend live`):** **23 official upstream modules at 100.0% live pass** (`test_acl` 64/64, `test_defacl` 24/24, `test_signurl` 14/14, `test_kms` 5/5, `test_retention`, `test_cors`, `test_setmeta`, `test_compose` with live Cloud KMS/CMEK, `test_lifecycle`, `test_web`, `test_pap`, `test_label`, `test_versioning`, `test_cat`, `test_rb`, `test_autoclass`, `test_defstorageclass`, `test_rpo`, `test_hash`, `test_notification`, `test_ubla`, `test_bucketpolicyonly`, `test_hmac`), plus `test_iam` at **39/41 (95.1%)** (the remaining 2 assert Python-internal `AttributeError` tracebacks).
   - **Hermetic TLS Mock (`--backend mock`, 39 modules):** **615/774 (79.5%)** passing, **19 modules at 100.0%**.
 
 ### Known Limitations / Roadmap
-- Remaining upstream edge cases in `test_cp` (multi-source naming edge cases; Python-internal `--testcallbackfile` pickle tests do not apply), `test_rsync`, `test_acl`/`test_defacl`/`test_iam`, and `test_Doption`.
+- Remaining upstream edge cases in `test_cp` (multi-source naming edge cases; Python-internal `--testcallbackfile` pickle tests do not apply), `test_rsync`, and `test_Doption`.
 - Live testing against real AWS S3 (currently verified against hermetic SigV4 mock).
-- `_ARGCOMPLETE` shell tab completion, standalone interactive OAuth `gsutil config`, and `cargo audit`/`cargo deny`.
+- `_ARGCOMPLETE` shell tab completion and standalone interactive OAuth `gsutil config`.
 
 ---
 
