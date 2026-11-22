@@ -75,5 +75,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${GITHUB_REF_NAME}" artifacts/* \
+            --repo "${GITHUB_REPOSITORY}" \
             --title "gsutil-rs ${GITHUB_REF_NAME}" \
             --generate-notes
