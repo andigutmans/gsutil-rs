@@ -75,7 +75,7 @@ jobs:
           python -m pip install --quiet crcmod
           echo "CLOUDSDK_PYTHON=$(which python)" >> "${GITHUB_ENV}"
       - name: Set up Google Cloud SDK (Python gsutil)
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
       - name: Build release gsutil & gsutil-parity
         run: cargo build --release -p gsutil-cli -p gsutil-parity
       - name: Run offline & TLS mock differential parity
