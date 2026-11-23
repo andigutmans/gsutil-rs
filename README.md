@@ -69,27 +69,25 @@ cargo build --release -p gsutil-cli
 
 ## Enterprise-Scale Live GCS Benchmarks (`target/release/gsutil` vs. Python `gsutil` v5.38)
 
-Measured in-region on a GCE `n2-standard-8` VM (`us-central1-a`, PD-SSD) against a `us-central1` GCS bucket:
+Measured against a `us-central1` GCS bucket (250k-object, 5k-file, 1 GiB gzip, 10 GiB, and 100 GiB runs on a GCE `n2-standard-8` VM in `us-central1-a`):
 
 | Workload | Scale | Python `gsutil` v5.38 | Rust `gsutil-rs` | Speedup | Python RSS | Rust RSS |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `ls -r` | 250,000 objects (4 levels deep) | 28.21 s (`8,863 obj/s`) | **16.19 s** (`15,441 obj/s`) | **1.74×** | 75.4 MiB | **12.8 MiB**\*\* |
-| `du -s` | 250,000 objects (`505,976,000` B) | 86.24 s | **13.60 s** | **6.34×** | 74.3 MiB | **13.0 MiB**\*\* |
+| `ls -r` | 250,000 objects (4 levels deep) | 28.21 s (`8,863 obj/s`) | **16.19 s** (`15,441 obj/s`) | **1.74×** | 75.4 MiB | **12.8 MiB** |
+| `du -s` | 250,000 objects (`505,976,000` B) | 86.24 s | **13.60 s** | **6.34×** | 74.3 MiB | **13.0 MiB** |
 | `-m rsync -r -n` (no-op diff) | 250,000 objects (`0` changes) | 568.53 s | **20.75 s** | **27.4×** | 114.9 MiB | 565.4 MiB |
 | Incremental `-m rsync -r` | 100 modified / 250,000 objects | >600 s (timed out) | **21.45 s** | **>28.0×** | — | 565.7 MiB |
 | Mixed + adversarial `-m cp -r` upload | 5,000 files (`1.35 GiB`) | 25.35 s (`53.4 MiB/s`) | **13.48 s** (`100.4 MiB/s`) | **1.88×** | 170.2 MiB | 153.6 MiB |
 | Mixed + adversarial `-m cp -r` download | 5,000 files (`1.35 GiB`) | 23.00 s (`58.8 MiB/s`) | **14.64 s** (`92.4 MiB/s`) | **1.57×** | 126.6 MiB | **42.7 MiB** |
 | Mixed `-m rsync -r -d` (50m/25a/25d) | 5,000 files (`1.35 GiB`) | 14.01 s | **1.18 s** | **11.8×** | 78.8 MiB | **25.1 MiB** |
+| `cp` single-stream resumable upload | 200 MiB random binary | 7.70 s (`26.0 MiB/s`) | **4.01 s** (`49.9 MiB/s`) | **1.92×** | 74.5 MiB | **17.3 MiB** |
+| `cp` single-stream resumable upload | 1 GiB random binary | 19.20 s (`53.3 MiB/s`) | **19.64 s** (`52.1 MiB/s`) | **0.98×** | 74.5 MiB | **17.3 MiB** |
 | `cp -Z` gzip upload | 1 GiB compressible JSONL | 22.75 s (`45.0 MiB/s`) | **6.73 s** (`152.3 MiB/s`) | **3.38×** | 75.2 MiB | **29.6 MiB** |
 | `cp` gzip download (SHA-256 verified) | 1 GiB compressible JSONL | 2.65 s (`386.3 MiB/s`) | **1.88 s** (`545.3 MiB/s`) | **1.41×** | 75.1 MiB | **16.5 MiB** |
-| `cp` single-stream resumable upload | 10 GiB random binary | **73.62 s** (`139.1 MiB/s`) | 138.65 s (`73.9 MiB/s`) | 0.53×\* | 75.9 MiB | **14.0 MiB** |
 | `cp` parallel composite upload (`150M`) | 10 GiB random binary | 14.26 s (`717.9 MiB/s`) | **12.67–17.65 s** (`580–808 MiB/s`) | **up to 1.13×** | 91.8 MiB | **44.3 MiB** |
 | `cp` sliced download (`150M`) | 10 GiB random binary | 72.93 s (`140.4 MiB/s`) | **18.25 s** (`561.2 MiB/s`) | **4.00×** | 75.0 MiB | **29.0 MiB** |
 | `compose` (`10 × 10 GiB`) | 100 GiB single object | — | **0.75 s** | — | — | **11.5 MiB** |
 | `cp` single-object download | **100 GiB** (`107,374,182,400` B) | 726.27 s (`141.0 MiB/s`) | **538.57 s** (`190.1 MiB/s`) | **1.35×** | 75.1 MiB | **30.4 MiB** |
-
-*\*Updated after VM run: fixing an `8 MiB` chunk override in `copy.rs` and replacing the full pre-read MD5 pass with single-pass on-the-fly hardware CRC32C brought single-stream resumable upload throughput to parity with Python `gsutil` (`19.64 s` vs. `19.20 s` on 1 GiB at **`17.3 MiB` vs. `74.5 MiB` RSS**, and `4.01 s` vs. `7.70 s` on 200 MiB).*
-*\*\*Updated after VM run: page-by-page streaming (`list_objects_paged`) + minimal `fields` projections reduced 250,000-object peak RSS from `493.7 MiB` → **`12.8 MiB`** (`ls -r`) and `295.0 MiB` → **`13.0 MiB`** (`du -s`).*
 
 ---
 
