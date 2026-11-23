@@ -156,6 +156,11 @@ pub fn apply_posix_to_local_file(path: &Path, attrs: &PosixAttributes) -> Result
     }
 
     #[cfg(unix)]
+    if let Some(gid) = attrs.gid {
+        let _ = std::os::unix::fs::chown(path, None, Some(gid));
+    }
+
+    #[cfg(unix)]
     if let Some(mode) = attrs.mode {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(mode & 0o777);
@@ -163,6 +168,130 @@ pub fn apply_posix_to_local_file(path: &Path, attrs: &PosixAttributes) -> Result
     }
 
     Ok(())
+}
+
+/// Validate that applying `attrs` (uid/gid/mode) to a downloaded file will not orphan it.
+///
+/// Mirrors `gslib/utils/posix_util.py::ValidateFilePermissionAccess`.
+pub fn validate_file_permission_access(
+    url_str: &str,
+    attrs: &PosixAttributes,
+) -> std::result::Result<(), String> {
+    #[cfg(not(unix))]
+    {
+        let _ = (url_str, attrs);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    {
+        let uid_present = attrs.uid.is_some();
+        let gid_present = attrs.gid.is_some();
+        let mode_present = attrs.mode.is_some();
+        if !uid_present && !gid_present && !mode_present {
+            return Ok(());
+        }
+
+        // Root can access files regardless of permissions.
+        if unsafe { libc::geteuid() } == 0 {
+            return Ok(());
+        }
+
+        const U_R: u32 = 0o400;
+        const G_R: u32 = 0o040;
+        const O_R: u32 = 0o004;
+
+        let mode_valid = attrs
+            .mode
+            .map(|m| (m & U_R) != 0 || (m & G_R) != 0 || (m & O_R) != 0)
+            .unwrap_or(false);
+        let mode = if let Some(m) = attrs.mode {
+            if !mode_valid {
+                return Err(format!("Mode for {url_str} won't allow read access."));
+            }
+            m
+        } else {
+            0o666
+        };
+
+        if let Some(uid) = attrs.uid {
+            let pw = unsafe { libc::getpwuid(uid as libc::uid_t) };
+            if pw.is_null() {
+                return Err(format!(
+                    "UID for {url_str} doesn't exist on current system. uid: {uid}"
+                ));
+            }
+        }
+        if let Some(gid) = attrs.gid {
+            let gr = unsafe { libc::getgrgid(gid as libc::gid_t) };
+            if gr.is_null() {
+                return Err(format!(
+                    "GID for {url_str} doesn't exist on current system. gid: {gid}"
+                ));
+            }
+        }
+
+        let current_uid = unsafe { libc::getuid() };
+        let uid_is_current_user = attrs.uid.is_some_and(|u| u == current_uid);
+
+        if !uid_present && gid_present && mode_present && (mode & U_R) == 0 {
+            return Err(format!(
+                "Insufficient access with uid/gid/mode for {url_str}, gid: {}, mode: {:03o}",
+                attrs.gid.unwrap_or(0),
+                mode & 0o777
+            ));
+        }
+
+        if uid_is_current_user {
+            if (mode & U_R) != 0 {
+                return Ok(());
+            }
+            return Err(format!(
+                "Insufficient access with uid/gid/mode for {url_str}, uid: {}, mode: {:03o}",
+                attrs.uid.unwrap_or(0),
+                mode & 0o777
+            ));
+        }
+
+        let user_groups = current_user_groups();
+        if let Some(gid) = attrs.gid {
+            if user_groups.contains(&gid) {
+                if (mode & G_R) != 0 {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "Insufficient access with uid/gid/mode for {url_str}, gid: {gid}, mode: {:03o}",
+                    mode & 0o777
+                ));
+            }
+        }
+
+        if (mode & O_R) != 0 {
+            return Ok(());
+        }
+        if !uid_present && !gid_present && mode_valid {
+            return Ok(());
+        }
+        Err(format!("There was a problem validating {url_str}."))
+    }
+}
+
+#[cfg(unix)]
+fn current_user_groups() -> Vec<u32> {
+    let mut groups = vec![unsafe { libc::getgid() }];
+    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if n > 0 {
+        let mut buf = vec![0 as libc::gid_t; n as usize];
+        let actual = unsafe { libc::getgroups(n, buf.as_mut_ptr()) };
+        if actual > 0 {
+            for &g in &buf[..actual as usize] {
+                if !groups.contains(&g) {
+                    groups.push(g);
+                }
+            }
+        }
+    }
+    groups
 }
 
 /// Parse an RFC 3339 timestamp string (e.g. GCS `timeCreated`) to Unix epoch seconds.

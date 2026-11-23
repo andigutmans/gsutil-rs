@@ -40,7 +40,7 @@ use crate::compose::MAX_COMPOSE_ARITY;
 use crate::parallel::{run_parallel_with_results, ParallelConfig};
 use crate::posix::{
     apply_posix_to_local_file, deserialize_posix_from_metadata, read_local_posix_attributes,
-    serialize_posix_to_metadata,
+    serialize_posix_to_metadata, validate_file_permission_access,
 };
 use crate::rewrite::normalize_storage_class;
 use crate::tracker::{
@@ -120,6 +120,8 @@ pub struct CopyConfig {
     pub src_urls: Vec<String>,
     pub dst_url: String,
     pub recursive: bool,
+    /// `-A`: copy all object versions (sequential only; incompatible with `-m`).
+    pub all_versions: bool,
     pub no_clobber: bool,
     pub continue_on_error: bool,
     pub preserve_acl: bool,
@@ -297,6 +299,21 @@ pub async fn run_copy(
             "Specifying both the -j/-J and -z/-Z options together is invalid.",
         ));
     }
+    if cfg.parallel_operations && cfg.all_versions {
+        return Err(GsutilError::command(
+            "-m option is not supported with the cp -A flag",
+        ));
+    }
+    if cfg.no_clobber
+        && cfg
+            .preconditions
+            .as_ref()
+            .is_some_and(|p| p.gen_match.is_some())
+    {
+        return Err(GsutilError::argument(
+            "Specifying x-goog-if-generation-match is not supported with cp -n.",
+        ));
+    }
 
     let mut src_url_strs = cfg.src_urls.clone();
     if cfg.read_stdin_urls {
@@ -309,10 +326,17 @@ pub async fn run_copy(
         return Err(GsutilError::command("cp requires at least one source URL."));
     }
 
-    if src_url_strs.len() > 1 && src_url_strs.iter().any(|s| s == "-" || s == "file://-") {
-        return Err(GsutilError::command(
-            "Multiple URL strings are not supported with streaming",
-        ));
+    if src_url_strs.iter().any(|s| s == "-" || s == "file://-") {
+        if src_url_strs.len() > 1 {
+            return Err(GsutilError::command(
+                "Multiple URL strings are not supported with streaming",
+            ));
+        }
+        if cfg.parallel_operations {
+            return Err(GsutilError::command(
+                "Cannot upload from a stream when using gsutil -m",
+            ));
+        }
     }
 
     let dst_base = StorageUrl::parse(&cfg.dst_url)?;
@@ -344,6 +368,48 @@ pub async fn run_copy(
         return Err(GsutilError::command(
             "Cannot copy multiple files/objects to a single FIFO.",
         ));
+    }
+
+    if cfg.parallel_operations && !cfg.quiet {
+        let force = boto.get_bool("GSUtil", "task_estimation_force", false);
+        let threshold = boto.get_u64("GSUtil", "task_estimation_threshold", 50_000) as usize;
+        if threshold > 0 && (force || pairs.len() >= threshold) {
+            let mut total_size: u64 = 0;
+            for (src, _) in &pairs {
+                match src {
+                    StorageUrl::File(f) if !f.is_stream => {
+                        if let Ok(m) = fs::metadata(&f.object_name) {
+                            total_size += m.len();
+                        }
+                    }
+                    StorageUrl::Cloud(c) => {
+                        if let (Some(b), Some(o)) =
+                            (c.bucket_name.as_deref(), c.object_name.as_deref())
+                        {
+                            if let Ok(prov) = api.for_provider(c.scheme.as_str()) {
+                                if let Ok(meta) = prov
+                                    .get_object_metadata(
+                                        b,
+                                        o,
+                                        c.generation.as_deref(),
+                                        Some(&["size".to_string()]),
+                                    )
+                                    .await
+                                {
+                                    total_size += meta.size_bytes();
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            eprintln!(
+                "Estimated work for this command: objects: {}, total size: {}",
+                pairs.len(),
+                total_size
+            );
+        }
     }
 
     if let Some(ref ui) = cfg.ui {
@@ -1427,6 +1493,17 @@ async fn copy_cloud_to_local(
         });
     }
 
+    if object_name.ends_with('/') {
+        fs::create_dir_all(dst_path)?;
+        return Ok(CopyItemResult {
+            src_url: src_url.url_string(),
+            dst_url: dst_url.url_string(),
+            bytes_transferred: 0,
+            created_url: None,
+            skipped: false,
+        });
+    }
+
     if let Some(parent) = dst_path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -1437,6 +1514,19 @@ async fn copy_cloud_to_local(
     let src_meta = src_api
         .get_object_metadata(bucket, object_name, src_url.generation(), None)
         .await?;
+
+    if cfg.preserve_posix {
+        if let Some(ref custom_meta) = src_meta.metadata {
+            let attrs = deserialize_posix_from_metadata(custom_meta);
+            if let Err(msg) = validate_file_permission_access(&src_url.url_string(), &attrs) {
+                eprintln!("{msg}");
+                return Err(GsutilError::command(format!(
+                    "Unable to preserve POSIX attributes for {}: {msg}",
+                    src_url.url_string()
+                )));
+            }
+        }
+    }
 
     if cfg.delete_source_after_copy && !cfg.quiet {
         maybe_warn_early_deletion(src_url, &src_meta);
@@ -1967,9 +2057,7 @@ async fn copy_cloud_to_cloud(
     let mut dst_meta = src_meta.clone();
     dst_meta.bucket = Some(dst_bucket.to_string());
     dst_meta.name = Some(dst_obj.to_string());
-    if let Some(ref sc) = cfg.storage_class {
-        dst_meta.storage_class = Some(normalize_storage_class(sc));
-    }
+    dst_meta.storage_class = cfg.storage_class.as_deref().map(normalize_storage_class);
     if !cfg.preserve_acl {
         dst_meta.acl = None;
     }

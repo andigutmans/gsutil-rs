@@ -26,7 +26,8 @@ use crate::copy::{copy_single_pair, CopyConfig, GzipMode};
 use crate::parallel::{run_parallel, ParallelConfig};
 use crate::posix::{
     apply_posix_to_local_file, deserialize_posix_from_metadata, parse_rfc3339_to_epoch_secs,
-    read_local_posix_attributes, serialize_posix_to_metadata, PosixAttributes,
+    read_local_posix_attributes, serialize_posix_to_metadata, validate_file_permission_access,
+    PosixAttributes,
 };
 use crate::ui::UIController;
 
@@ -148,8 +149,33 @@ pub struct RsyncSummary {
     pub failed: usize,
 }
 
-/// Validate `RsyncConfig` options offline (before any cloud API calls) and compile `-x` regex.
-pub fn validate_rsync_config(cfg: &RsyncConfig) -> Result<Option<Regex>> {
+/// Compiled `-x` / `-y` exclude regex supporting both linear-time `regex` and PCRE lookarounds.
+#[derive(Debug)]
+pub enum ExcludeRegex {
+    Fast(Regex),
+    Fancy(Box<fancy_regex::Regex>),
+}
+
+impl ExcludeRegex {
+    pub fn compile(pat: &str) -> Result<Self> {
+        if let Ok(re) = Regex::new(pat) {
+            return Ok(Self::Fast(re));
+        }
+        fancy_regex::Regex::new(pat)
+            .map(|re| Self::Fancy(Box::new(re)))
+            .map_err(|_| GsutilError::command(format!("Invalid exclude filter ({pat})")))
+    }
+
+    pub fn is_match(&self, text: &str) -> bool {
+        match self {
+            Self::Fast(re) => re.is_match(text),
+            Self::Fancy(re) => re.is_match(text).unwrap_or(false),
+        }
+    }
+}
+
+/// Validate `RsyncConfig` options offline (before any cloud API calls) and compile `-x`/`-y` regex.
+pub fn validate_rsync_config(cfg: &RsyncConfig) -> Result<Option<ExcludeRegex>> {
     if cfg.preserve_acl && cfg.canned_acl.is_some() {
         return Err(GsutilError::command(
             "Specifying both the -p and -a options together is invalid.",
@@ -162,9 +188,7 @@ pub fn validate_rsync_config(cfg: &RsyncConfig) -> Result<Option<Regex>> {
     }
     match &cfg.exclude_pattern {
         Some(pat) if pat.is_empty() => Err(GsutilError::command("Invalid blank exclude filter")),
-        Some(pat) => Regex::new(pat)
-            .map(Some)
-            .map_err(|_| GsutilError::command(format!("Invalid exclude filter ({pat})"))),
+        Some(pat) => ExcludeRegex::compile(pat).map(Some),
         None => Ok(None),
     }
 }
@@ -813,7 +837,7 @@ async fn list_tree_sorted(
     api: &dyn CloudApi,
     root: &StorageUrl,
     cfg: &RsyncConfig,
-    exclude_re: Option<&Regex>,
+    exclude_re: Option<&ExcludeRegex>,
     buffer_lines: usize,
     check_orphan_posix: bool,
 ) -> Result<NamedTempFile> {
@@ -833,7 +857,7 @@ async fn list_tree_sorted(
 fn list_local_tree_into(
     root: &Path,
     cfg: &RsyncConfig,
-    exclude_re: Option<&Regex>,
+    exclude_re: Option<&ExcludeRegex>,
     sorter: &mut ExternalBatchSorter,
 ) -> Result<()> {
     if !root.exists() {
@@ -850,7 +874,7 @@ fn walk_local_rsync(
     root: &Path,
     dir: &Path,
     cfg: &RsyncConfig,
-    exclude_re: Option<&Regex>,
+    exclude_re: Option<&ExcludeRegex>,
     visited_dirs: &mut HashSet<PathBuf>,
     sorter: &mut ExternalBatchSorter,
 ) -> Result<()> {
@@ -948,7 +972,7 @@ async fn list_cloud_tree_into(
     api: &dyn CloudApi,
     root: &StorageUrl,
     cfg: &RsyncConfig,
-    exclude_re: Option<&Regex>,
+    exclude_re: Option<&ExcludeRegex>,
     check_orphan_posix: bool,
     sorter: &mut ExternalBatchSorter,
 ) -> Result<()> {
@@ -977,6 +1001,7 @@ async fn list_cloud_tree_into(
 
     let prefix_str = prefix.as_deref().unwrap_or("");
     let now_limit = chrono::Utc::now().timestamp() + 86_400;
+    let mut has_orphan_posix_error = false;
 
     api.for_provider(scheme)?
         .list_objects_paged(
@@ -1047,13 +1072,9 @@ async fn list_cloud_tree_into(
                         .map(deserialize_posix_from_metadata)
                         .unwrap_or_default();
                     if check_orphan_posix {
-                        if let Some(mode) = posix.mode {
-                            if (mode & 0o400) == 0 {
-                                eprintln!("Mode for {full_url} won't allow read access.");
-                                return Err(GsutilError::command(
-                                    "This sync will orphan file(s), please fix their permissions before trying again.",
-                                ));
-                            }
+                        if let Err(msg) = validate_file_permission_access(&full_url, &posix) {
+                            eprintln!("{msg}");
+                            has_orphan_posix_error = true;
                         }
                     }
                     let time_created = obj
@@ -1078,7 +1099,14 @@ async fn list_cloud_tree_into(
                 Ok(())
             },
         )
-        .await
+        .await?;
+
+    if has_orphan_posix_error {
+        return Err(GsutilError::command(
+            "This sync will orphan file(s), please fix their permissions before trying again.",
+        ));
+    }
+    Ok(())
 }
 
 fn build_child_url(root: &StorageUrl, rel_path: &str) -> String {

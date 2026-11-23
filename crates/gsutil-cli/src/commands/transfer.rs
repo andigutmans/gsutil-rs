@@ -306,6 +306,7 @@ fn build_copy_config(
     for (o, a) in sub_opts {
         match o.as_str() {
             "-a" => cfg.canned_acl = Some(a.clone()),
+            "-A" => cfg.all_versions = true,
             "-c" => cfg.continue_on_error = true,
             "-D" => cfg.daisy_chain = true,
             "-e" => cfg.exclude_symlinks = true,
@@ -456,11 +457,6 @@ pub async fn run_rsync_cmd(
             "-x" | "-y" => {
                 if a.is_empty() {
                     return Err(GsutilError::command("Invalid blank exclude filter"));
-                }
-                if regex::Regex::new(a).is_err() {
-                    return Err(GsutilError::command(format!(
-                        "Invalid exclude filter ({a})"
-                    )));
                 }
                 cfg.exclude_pattern = Some(a.clone());
                 if o == "-y" {
