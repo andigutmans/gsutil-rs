@@ -27,7 +27,7 @@ gsutil-admin = { path = "crates/gsutil-admin" }
 gsutil-cli = { path = "crates/gsutil-cli" }
 
 async-trait = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 crc32c = "0.6"
